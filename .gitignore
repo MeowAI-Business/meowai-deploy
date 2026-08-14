@@ -1,0 +1,9 @@
+/target/
+*.log
+.env
+.env.*
+!.env.example
+state.json
+secrets.env
+deployment.toml
+

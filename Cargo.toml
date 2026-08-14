@@ -1,0 +1,26 @@
+[package]
+name = "meowai-deploy"
+version = "0.1.0"
+edition = "2024"
+description = "Interactive deployment CLI for MeowAI downstream New API sites"
+license = "MIT"
+repository = "https://github.com/MeowAI-Business/meowai-deploy"
+readme = "README.md"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive", "env"] }
+cliclack = "0.5.6"
+comfy-table = "7.1"
+console = "0.15"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.44", features = ["macros", "rt-multi-thread", "time"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+tempfile = "3.15"
