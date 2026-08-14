@@ -443,6 +443,172 @@ async fn expired_access_token_refreshes_before_group_read() {
     assert_eq!(catalog.groups.len(), 1);
 }
 
+#[tokio::test]
+async fn status_key_is_created_once_and_plaintext_is_not_expected_on_reuse() {
+    let server = MockServer::start().await;
+    let mut client = authenticated_client(&server).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    #[derive(Clone)]
+    struct StatusKeyLifecycleResponder {
+        calls: Arc<AtomicUsize>,
+    }
+    impl Respond for StatusKeyLifecycleResponder {
+        fn respond(&self, _: &Request) -> ResponseTemplate {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "success": true,
+                    "message": "",
+                    "data": {
+                        "key": "osk-created-once",
+                        "created": true,
+                        "id": 9,
+                        "created_at": 100,
+                        "last_used_at": 0,
+                        "revoked_at": 0
+                    }
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "success": true,
+                    "message": "",
+                    "data": {
+                        "created": false,
+                        "id": 9,
+                        "created_at": 100,
+                        "last_used_at": 200,
+                        "revoked_at": 0
+                    }
+                }))
+            }
+        }
+    }
+    Mock::given(method("POST"))
+        .and(path("/api/onboard/status-key"))
+        .and(header("authorization", "Bearer access-one"))
+        .respond_with(StatusKeyLifecycleResponder { calls })
+        .expect(2)
+        .mount(&server)
+        .await;
+    let first = client
+        .ensure_onboard_status_key()
+        .await
+        .expect("create status key");
+    assert!(first.created);
+    assert_eq!(
+        first.key().expect("plaintext").expose_secret(),
+        "osk-created-once"
+    );
+
+    let second = client
+        .ensure_onboard_status_key()
+        .await
+        .expect("reuse status key");
+    assert!(!second.created);
+    assert!(second.key().is_none());
+    assert_eq!(second.metadata.id, 9);
+
+    Mock::given(method("DELETE"))
+        .and(path("/api/onboard/status-key"))
+        .and(header("authorization", "Bearer access-one"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "message": "",
+            "data": {
+                "revoked": true,
+                "id": 9,
+                "created_at": 100,
+                "last_used_at": 200,
+                "revoked_at": 300
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let revoked = client
+        .revoke_onboard_status_key()
+        .await
+        .expect("revoke status key");
+    assert_eq!(revoked.revoked_at, 300);
+}
+
+#[tokio::test]
+async fn status_client_reads_direct_manifest_snapshot_and_monitor_payloads() {
+    let server = MockServer::start().await;
+    let client = SourceClient::new(&server.uri()).expect("create source client");
+    let status_key = SecretString::from("osk-status-secret");
+    let manifest = json!({
+        "success": true,
+        "schema_version": "1",
+        "page_name": "MeowAI",
+        "page_slug": "default",
+        "page_description": "status",
+        "theme": "dark",
+        "public": true,
+        "generated_at": "2026-08-14T00:00:00Z",
+        "monitors": [{
+            "id": "7", "name": "GPT", "type": "http", "sort_order": 0,
+            "group_id": "1", "group": "Official", "interval": 60,
+            "timeout": 10, "retries": 2, "notifications_enabled": false,
+            "display_enabled": true
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/onboard/status/manifest"))
+        .and(header("authorization", "Bearer osk-status-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(manifest))
+        .mount(&server)
+        .await;
+    let result = client
+        .onboard_status_manifest(&status_key)
+        .await
+        .expect("read manifest");
+    assert_eq!(result.page_name, "MeowAI");
+    assert_eq!(result.monitors[0].id, "7");
+
+    Mock::given(method("GET"))
+        .and(path("/api/onboard/status/snapshot"))
+        .and(header("authorization", "Bearer osk-status-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "schema_version": "1",
+            "page": {"name":"MeowAI","slug":"default","description":"status","theme":"dark","public":true},
+            "generated_at": "2026-08-14T00:00:00Z",
+            "monitors": []
+        })))
+        .mount(&server)
+        .await;
+    let snapshot = client
+        .onboard_status_snapshot(&status_key)
+        .await
+        .expect("read snapshot");
+    assert_eq!(snapshot.page.slug, "default");
+
+    Mock::given(method("GET"))
+        .and(path("/api/onboard/status/monitors/7"))
+        .and(header("authorization", "Bearer osk-status-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": false,
+            "monitor_id": "7",
+            "status": "down",
+            "message": "failed",
+            "checked_at": "2026-08-14T00:00:00Z"
+        })))
+        .mount(&server)
+        .await;
+    let monitor = client
+        .onboard_status_monitor(&status_key, "7")
+        .await
+        .expect("read monitor");
+    assert!(!monitor.success);
+    assert_eq!(monitor.status, "down");
+    assert!(
+        client
+            .onboard_status_monitor(&status_key, "7/secret")
+            .await
+            .is_err()
+    );
+}
+
 fn group(name: &str, ratio: impl Into<Value>) -> SourceGroup {
     SourceGroup {
         group_id: name.to_owned(),

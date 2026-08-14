@@ -1,5 +1,6 @@
 use clap::CommandFactory;
 use cliclack::{log, note, spinner};
+use secrecy::ExposeSecret;
 
 use crate::{
     cli::{Cli, Command, OnboardArgs},
@@ -84,15 +85,28 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
         .ensure_group_tokens(&config.deployment_id(), &catalog)
         .await?;
     progress.stop("源站分组 Token 已就绪");
+
+    progress.start("准备源站 public status Key");
+    let status_key = source.ensure_onboard_status_key().await?;
+    progress.stop(if status_key.created {
+        "源站 public status Key 已创建"
+    } else {
+        "源站 public status Key 已复用"
+    });
+    let status_key_display = status_key
+        .key()
+        .map(|key| key.expose_secret().to_owned())
+        .unwrap_or_else(|| "已存在，源站不会再次返回明文".to_owned());
     note(
         "源站资源",
         format!(
-            "账号：{}\n分组：{}\nToken：新建 {}，复用 {}，修正 {}\n分组响应哈希：{}",
+            "账号：{}\n分组：{}\nToken：新建 {}，复用 {}，修正 {}\nstatus Key：{}\n分组响应哈希：{}",
             identity.username,
             catalog.groups.len(),
             token_sync.created,
             token_sync.reused,
             token_sync.updated,
+            status_key_display,
             catalog.response_sha256
         ),
     )

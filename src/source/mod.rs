@@ -1,8 +1,13 @@
 mod auth;
 mod groups;
+mod onboard_status;
 
 pub use auth::{SourceAccountMode, SourceCredentials, SourceIdentity};
 pub use groups::{GroupCatalog, SourceGroup, TokenBinding, TokenSync};
+pub use onboard_status::{
+    StatusKeyMetadata, StatusKeyProvision, StatusManifest, StatusMonitorManifest,
+    StatusMonitorResponse, StatusMonitorSnapshot, StatusPage, StatusSnapshot,
+};
 
 use std::{net::IpAddr, time::Duration};
 
@@ -61,6 +66,9 @@ pub enum SourceError {
 
     #[error("source group catalog is empty")]
     EmptyGroups,
+
+    #[error("status key is required")]
+    StatusKeyRequired,
 }
 
 pub struct SourceClient {
