@@ -33,6 +33,9 @@ pub enum AppError {
 
     #[error("{0} is not implemented in the current release")]
     NotReady(String),
+
+    #[error(transparent)]
+    Source(#[from] crate::source::SourceError),
 }
 
 impl AppError {
@@ -45,7 +48,8 @@ impl AppError {
             | Self::InvalidToml(_)
             | Self::ReadFile { .. }
             | Self::WriteFile { .. }
-            | Self::Message(_) => 1,
+            | Self::Message(_)
+            | Self::Source(_) => 1,
         }
     }
 }

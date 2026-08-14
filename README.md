@@ -11,7 +11,7 @@ cargo run -- doctor --skip-network
 cargo run -- onboard --dry-run
 ```
 
-`onboard` without a config file starts the interactive wizard. For automation, pass a TOML file with `--config FILE --non-interactive`. Missing non-interactive passwords are read from `MEOWAI_DEPLOY_NEWAPI_ADMIN_PASSWORD` and `MEOWAI_DEPLOY_KUMA_ADMIN_PASSWORD`, or generated randomly and shown once in the terminal.
+`onboard` without a config file starts the interactive wizard. For automation, pass a TOML file with `--config FILE --non-interactive`; set `source_account_mode`, `source_username`, and `MEOWAI_DEPLOY_SOURCE_PASSWORD` for source account operations. Missing downstream passwords are read from `MEOWAI_DEPLOY_NEWAPI_ADMIN_PASSWORD` and `MEOWAI_DEPLOY_KUMA_ADMIN_PASSWORD`, or generated randomly and shown once in the terminal.
 
 Running `meowai-deploy` or `cargo run` without a subcommand only prints help. It never starts the wizard implicitly.
 

@@ -6,6 +6,7 @@ use crate::{
     config::{DeploymentConfig, interactive_config},
     doctor,
     error::{AppError, Result},
+    source::SourceClient,
 };
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -66,9 +67,37 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
     }
 
     let progress = spinner();
-    progress.start("检查 onboard 配置");
-    tokio::time::sleep(std::time::Duration::from_millis(350)).await;
-    progress.stop("CLI 骨架已就绪；实际部署能力尚未接入");
+    let credentials = config.source_credentials()?;
+    progress.start("登录源站账号");
+    let mut source = SourceClient::new(&config.source_url)?;
+    let identity = source
+        .authenticate(config.source_account_mode, &credentials)
+        .await?;
+    progress.stop("源站账号已验证");
+
+    progress.start("读取源站分组");
+    let catalog = source.groups().await?;
+    progress.stop(format!("已读取 {} 个可见分组", catalog.groups.len()));
+
+    progress.start("同步源站分组 Token");
+    let token_sync = source
+        .ensure_group_tokens(&config.deployment_id(), &catalog)
+        .await?;
+    progress.stop("源站分组 Token 已就绪");
+    note(
+        "源站资源",
+        format!(
+            "账号：{}\n分组：{}\nToken：新建 {}，复用 {}，修正 {}\n分组响应哈希：{}",
+            identity.username,
+            catalog.groups.len(),
+            token_sync.created,
+            token_sync.reused,
+            token_sync.updated,
+            catalog.response_sha256
+        ),
+    )
+    .map_err(AppError::from_prompt)?;
+    log::warning("源站适配已完成；下游容器部署将在后续流程接入").map_err(AppError::from_prompt)?;
     Ok(())
 }
 

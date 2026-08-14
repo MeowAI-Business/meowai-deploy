@@ -1,0 +1,499 @@
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt,
+};
+
+use reqwest::Method;
+use secrecy::SecretString;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use super::{SourceClient, SourceError, SourceResult, require_data, unix_timestamp};
+
+const TOKEN_NAME_LIMIT: usize = 50;
+const PAGE_SIZE: usize = 100;
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SourceGroup {
+    pub group_id: String,
+    pub group_name: String,
+    pub description: String,
+    pub ratio: serde_json::Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct GroupCatalog {
+    pub groups: Vec<SourceGroup>,
+    pub fetched_at: i64,
+    pub response_sha256: String,
+}
+
+pub struct TokenBinding {
+    pub group_id: String,
+    pub group_name: String,
+    pub token_id: i64,
+    pub token_name: String,
+    pub reused: bool,
+    api_key: SecretString,
+}
+
+impl TokenBinding {
+    pub fn api_key(&self) -> &SecretString {
+        &self.api_key
+    }
+}
+
+impl fmt::Debug for TokenBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TokenBinding")
+            .field("group_id", &self.group_id)
+            .field("group_name", &self.group_name)
+            .field("token_id", &self.token_id)
+            .field("token_name", &self.token_name)
+            .field("reused", &self.reused)
+            .field("api_key", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+pub struct TokenSync {
+    pub bindings: Vec<TokenBinding>,
+    pub created: usize,
+    pub reused: usize,
+    pub updated: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RawGroup {
+    #[serde(default)]
+    desc: String,
+    ratio: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SourceToken {
+    id: i64,
+    name: String,
+    status: i32,
+    remain_quota: i64,
+    unlimited_quota: bool,
+    expired_time: i64,
+    group: Option<String>,
+    model_limits_enabled: bool,
+    #[serde(default)]
+    model_limits: Option<String>,
+    #[serde(default)]
+    allow_ips: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Page<T> {
+    items: Vec<T>,
+    total: usize,
+    page: usize,
+    page_size: usize,
+}
+
+#[derive(Serialize)]
+struct DesiredToken<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<i64>,
+    name: &'a str,
+    status: i32,
+    remain_quota: i64,
+    expired_time: i64,
+    unlimited_quota: bool,
+    model_limits_enabled: bool,
+    model_limits: &'a str,
+    allow_ips: &'a str,
+    group: &'a str,
+    auto_groups: &'a [String],
+    cross_group_retry: bool,
+}
+
+#[derive(Serialize)]
+struct TokenStatus {
+    id: i64,
+    status: i32,
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenKeys {
+    keys: HashMap<String, String>,
+}
+
+impl SourceClient {
+    pub async fn groups(&mut self) -> SourceResult<GroupCatalog> {
+        let envelope = self
+            .authenticated_request::<BTreeMap<String, RawGroup>>(
+                Method::GET,
+                "/api/user/self/groups",
+                None,
+            )
+            .await?;
+        let raw_groups = require_data(envelope, "/api/user/self/groups")?;
+        if raw_groups.is_empty() {
+            return Err(SourceError::EmptyGroups);
+        }
+        let canonical =
+            serde_json::to_vec(&raw_groups).map_err(|error| SourceError::InvalidResponse {
+                endpoint: "/api/user/self/groups".to_owned(),
+                message: error.to_string(),
+            })?;
+        let response_sha256 = hex_digest(&canonical);
+        let groups = raw_groups
+            .into_iter()
+            .map(|(name, group)| SourceGroup {
+                group_id: name.clone(),
+                group_name: name,
+                description: group.desc,
+                ratio: group.ratio,
+            })
+            .collect();
+        Ok(GroupCatalog {
+            groups,
+            fetched_at: unix_timestamp(),
+            response_sha256,
+        })
+    }
+
+    pub async fn ensure_group_tokens(
+        &mut self,
+        deployment_id: &str,
+        catalog: &GroupCatalog,
+    ) -> SourceResult<TokenSync> {
+        if catalog.groups.is_empty() {
+            return Err(SourceError::EmptyGroups);
+        }
+
+        let desired = desired_token_names(deployment_id, &catalog.groups)?;
+        let initial_tokens = self.list_tokens().await?;
+        let mut created = 0;
+        let mut initially_present = BTreeMap::new();
+
+        for (group, token_name) in catalog.groups.iter().zip(&desired) {
+            let matches = matching_tokens(&initial_tokens, token_name);
+            if matches.len() > 1 {
+                return Err(SourceError::AmbiguousToken(format!(
+                    "multiple tokens named {token_name} exist for group {}",
+                    group.group_name
+                )));
+            }
+            if let Some(token) = matches.first() {
+                initially_present.insert(group.group_id.clone(), token.id);
+            } else {
+                self.create_token(token_name, &group.group_name).await?;
+                created += 1;
+            }
+        }
+
+        let tokens = if created == 0 {
+            initial_tokens
+        } else {
+            self.list_tokens().await?
+        };
+        let mut updated = 0;
+        let mut selected = Vec::with_capacity(catalog.groups.len());
+
+        for (group, token_name) in catalog.groups.iter().zip(&desired) {
+            let matches = matching_tokens(&tokens, token_name);
+            if matches.len() != 1 {
+                return Err(SourceError::AmbiguousToken(format!(
+                    "expected one token named {token_name} for group {}, found {}",
+                    group.group_name,
+                    matches.len()
+                )));
+            }
+            let token = matches[0];
+            if token_needs_update(token, &group.group_name) {
+                let was_disabled = token.status != 1;
+                self.update_token(token.id, token_name, &group.group_name)
+                    .await?;
+                if was_disabled {
+                    self.enable_token(token.id).await?;
+                }
+                updated += 1;
+            }
+            selected.push((
+                group.clone(),
+                token_name.clone(),
+                token.id,
+                initially_present.contains_key(&group.group_id),
+            ));
+        }
+
+        let ids = selected.iter().map(|(_, _, id, _)| *id).collect::<Vec<_>>();
+        let keys = self.token_keys(&ids).await?;
+        let mut bindings = Vec::with_capacity(selected.len());
+        for (group, token_name, token_id, reused) in selected {
+            let raw_key = keys.get(&token_id.to_string()).cloned().ok_or_else(|| {
+                SourceError::InvalidResponse {
+                    endpoint: "/api/token/batch/keys".to_owned(),
+                    message: format!("missing key for token {token_id}"),
+                }
+            })?;
+            let api_key = if raw_key.starts_with("sk-") {
+                raw_key
+            } else {
+                format!("sk-{raw_key}")
+            };
+            bindings.push(TokenBinding {
+                group_id: group.group_id.clone(),
+                group_name: group.group_name.clone(),
+                token_id,
+                token_name: token_name.clone(),
+                reused,
+                api_key: SecretString::from(api_key),
+            });
+        }
+
+        Ok(TokenSync {
+            reused: bindings.len() - created,
+            bindings,
+            created,
+            updated,
+        })
+    }
+
+    async fn list_tokens(&mut self) -> SourceResult<Vec<SourceToken>> {
+        let mut tokens = Vec::new();
+        let mut page_number = 1;
+        loop {
+            let path = format!("/api/token/?p={page_number}&size={PAGE_SIZE}");
+            let envelope = self
+                .authenticated_request::<Page<SourceToken>>(Method::GET, &path, None)
+                .await?;
+            let page = require_data(envelope, &path)?;
+            let item_count = page.items.len();
+            tokens.extend(page.items);
+            if tokens.len() >= page.total || item_count == 0 {
+                break;
+            }
+            if page.page_size == 0 || page.page != page_number {
+                return Err(SourceError::InvalidResponse {
+                    endpoint: path,
+                    message: "invalid pagination metadata".to_owned(),
+                });
+            }
+            page_number += 1;
+        }
+        Ok(tokens)
+    }
+
+    async fn create_token(&mut self, name: &str, group: &str) -> SourceResult<()> {
+        let request = desired_token(None, name, group);
+        self.authenticated_request::<serde_json::Value>(
+            Method::POST,
+            "/api/token/",
+            Some(
+                serde_json::to_value(request).map_err(|error| SourceError::InvalidResponse {
+                    endpoint: "/api/token/".to_owned(),
+                    message: error.to_string(),
+                })?,
+            ),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn update_token(&mut self, id: i64, name: &str, group: &str) -> SourceResult<()> {
+        let request = desired_token(Some(id), name, group);
+        self.authenticated_request::<serde_json::Value>(
+            Method::PUT,
+            "/api/token/",
+            Some(
+                serde_json::to_value(request).map_err(|error| SourceError::InvalidResponse {
+                    endpoint: "/api/token/".to_owned(),
+                    message: error.to_string(),
+                })?,
+            ),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn enable_token(&mut self, id: i64) -> SourceResult<()> {
+        let body = serde_json::to_value(TokenStatus { id, status: 1 }).map_err(|error| {
+            SourceError::InvalidResponse {
+                endpoint: "/api/token/".to_owned(),
+                message: error.to_string(),
+            }
+        })?;
+        self.authenticated_request::<serde_json::Value>(
+            Method::PUT,
+            "/api/token/?status_only=true",
+            Some(body),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn token_keys(&mut self, ids: &[i64]) -> SourceResult<HashMap<String, String>> {
+        let mut keys = HashMap::new();
+        for chunk in ids.chunks(100) {
+            let body = serde_json::json!({"ids": chunk});
+            let envelope = self
+                .authenticated_request::<TokenKeys>(
+                    Method::POST,
+                    "/api/token/batch/keys",
+                    Some(body),
+                )
+                .await?;
+            for (id, key) in require_data(envelope, "/api/token/batch/keys")?.keys {
+                if key.trim().is_empty() {
+                    return Err(SourceError::InvalidResponse {
+                        endpoint: "/api/token/batch/keys".to_owned(),
+                        message: format!("empty key for token {id}"),
+                    });
+                }
+                keys.insert(id, key);
+            }
+        }
+        Ok(keys)
+    }
+}
+
+fn desired_token<'a>(id: Option<i64>, name: &'a str, group: &'a str) -> DesiredToken<'a> {
+    DesiredToken {
+        id,
+        name,
+        status: 1,
+        remain_quota: 0,
+        expired_time: -1,
+        unlimited_quota: true,
+        model_limits_enabled: false,
+        model_limits: "",
+        allow_ips: "",
+        group,
+        auto_groups: &[],
+        cross_group_retry: false,
+    }
+}
+
+fn matching_tokens<'a>(tokens: &'a [SourceToken], name: &str) -> Vec<&'a SourceToken> {
+    tokens.iter().filter(|token| token.name == name).collect()
+}
+
+fn token_needs_update(token: &SourceToken, group: &str) -> bool {
+    token.status != 1
+        || token.remain_quota != 0
+        || !token.unlimited_quota
+        || token.expired_time != -1
+        || token.group.as_deref().unwrap_or_default() != group
+        || token.model_limits_enabled
+        || token
+            .model_limits
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        || token
+            .allow_ips
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+}
+
+fn desired_token_names(deployment_id: &str, groups: &[SourceGroup]) -> SourceResult<Vec<String>> {
+    if deployment_id.is_empty()
+        || deployment_id.len() > 24
+        || !deployment_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
+    {
+        return Err(SourceError::InvalidDeployment(
+            "deployment id must use 1-24 ASCII letters, digits, '-' or '_'".to_owned(),
+        ));
+    }
+    let mut names = Vec::with_capacity(groups.len());
+    for group in groups {
+        if group.group_name.is_empty() {
+            return Err(SourceError::InvalidDeployment(
+                "group name cannot be empty".to_owned(),
+            ));
+        }
+        let prefix = format!("meowai-deploy/{deployment_id}/");
+        let full = format!("{prefix}{}", group.group_name);
+        let name = if full.len() <= TOKEN_NAME_LIMIT {
+            full
+        } else {
+            let digest = hex_digest(group.group_name.as_bytes());
+            let suffix = format!("-{}", &digest[..10]);
+            let available = TOKEN_NAME_LIMIT
+                .checked_sub(prefix.len() + suffix.len())
+                .ok_or_else(|| {
+                    SourceError::InvalidDeployment(
+                        "deployment id leaves no room for a token name".to_owned(),
+                    )
+                })?;
+            let truncated = truncate_utf8(&group.group_name, available);
+            if truncated.is_empty() {
+                return Err(SourceError::InvalidDeployment(
+                    "group name cannot fit in the source token name".to_owned(),
+                ));
+            }
+            format!("{prefix}{truncated}{suffix}")
+        };
+        if names.contains(&name) {
+            return Err(SourceError::InvalidDeployment(format!(
+                "token name collision for group {}",
+                group.group_name
+            )));
+        }
+        names.push(name);
+    }
+    Ok(names)
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use secrecy::ExposeSecret;
+
+    #[test]
+    fn token_names_are_stable_and_fit_the_source_limit() {
+        let groups = vec![SourceGroup {
+            group_id: "超长分组".repeat(12),
+            group_name: "超长分组".repeat(12),
+            description: String::new(),
+            ratio: serde_json::json!(1),
+        }];
+        let first = desired_token_names("deploy_123", &groups).expect("build token name");
+        let second = desired_token_names("deploy_123", &groups).expect("repeat token name");
+        assert_eq!(first, second);
+        assert!(first[0].len() <= TOKEN_NAME_LIMIT);
+        assert!(first[0].starts_with("meowai-deploy/deploy_123/"));
+    }
+
+    #[test]
+    fn token_debug_output_redacts_the_key() {
+        let binding = TokenBinding {
+            group_id: "default".to_owned(),
+            group_name: "default".to_owned(),
+            token_id: 7,
+            token_name: "meowai-deploy/site/default".to_owned(),
+            reused: false,
+            api_key: SecretString::from("sk-super-secret".to_owned()),
+        };
+        let debug = format!("{binding:?}");
+        assert!(!debug.contains(binding.api_key().expose_secret()));
+        assert!(debug.contains("<redacted>"));
+    }
+}

@@ -7,11 +7,14 @@ use std::{
 use cliclack::{input, intro, log, outro, password, select};
 use rand::{Rng, distributions::Alphanumeric};
 use reqwest::Url;
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{
     cli::OnboardArgs,
     error::{AppError, Result},
+    source::{SourceAccountMode, SourceCredentials},
 };
 
 pub const DEFAULT_SOURCE_URL: &str = "https://enterprise.meowai.net";
@@ -22,6 +25,10 @@ pub const DEFAULT_KUMA_PORT: u16 = 3001;
 #[serde(default)]
 pub struct DeploymentConfig {
     pub source_url: String,
+    pub source_account_mode: SourceAccountMode,
+    pub source_username: String,
+    #[serde(skip)]
+    pub source_password: Option<SecretString>,
     pub website_name: String,
     pub container_name: String,
     pub directory: PathBuf,
@@ -51,6 +58,9 @@ impl Default for DeploymentConfig {
     fn default() -> Self {
         Self {
             source_url: DEFAULT_SOURCE_URL.to_owned(),
+            source_account_mode: SourceAccountMode::Login,
+            source_username: String::new(),
+            source_password: None,
             website_name: String::new(),
             container_name: "newapi".to_owned(),
             directory: PathBuf::from("/opt/meowai-deploy/newapi"),
@@ -81,6 +91,8 @@ impl DeploymentConfig {
     pub fn write_template(path: &Path) -> Result<()> {
         let template = r#"# meowai-deploy onboard configuration
 source_url = "https://enterprise.meowai.net"
+source_account_mode = "login"
+source_username = ""
 website_name = ""
 container_name = "newapi"
 directory = "/opt/meowai-deploy/newapi"
@@ -95,6 +107,7 @@ image = "ghcr.io/moorcorpa/new-api-outgap"
 image_ref = "current-commit-or-digest"
 
 # Passwords may be supplied through the environment or an interactive prompt.
+# Source account password uses MEOWAI_DEPLOY_SOURCE_PASSWORD.
 # Do not put secrets in a shared config file.
 "#;
         fs::write(path, template).map_err(|source| AppError::WriteFile {
@@ -123,6 +136,11 @@ image_ref = "current-commit-or-digest"
     }
 
     pub fn resolve_passwords(&mut self) {
+        if self.source_password.is_none() {
+            self.source_password = env::var("MEOWAI_DEPLOY_SOURCE_PASSWORD")
+                .ok()
+                .map(SecretString::from);
+        }
         if self.newapi_admin_password.is_none() {
             self.newapi_admin_password = Some(
                 env::var("MEOWAI_DEPLOY_NEWAPI_ADMIN_PASSWORD").unwrap_or_else(|_| random_secret()),
@@ -176,6 +194,31 @@ image_ref = "current-commit-or-digest"
         Ok(())
     }
 
+    pub fn source_credentials(&self) -> Result<SourceCredentials> {
+        let password = self.source_password.clone().ok_or_else(|| {
+            AppError::InvalidConfig(
+                "source password is required; set MEOWAI_DEPLOY_SOURCE_PASSWORD or use the prompt"
+                    .to_owned(),
+            )
+        })?;
+        SourceCredentials::new(self.source_username.clone(), password).map_err(AppError::from)
+    }
+
+    pub fn deployment_id(&self) -> String {
+        let identity = format!(
+            "{}\0{}\0{}\0{}",
+            self.source_url,
+            self.target_label(),
+            self.directory.display(),
+            self.container_name
+        );
+        let digest = Sha256::digest(identity.as_bytes());
+        digest[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
     pub fn target_label(&self) -> String {
         match &self.target {
             Target::Local => "local".to_owned(),
@@ -189,6 +232,9 @@ impl fmt::Debug for DeploymentConfig {
         formatter
             .debug_struct("DeploymentConfig")
             .field("source_url", &self.source_url)
+            .field("source_account_mode", &self.source_account_mode)
+            .field("source_username", &self.source_username)
+            .field("source_password", &"<redacted>")
             .field("website_name", &self.website_name)
             .field("container_name", &self.container_name)
             .field("directory", &self.directory)
@@ -214,6 +260,12 @@ impl fmt::Display for DeploymentConfig {
         writeln!(formatter, "directory: {}", self.directory.display())?;
         writeln!(formatter, "target: {}", self.target_label())?;
         writeln!(formatter, "source_url: {}", self.source_url)?;
+        writeln!(formatter, "source_username: {}", self.source_username)?;
+        writeln!(
+            formatter,
+            "source_account_mode: {:?}",
+            self.source_account_mode
+        )?;
         writeln!(
             formatter,
             "newapi: {}:{}",
@@ -243,6 +295,29 @@ pub async fn interactive_config(args: &OnboardArgs) -> Result<DeploymentConfig> 
 
 fn prompt_config() -> Result<DeploymentConfig> {
     prompt_io(intro("meowai-deploy  ·  onboard"))?;
+    prompt_io(log::step("源站账号"))?;
+    let source_url: String = prompt_io(
+        input("源站 URL")
+            .default_input(DEFAULT_SOURCE_URL)
+            .interact(),
+    )?;
+    let source_account_mode: SourceAccountMode = prompt_io(
+        select("账号操作")
+            .item(
+                SourceAccountMode::Login,
+                "登录已有账号",
+                "使用源站现有普通账号",
+            )
+            .item(
+                SourceAccountMode::Register,
+                "注册新账号",
+                "在源站创建普通账号后继续",
+            )
+            .initial_value(SourceAccountMode::Login)
+            .interact(),
+    )?;
+    let source_username: String = prompt_io(input("源站用户名").interact())?;
+    let source_password = Some(prompt_io(password("源站密码").mask('•').interact())?);
     prompt_io(log::step("项目身份"))?;
     let website_name: String = prompt_io(
         input("网站名称")
@@ -263,11 +338,6 @@ fn prompt_config() -> Result<DeploymentConfig> {
     let kuma_bind = prompt_bind("Uptime Kuma 监听地址")?;
     let newapi_port = prompt_port("New API 端口", DEFAULT_NEWAPI_PORT)?;
     let kuma_port = prompt_port("Uptime Kuma 端口", DEFAULT_KUMA_PORT)?;
-    let source_url: String = prompt_io(
-        input("源站 URL")
-            .default_input(DEFAULT_SOURCE_URL)
-            .interact(),
-    )?;
     let target: String = prompt_io(
         select("部署方式")
             .item("local".to_owned(), "本机", "直接在当前服务器运行")
@@ -288,6 +358,9 @@ fn prompt_config() -> Result<DeploymentConfig> {
     let kuma_admin_password = Some(prompt_secret("Uptime Kuma 管理员密码")?);
     let config = DeploymentConfig {
         source_url,
+        source_account_mode,
+        source_username,
+        source_password: source_password.map(SecretString::from),
         website_name,
         container_name,
         directory,
@@ -407,11 +480,44 @@ mod tests {
         let config = DeploymentConfig {
             newapi_admin_password: Some("newapi-secret".to_owned()),
             kuma_admin_password: Some("kuma-secret".to_owned()),
+            source_username: "source-user".to_owned(),
+            source_password: Some(SecretString::from("source-secret".to_owned())),
             ..DeploymentConfig::default()
         };
         let debug = format!("{config:?}");
         assert!(!debug.contains("newapi-secret"));
         assert!(!debug.contains("kuma-secret"));
+        assert!(!debug.contains("source-secret"));
         assert!(debug.contains("<redacted>"));
+        let serialized = toml::to_string(&config).expect("serialize non-secret config");
+        assert!(!serialized.contains("source-secret"));
+        assert!(!serialized.contains("source_password"));
+    }
+
+    #[test]
+    fn source_credentials_follow_source_validation_limits() {
+        let short =
+            SourceCredentials::new("valid-user", SecretString::from("valid-pass".to_owned()));
+        assert!(short.is_ok());
+        assert!(
+            SourceCredentials::new(
+                "this-username-is-too-long",
+                SecretString::from("valid-pass".to_owned())
+            )
+            .is_err()
+        );
+        assert!(
+            SourceCredentials::new("valid-user", SecretString::from("tiny".to_owned())).is_err()
+        );
+    }
+
+    #[test]
+    fn deployment_id_is_stable_for_the_same_target() {
+        let mut first = DeploymentConfig::default();
+        first.normalize();
+        let mut second = first.clone();
+        assert_eq!(first.deployment_id(), second.deployment_id());
+        second.container_name = "other".to_owned();
+        assert_ne!(first.deployment_id(), second.deployment_id());
     }
 }
