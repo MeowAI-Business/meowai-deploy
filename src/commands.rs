@@ -73,6 +73,10 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
     let catalog = source.groups().await?;
     progress.stop(format!("已读取 {} 个可见分组", catalog.groups.len()));
 
+    progress.start("读取源站价格配置");
+    let source_pricing = source.pricing().await?;
+    progress.stop("已读取并校验 8 个源站价格配置");
+
     progress.start("同步源站分组 Token");
     let token_sync = source
         .ensure_group_tokens(&config.deployment_id(), &catalog)
@@ -138,7 +142,7 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
     progress.stop("下游管理员已生成，站点配置已写入");
 
     progress.start("导入下游价格配置");
-    let pricing_hashes = downstream.import_pricing().await?;
+    let pricing_hashes = downstream.import_pricing(&source_pricing).await?;
     deployment.state.pricing_sha256 = pricing_hashes;
     deployment
         .state
@@ -245,6 +249,11 @@ async fn run_sync_inner(
     }
 
     let catalog = source.groups().await?;
+    let source_pricing = if args.pricing {
+        Some(source.pricing().await?)
+    } else {
+        None
+    };
     let active_group_ids = catalog
         .groups
         .iter()
@@ -284,8 +293,8 @@ async fn run_sync_inner(
         .disable_removed_channels(&previous_channels, &mut channels)
         .await?;
     deployment.state.channels = channels;
-    if args.pricing {
-        deployment.state.pricing_sha256 = downstream.import_pricing().await?;
+    if let Some(source_pricing) = &source_pricing {
+        deployment.state.pricing_sha256 = downstream.import_pricing(source_pricing).await?;
         deployment
             .state
             .mark_phase("pricing", "DONE", "8 个价格 option 已重新导入并回读一致");

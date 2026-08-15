@@ -57,6 +57,19 @@ fn token(id: i64, name: &str, group: &str) -> Value {
     })
 }
 
+fn pricing_data() -> Value {
+    json!({
+        "model_price": {"fixed": 2},
+        "model_ratio": {"input": 1},
+        "cache_ratio": {"cache": 0.5},
+        "create_cache_ratio": {"create": 1.25},
+        "completion_ratio": {"output": 3},
+        "image_ratio": {"image": 4},
+        "audio_ratio": {"audio": 5},
+        "audio_completion_ratio": {"audio-output": 6}
+    })
+}
+
 async fn mount_login(server: &MockServer) {
     Mock::given(method("POST"))
         .and(path("/api/user/login"))
@@ -699,6 +712,82 @@ async fn status_client_reads_direct_manifest_snapshot_and_monitor_payloads() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn pricing_reads_all_eight_authenticated_source_fields() {
+    let server = MockServer::start().await;
+    let mut client = authenticated_client(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/onboard/pricing"))
+        .and(header("authorization", "Bearer access-one"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "message": "",
+            "data": pricing_data()
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let pricing = client.pricing().await.expect("read source pricing");
+    let options = pricing.options().expect("build downstream options");
+    assert_eq!(options.len(), 8);
+    assert_eq!(
+        options
+            .iter()
+            .map(|option| option.source_field)
+            .collect::<Vec<_>>(),
+        [
+            "model_price",
+            "model_ratio",
+            "cache_ratio",
+            "create_cache_ratio",
+            "completion_ratio",
+            "image_ratio",
+            "audio_ratio",
+            "audio_completion_ratio"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn pricing_rejects_missing_or_invalid_source_fields() {
+    let mut missing = pricing_data();
+    missing
+        .as_object_mut()
+        .expect("pricing object")
+        .remove("audio_completion_ratio");
+    let mut invalid = pricing_data();
+    invalid
+        .as_object_mut()
+        .expect("pricing object")
+        .insert("model_price".to_owned(), json!({"": 1}));
+
+    for data in [missing, invalid] {
+        let server = MockServer::start().await;
+        let mut client = authenticated_client(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/onboard/pricing"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "message": "",
+                "data": data
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let error = client
+            .pricing()
+            .await
+            .expect_err("invalid pricing must be rejected");
+        assert!(matches!(
+            error,
+            SourceError::InvalidResponse { ref endpoint, .. }
+                if endpoint == "/api/onboard/pricing"
+        ));
+    }
 }
 
 fn group(name: &str, ratio: impl Into<Value>) -> SourceGroup {

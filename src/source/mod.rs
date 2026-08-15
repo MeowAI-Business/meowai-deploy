@@ -1,6 +1,7 @@
 mod auth;
 mod groups;
 mod onboard_status;
+mod pricing;
 
 pub use auth::{SourceAccountMode, SourceCredentials, SourceIdentity};
 pub use groups::{GroupCatalog, SourceGroup, TokenBinding, TokenSync};

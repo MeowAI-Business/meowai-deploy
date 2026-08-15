@@ -1,78 +1,77 @@
 use std::{collections::BTreeMap, fmt};
 
 use serde::{Deserialize, Deserializer, de::MapAccess};
+use serde_json::Value;
 
 use crate::{
     error::{AppError, Result},
     security::sha256_hex,
 };
 
-const SNAPSHOTS: [(&str, &str, &str); 8] = [
-    (
-        "ModelPrice",
-        "模型固定定价.json",
-        include_str!("../assets/pricing/模型固定定价.json"),
-    ),
-    (
-        "ModelRatio",
-        "模型倍率.json",
-        include_str!("../assets/pricing/模型倍率.json"),
-    ),
-    (
-        "CacheRatio",
-        "提示缓存倍率.json",
-        include_str!("../assets/pricing/提示缓存倍率.json"),
-    ),
-    (
-        "CreateCacheRatio",
-        "创建缓存倍率.json",
-        include_str!("../assets/pricing/创建缓存倍率.json"),
-    ),
-    (
-        "CompletionRatio",
-        "补全倍率.json",
-        include_str!("../assets/pricing/补全倍率.json"),
-    ),
-    (
-        "ImageRatio",
-        "图片倍率.json",
-        include_str!("../assets/pricing/图片倍率.json"),
-    ),
-    (
-        "AudioRatio",
-        "音频倍率.json",
-        include_str!("../assets/pricing/音频倍率.json"),
-    ),
-    (
-        "AudioCompletionRatio",
-        "音频补全倍率.json",
-        include_str!("../assets/pricing/音频补全倍率.json"),
-    ),
-];
-
 #[derive(Clone, Debug)]
 pub struct PricingOption {
     pub key: &'static str,
-    pub file_name: &'static str,
+    pub source_field: &'static str,
     pub canonical_json: String,
     pub sha256: String,
 }
 
-pub fn embedded_pricing() -> Result<Vec<PricingOption>> {
-    SNAPSHOTS
-        .iter()
-        .map(|(key, file_name, source)| {
-            let canonical_json = canonical_price_json(source).map_err(|error| {
-                AppError::State(format!("invalid embedded price file {file_name}: {error}"))
+#[derive(Clone, Debug, Deserialize)]
+pub struct PricingConfig {
+    model_price: StrictPriceMap,
+    model_ratio: StrictPriceMap,
+    cache_ratio: StrictPriceMap,
+    create_cache_ratio: StrictPriceMap,
+    completion_ratio: StrictPriceMap,
+    image_ratio: StrictPriceMap,
+    audio_ratio: StrictPriceMap,
+    audio_completion_ratio: StrictPriceMap,
+}
+
+impl PricingConfig {
+    pub fn from_value(value: Value) -> std::result::Result<Self, String> {
+        serde_json::from_value(value).map_err(|error| error.to_string())
+    }
+
+    pub fn options(&self) -> Result<Vec<PricingOption>> {
+        [
+            ("ModelPrice", "model_price", &self.model_price),
+            ("ModelRatio", "model_ratio", &self.model_ratio),
+            ("CacheRatio", "cache_ratio", &self.cache_ratio),
+            (
+                "CreateCacheRatio",
+                "create_cache_ratio",
+                &self.create_cache_ratio,
+            ),
+            (
+                "CompletionRatio",
+                "completion_ratio",
+                &self.completion_ratio,
+            ),
+            ("ImageRatio", "image_ratio", &self.image_ratio),
+            ("AudioRatio", "audio_ratio", &self.audio_ratio),
+            (
+                "AudioCompletionRatio",
+                "audio_completion_ratio",
+                &self.audio_completion_ratio,
+            ),
+        ]
+        .into_iter()
+        .map(|(key, source_field, values)| {
+            let canonical_json = serde_json::to_string(&values.0).map_err(|error| {
+                AppError::State(format!(
+                    "serialize source pricing field {source_field}: {error}"
+                ))
             })?;
             Ok(PricingOption {
                 key,
-                file_name,
+                source_field,
                 sha256: sha256_hex(canonical_json.as_bytes()),
                 canonical_json,
             })
         })
         .collect()
+    }
 }
 
 pub fn canonical_price_json(source: &str) -> std::result::Result<String, String> {
@@ -83,6 +82,7 @@ pub fn canonical_price_json(source: &str) -> std::result::Result<String, String>
     serde_json::to_string(&parsed.0).map_err(|error| error.to_string())
 }
 
+#[derive(Clone, Debug)]
 struct StrictPriceMap(BTreeMap<String, f64>);
 
 impl<'de> Deserialize<'de> for StrictPriceMap {
@@ -135,10 +135,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_embedded_price_snapshots_are_valid() {
-        let snapshots = embedded_pricing().expect("parse snapshots");
-        assert_eq!(snapshots.len(), 8);
-        assert!(snapshots.iter().all(|snapshot| snapshot.sha256.len() == 64));
+    fn source_configuration_maps_all_eight_options() {
+        let config = PricingConfig::from_value(serde_json::json!({
+            "model_price": {"fixed": 2},
+            "model_ratio": {"input": 1},
+            "cache_ratio": {"cache": 0.5},
+            "create_cache_ratio": {"create": 1.25},
+            "completion_ratio": {"output": 3},
+            "image_ratio": {"image": 4},
+            "audio_ratio": {"audio": 5},
+            "audio_completion_ratio": {"audio-output": 6}
+        }))
+        .expect("parse source pricing");
+
+        let options = config.options().expect("build pricing options");
+        assert_eq!(options.len(), 8);
+        assert_eq!(options[0].key, "ModelPrice");
+        assert_eq!(options[0].source_field, "model_price");
+        assert_eq!(options[0].canonical_json, r#"{"fixed":2.0}"#);
+        assert!(options.iter().all(|option| option.sha256.len() == 64));
+    }
+
+    #[test]
+    fn source_configuration_requires_all_fields_and_valid_maps() {
+        let missing = serde_json::json!({
+            "model_price": {},
+            "model_ratio": {},
+            "cache_ratio": {},
+            "create_cache_ratio": {},
+            "completion_ratio": {},
+            "image_ratio": {},
+            "audio_ratio": {}
+        });
+        assert!(PricingConfig::from_value(missing).is_err());
+
+        let invalid = serde_json::json!({
+            "model_price": {"": 1},
+            "model_ratio": {},
+            "cache_ratio": {},
+            "create_cache_ratio": {},
+            "completion_ratio": {},
+            "image_ratio": {},
+            "audio_ratio": {},
+            "audio_completion_ratio": {}
+        });
+        assert!(PricingConfig::from_value(invalid).is_err());
     }
 
     #[test]

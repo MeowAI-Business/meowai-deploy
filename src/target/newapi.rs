@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use crate::{
     config::DeploymentConfig,
     error::{AppError, Result},
-    pricing::embedded_pricing,
+    pricing::PricingConfig,
     security::sha256_hex,
     source::{GroupCatalog, TokenBinding},
     state::ChannelState,
@@ -138,34 +138,34 @@ impl NewApiClient {
             .await
     }
 
-    pub async fn import_pricing(&self) -> Result<BTreeMap<String, String>> {
-        let snapshots = embedded_pricing()?;
-        for snapshot in &snapshots {
-            self.update_option(snapshot.key, &snapshot.canonical_json)
+    pub async fn import_pricing(
+        &self,
+        source_pricing: &PricingConfig,
+    ) -> Result<BTreeMap<String, String>> {
+        let options_to_import = source_pricing.options()?;
+        for option in &options_to_import {
+            self.update_option(option.key, &option.canonical_json)
                 .await?;
         }
         let options = self.options().await?;
         let mut hashes = BTreeMap::new();
-        for snapshot in &snapshots {
-            let returned = options.get(snapshot.key).ok_or_else(|| {
-                AppError::Target(format!(
-                    "downstream option {} was not returned",
-                    snapshot.key
-                ))
+        for option in &options_to_import {
+            let returned = options.get(option.key).ok_or_else(|| {
+                AppError::Target(format!("downstream option {} was not returned", option.key))
             })?;
             let canonical = crate::pricing::canonical_price_json(returned).map_err(|error| {
                 AppError::Target(format!(
                     "downstream option {} is invalid after import: {error}",
-                    snapshot.key
+                    option.key
                 ))
             })?;
-            if canonical != snapshot.canonical_json {
+            if canonical != option.canonical_json {
                 return Err(AppError::Target(format!(
                     "downstream option {} differs after import",
-                    snapshot.key
+                    option.key
                 )));
             }
-            hashes.insert(snapshot.file_name.to_owned(), snapshot.sha256.clone());
+            hashes.insert(option.source_field.to_owned(), option.sha256.clone());
         }
         Ok(hashes)
     }
@@ -550,6 +550,17 @@ fn channel_needs_update(current: &RemoteChannel, desired: &DesiredChannel) -> bo
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use secrecy::SecretString;
+    use serde_json::json;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+
+    use crate::{config::Target, pricing::PricingConfig};
+
     use super::*;
 
     #[test]
@@ -582,5 +593,58 @@ mod tests {
             tag: Some(desired.tag.clone()),
         };
         assert!(!channel_needs_update(&current, &desired));
+    }
+
+    #[tokio::test]
+    async fn import_pricing_writes_and_reads_all_source_options() {
+        let source_pricing = PricingConfig::from_value(json!({
+            "model_price": {"fixed": 2},
+            "model_ratio": {"input": 1},
+            "cache_ratio": {"cache": 0.5},
+            "create_cache_ratio": {"create": 1.25},
+            "completion_ratio": {"output": 3},
+            "image_ratio": {"image": 4},
+            "audio_ratio": {"audio": 5},
+            "audio_completion_ratio": {"audio-output": 6}
+        }))
+        .expect("parse source pricing");
+        let options = source_pricing.options().expect("build source options");
+        let returned_options = options
+            .iter()
+            .map(|option| json!({"key": option.key, "value": option.canonical_json}))
+            .collect::<Vec<_>>();
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/option/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "message": ""
+            })))
+            .expect(8)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/option/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "message": "",
+                "data": returned_options
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let port = server.address().port();
+        let executor = TargetExecutor::new(Target::Local, PathBuf::from("/tmp/meowai-deploy-test"));
+        let mut client = NewApiClient::connect(&executor, port).expect("create client");
+        client.access_token = Some(SecretString::from("downstream-admin"));
+
+        let hashes = client
+            .import_pricing(&source_pricing)
+            .await
+            .expect("import source pricing");
+        assert_eq!(hashes.len(), 8);
+        assert_eq!(hashes.get("model_price").map(String::len), Some(64));
     }
 }

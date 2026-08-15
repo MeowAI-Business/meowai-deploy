@@ -44,7 +44,7 @@ pub struct SyncArgs {
     #[command(flatten)]
     pub deployment: DeploymentArgs,
 
-    /// Re-import the bundled pricing snapshots. By default pricing is left untouched.
+    /// Re-import current source pricing. By default pricing is left untouched.
     #[arg(long)]
     pub pricing: bool,
 
