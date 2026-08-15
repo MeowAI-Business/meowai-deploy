@@ -9,7 +9,7 @@ use std::{
     net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use shell_escape::escape;
@@ -254,14 +254,30 @@ docker --config "$registry_config" pull --platform linux/amd64 {image}"#,
                     .arg(destination)
                     .spawn()
                     .map_err(|error| AppError::Target(format!("open SSH tunnel: {error}")))?;
-                std::thread::sleep(std::time::Duration::from_millis(350));
-                if let Some(status) = child
-                    .try_wait()
-                    .map_err(|error| AppError::Target(format!("check SSH tunnel: {error}")))?
-                {
-                    return Err(AppError::Target(format!(
-                        "SSH tunnel exited early with {status}"
-                    )));
+                let tunnel_address = SocketAddr::from(([127, 0, 0, 1], local_port));
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    if let Some(status) = child
+                        .try_wait()
+                        .map_err(|error| AppError::Target(format!("check SSH tunnel: {error}")))?
+                    {
+                        return Err(AppError::Target(format!(
+                            "SSH tunnel exited early with {status}"
+                        )));
+                    }
+                    if TcpStream::connect_timeout(&tunnel_address, Duration::from_millis(100))
+                        .is_ok()
+                    {
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(AppError::Target(
+                            "SSH tunnel did not become ready within 10 seconds".to_owned(),
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
                 }
                 Ok(TargetEndpoint {
                     base_url: format!("http://127.0.0.1:{local_port}"),
