@@ -21,7 +21,7 @@ use crate::{
     security::{sha256_hex, write_private_file},
 };
 
-const REMOTE_SCRIPT_RUNNER: &str = r#"if [ "$(id -u)" -eq 0 ]; then
+const PRIVILEGED_SCRIPT_RUNNER: &str = r#"if [ "$(id -u)" -eq 0 ]; then
     exec sh -s
 elif command -v sudo >/dev/null 2>&1 && sudo -n sh -c true >/dev/null 2>&1; then
     exec sudo -n sh -s
@@ -70,9 +70,6 @@ impl TargetExecutor {
     }
 
     pub fn validate_access(&self) -> Result<()> {
-        let Target::Ssh { destination } = &self.target else {
-            return Ok(());
-        };
         let directory = quote_path(&self.directory);
         let script = format!(
             r#"set -eu
@@ -89,15 +86,43 @@ done
 if [ -d "$path" ] && [ -w "$path" ] && docker info >/dev/null 2>&1; then
     exit 0
 fi
-printf '%s\n' 'SSH 用户不是 root、没有免密 sudo，且无法以当前用户写入部署目录并使用 Docker' >&2
+printf '%s\n' '当前用户不是 root、没有可用的 sudo，且无法写入部署目录并使用 Docker' >&2
 exit 1"#,
         );
-        let output = Command::new("ssh")
-            .args(["-o", "ConnectTimeout=10"])
-            .arg(destination)
-            .arg(script)
-            .output()
-            .map_err(|error| AppError::Target(format!("failed to start ssh: {error}")))?;
+        let output = match &self.target {
+            Target::Local => {
+                let direct =
+                    Command::new("sh")
+                        .args(["-c", &script])
+                        .output()
+                        .map_err(|error| {
+                            AppError::Target(format!("failed to validate local access: {error}"))
+                        })?;
+                if direct.status.success() {
+                    return Ok(());
+                }
+                Command::new("sudo")
+                    .arg("-v")
+                    .status()
+                    .map_err(|error| {
+                        AppError::Target(format!("本机部署目录需要提权，但无法启动 sudo: {error}"))
+                    })
+                    .and_then(|status| {
+                        if status.success() {
+                            Ok(())
+                        } else {
+                            Err(AppError::Target(format!("sudo 身份验证失败（{status}）")))
+                        }
+                    })?;
+                return Ok(());
+            }
+            Target::Ssh { destination } => Command::new("ssh")
+                .args(["-o", "ConnectTimeout=10"])
+                .arg(destination)
+                .arg(script)
+                .output()
+                .map_err(|error| AppError::Target(format!("failed to start ssh: {error}")))?,
+        };
         require_success("验证 SSH 连接和部署权限", output)?;
         Ok(())
     }
@@ -126,15 +151,17 @@ exit 1"#,
         let destination = self.directory.join(relative);
         match &self.target {
             Target::Local => {
-                if private {
-                    write_private_file(&destination, content)
-                } else {
-                    fs::write(&destination, content).map_err(|source| AppError::WriteFile {
-                        path: destination,
-                        source,
-                    })?;
-                    Ok(())
-                }
+                let temporary = tempfile::NamedTempFile::new().map_err(|error| {
+                    AppError::Target(format!("create local upload file: {error}"))
+                })?;
+                write_private_file(temporary.path(), content)?;
+                let mode = if private { "600" } else { "644" };
+                self.run_script(&format!(
+                    "install -m {mode} {temporary} {destination}",
+                    temporary = quote_path(temporary.path()),
+                    destination = quote_path(&destination),
+                ))?;
+                Ok(())
             }
             Target::Ssh { destination: host } => {
                 let temporary = tempfile::NamedTempFile::new()
@@ -304,7 +331,7 @@ docker --config "$registry_config" pull --platform linux/amd64 {image}"#,
         match &self.target {
             Target::Local => {
                 let mut child = Command::new("sh")
-                    .arg("-s")
+                    .args(["-c", PRIVILEGED_SCRIPT_RUNNER])
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
@@ -323,7 +350,7 @@ docker --config "$registry_config" pull --platform linux/amd64 {image}"#,
             Target::Ssh { destination } => {
                 let mut child = Command::new("ssh")
                     .arg(destination)
-                    .arg(REMOTE_SCRIPT_RUNNER)
+                    .arg(PRIVILEGED_SCRIPT_RUNNER)
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
@@ -433,11 +460,11 @@ mod tests {
     }
 
     #[test]
-    fn remote_scripts_support_root_passwordless_sudo_and_unprivileged_users() {
-        assert!(REMOTE_SCRIPT_RUNNER.contains("id -u"));
-        assert!(REMOTE_SCRIPT_RUNNER.contains("sudo -n sh -c true"));
-        assert!(REMOTE_SCRIPT_RUNNER.contains("sudo -n sh -s"));
-        assert!(REMOTE_SCRIPT_RUNNER.contains("exec sh -s"));
+    fn target_scripts_support_root_passwordless_sudo_and_unprivileged_users() {
+        assert!(PRIVILEGED_SCRIPT_RUNNER.contains("id -u"));
+        assert!(PRIVILEGED_SCRIPT_RUNNER.contains("sudo -n sh -c true"));
+        assert!(PRIVILEGED_SCRIPT_RUNNER.contains("sudo -n sh -s"));
+        assert!(PRIVILEGED_SCRIPT_RUNNER.contains("exec sh -s"));
     }
 
     #[test]
