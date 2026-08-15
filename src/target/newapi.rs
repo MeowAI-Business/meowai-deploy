@@ -172,6 +172,21 @@ impl NewApiClient {
             .await
     }
 
+    pub async fn configure_public_status_url(&self, public_status_url: &str) -> Result<()> {
+        self.update_option("console_setting.public_status_url", public_status_url)
+            .await?;
+        let options = self.options().await?;
+        if options
+            .get("console_setting.public_status_url")
+            .is_none_or(|value| value != public_status_url)
+        {
+            return Err(AppError::Target(
+                "downstream public status URL differs after configuration".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn import_pricing(
         &self,
         source_pricing: &PricingConfig,
@@ -953,6 +968,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_status_url_is_written_to_the_downstream_kuma_page() {
+        let server = MockServer::start().await;
+        let expected = "http://uptime-kuma:3001/status/meowai-abcdef12";
+        Mock::given(method("PUT"))
+            .and(path("/api/option/"))
+            .and(wiremock::matchers::body_json(json!({
+                "key": "console_setting.public_status_url",
+                "value": expected
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "message": ""
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/option/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "message": "",
+                "data": [{
+                    "key": "console_setting.public_status_url",
+                    "value": expected
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let port = server.address().port();
+        let executor = TargetExecutor::new(Target::Local, PathBuf::from("/tmp/meowai-deploy-test"));
+        let mut client = NewApiClient::connect(&executor, port).expect("create client");
+        client.access_token = Some(SecretString::from("downstream-admin"));
+        client
+            .configure_public_status_url(expected)
+            .await
+            .expect("configure downstream Kuma URL");
+    }
+
+    #[tokio::test]
     async fn import_pricing_writes_and_reads_all_source_options() {
         let source_pricing = PricingConfig::from_value(json!({
             "model_price": {"fixed": 2},
@@ -978,7 +1034,7 @@ mod tests {
                 "success": true,
                 "message": ""
             })))
-            .expect(20)
+            .expect(19)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -1021,7 +1077,7 @@ mod tests {
             .import_pricing(&source_pricing)
             .await
             .expect("import source pricing");
-        assert_eq!(hashes.len(), 23);
+        assert_eq!(hashes.len(), 22);
         assert_eq!(hashes.get("model_price").map(String::len), Some(64));
     }
 }

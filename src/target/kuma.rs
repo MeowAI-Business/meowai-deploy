@@ -59,6 +59,10 @@ pub fn status_page_slug(deployment_id: &str) -> String {
     format!("meowai-{deployment_id}")
 }
 
+pub fn internal_status_page_url(slug: &str) -> String {
+    format!("http://uptime-kuma:3001/status/{slug}")
+}
+
 pub fn sync_status_page(options: KumaSyncOptions<'_>) -> Result<KumaSyncResult> {
     if !options.manifest.success {
         return Err(AppError::Target(
@@ -127,5 +131,9 @@ mod tests {
     #[test]
     fn status_page_slug_is_stable_and_safe() {
         assert_eq!(status_page_slug("abcdef12"), "meowai-abcdef12");
+        assert_eq!(
+            internal_status_page_url("meowai-abcdef12"),
+            "http://uptime-kuma:3001/status/meowai-abcdef12"
+        );
     }
 }

@@ -807,7 +807,7 @@ async fn pricing_reads_all_authenticated_source_fields() {
 
     let pricing = client.pricing().await.expect("read source pricing");
     let options = pricing.options().expect("build downstream options");
-    assert_eq!(options.len(), 20);
+    assert_eq!(options.len(), 19);
     assert_eq!(
         options
             .iter()
@@ -832,8 +832,7 @@ async fn pricing_reads_all_authenticated_source_fields() {
             "video_setting.seedance_domestic_canonical_enabled",
             "video_setting.video_asset_affinity_enforced",
             "video_setting.seedance_completion_token_billing_enabled",
-            "video_setting.video_playground_real_token_enabled",
-            "public_status_url"
+            "video_setting.video_playground_real_token_enabled"
         ]
     );
 }

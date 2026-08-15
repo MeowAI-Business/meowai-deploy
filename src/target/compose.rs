@@ -365,10 +365,6 @@ impl DeploymentRuntime {
 
 fn render_compose(config: &DeploymentConfig, runtime: &DeploymentRuntime) -> Result<String> {
     let image = image_reference(&config.image, &config.image_ref);
-    let source_snapshot = format!(
-        "{}/api/onboard/status/snapshot",
-        runtime.container_source_url.trim_end_matches('/')
-    );
     let newapi = json!({
         "image": image,
         "platform": "linux/amd64",
@@ -382,10 +378,6 @@ fn render_compose(config: &DeploymentConfig, runtime: &DeploymentRuntime) -> Res
             "REDIS_CONN_STRING": "redis://:${REDIS_PASSWORD}@redis:6379",
             "SESSION_SECRET": "${SESSION_SECRET}",
             "TZ": "Asia/Shanghai",
-            "PUBLIC_STATUS_MODE": "onboard",
-            "PUBLIC_STATUS_SOURCE_URL": source_snapshot,
-            "PUBLIC_STATUS_SOURCE_KEY": "${PUBLIC_STATUS_SOURCE_KEY}",
-            "PUBLIC_STATUS_CACHE_SECONDS": "30",
             "SESSION_COOKIE_SECURE": "false"
         },
         "extra_hosts": ["host.docker.internal:host-gateway"],
@@ -581,10 +573,10 @@ mod tests {
         assert_eq!(value["services"]["uptime-kuma"]["image"], KUMA_IMAGE);
         assert_eq!(value["services"]["new-api"]["platform"], "linux/amd64");
         assert_eq!(value["services"]["new-api"]["pull_policy"], "missing");
-        assert_eq!(
-            value["services"]["new-api"]["environment"]["PUBLIC_STATUS_SOURCE_URL"],
-            "http://host.docker.internal:3004/api/onboard/status/snapshot"
-        );
+        let environment = &value["services"]["new-api"]["environment"];
+        assert!(environment.get("PUBLIC_STATUS_MODE").is_none());
+        assert!(environment.get("PUBLIC_STATUS_SOURCE_URL").is_none());
+        assert!(environment.get("PUBLIC_STATUS_SOURCE_KEY").is_none());
     }
 
     #[test]

@@ -103,7 +103,8 @@ pub struct PricingConfig {
     #[serde(default)]
     pub video_capabilities: Vec<VideoCapabilityPolicy>,
     #[serde(default)]
-    public_status_url: String,
+    #[serde(rename = "public_status_url")]
+    _public_status_url: String,
 }
 
 impl PricingConfig {
@@ -231,11 +232,6 @@ impl PricingConfig {
             "video_setting.video_playground_real_token_enabled",
             "video_setting.video_playground_real_token_enabled",
             bool_string(self.video_setting.video_playground_real_token_enabled),
-        ));
-        options.push(exact_option(
-            "console_setting.public_status_url",
-            "public_status_url",
-            &self.public_status_url,
         ));
         Ok(options)
     }
@@ -365,7 +361,12 @@ mod tests {
         .expect("parse source pricing");
 
         let options = config.options().expect("build pricing options");
-        assert_eq!(options.len(), 20);
+        assert_eq!(options.len(), 19);
+        assert!(
+            options
+                .iter()
+                .all(|option| option.key != "console_setting.public_status_url")
+        );
         assert_eq!(options[0].key, "ModelPrice");
         assert_eq!(options[0].source_field, "model_price");
         assert_eq!(options[0].canonical_json, r#"{"fixed":2.0}"#);

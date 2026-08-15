@@ -263,6 +263,10 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
     })?;
     deployment.state.manifest_sha256 = kuma_sync.manifest_sha256;
     deployment.state.kuma_monitors = kuma_sync.monitors;
+    let public_status_url = kuma::internal_status_page_url(&kuma_sync.page_slug);
+    downstream
+        .configure_public_status_url(&public_status_url)
+        .await?;
     deployment.state.mark_phase(
         "kuma",
         "DONE",
@@ -273,8 +277,9 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
     );
     deployment.persist_state()?;
     print_done(&format!(
-        "已同步 {} 个公共状态监控",
-        deployment.state.kuma_monitors.len()
+        "已同步 {} 个公共状态监控，公开状态页 {}",
+        deployment.state.kuma_monitors.len(),
+        public_status_url
     ));
     deployment.state.last_sync_at = unix_timestamp();
     deployment.state.last_sync_success = true;
@@ -409,6 +414,10 @@ async fn run_sync_inner(
     })?;
     deployment.state.manifest_sha256 = kuma_sync.manifest_sha256;
     deployment.state.kuma_monitors = kuma_sync.monitors;
+    let public_status_url = kuma::internal_status_page_url(&kuma_sync.page_slug);
+    downstream
+        .configure_public_status_url(&public_status_url)
+        .await?;
     deployment.state.mark_phase(
         "kuma",
         "DONE",
