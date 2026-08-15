@@ -1018,7 +1018,26 @@ mod tests {
             "completion_ratio": {"output": 3},
             "image_ratio": {"image": 4},
             "audio_ratio": {"audio": 5},
-            "audio_completion_ratio": {"audio-output": 6}
+            "audio_completion_ratio": {"audio-output": 6},
+            "marketplace": {
+                "marketplace_enabled": true,
+                "provider_self_apply_enabled": false,
+                "official_groups_selectable_enabled": true,
+                "marketplace_commission_bps": 2000,
+                "marketplace_probe_interval_minutes": 10,
+                "official_credential_recheck_enabled": true,
+                "official_credential_rate_limit_cooldown_seconds": 60,
+                "official_credential_recheck_scan_interval_seconds": 300,
+                "official_credential_health_recheck_interval_seconds": 21600,
+                "official_credential_grade_recheck_interval_seconds": 604800,
+                "official_credential_failed_recheck_interval_seconds": 900,
+                "official_credential_recheck_batch_size": 50,
+                "official_credential_recheck_lock_seconds": 600,
+                "official_credential_supplier_recheck_min_interval_seconds": 900,
+                "official_credential_supplier_recheck_daily_limit": 10,
+                "official_credential_recheck_jitter_seconds": 300,
+                "official_credential_availability_window_days": 30
+            }
         }))
         .expect("parse source pricing");
         let options = source_pricing.options().expect("build source options");
@@ -1034,7 +1053,7 @@ mod tests {
                 "success": true,
                 "message": ""
             })))
-            .expect(19)
+            .expect(36)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -1077,7 +1096,7 @@ mod tests {
             .import_pricing(&source_pricing)
             .await
             .expect("import source pricing");
-        assert_eq!(hashes.len(), 22);
+        assert_eq!(hashes.len(), 39);
         assert_eq!(hashes.get("model_price").map(String::len), Some(64));
     }
 }

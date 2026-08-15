@@ -66,7 +66,30 @@ fn pricing_data() -> Value {
         "completion_ratio": {"output": 3},
         "image_ratio": {"image": 4},
         "audio_ratio": {"audio": 5},
-        "audio_completion_ratio": {"audio-output": 6}
+        "audio_completion_ratio": {"audio-output": 6},
+        "marketplace": marketplace_data()
+    })
+}
+
+fn marketplace_data() -> Value {
+    json!({
+        "marketplace_enabled": true,
+        "provider_self_apply_enabled": false,
+        "official_groups_selectable_enabled": true,
+        "marketplace_commission_bps": 2000,
+        "marketplace_probe_interval_minutes": 10,
+        "official_credential_recheck_enabled": true,
+        "official_credential_rate_limit_cooldown_seconds": 60,
+        "official_credential_recheck_scan_interval_seconds": 300,
+        "official_credential_health_recheck_interval_seconds": 21600,
+        "official_credential_grade_recheck_interval_seconds": 604800,
+        "official_credential_failed_recheck_interval_seconds": 900,
+        "official_credential_recheck_batch_size": 50,
+        "official_credential_recheck_lock_seconds": 600,
+        "official_credential_supplier_recheck_min_interval_seconds": 900,
+        "official_credential_supplier_recheck_daily_limit": 10,
+        "official_credential_recheck_jitter_seconds": 300,
+        "official_credential_availability_window_days": 30
     })
 }
 
@@ -807,7 +830,7 @@ async fn pricing_reads_all_authenticated_source_fields() {
 
     let pricing = client.pricing().await.expect("read source pricing");
     let options = pricing.options().expect("build downstream options");
-    assert_eq!(options.len(), 19);
+    assert_eq!(options.len(), 36);
     assert_eq!(
         options
             .iter()
@@ -832,7 +855,24 @@ async fn pricing_reads_all_authenticated_source_fields() {
             "video_setting.seedance_domestic_canonical_enabled",
             "video_setting.video_asset_affinity_enforced",
             "video_setting.seedance_completion_token_billing_enabled",
-            "video_setting.video_playground_real_token_enabled"
+            "video_setting.video_playground_real_token_enabled",
+            "marketplace.marketplace_enabled",
+            "marketplace.provider_self_apply_enabled",
+            "marketplace.official_groups_selectable_enabled",
+            "marketplace.marketplace_commission_bps",
+            "marketplace.marketplace_probe_interval_minutes",
+            "marketplace.official_credential_recheck_enabled",
+            "marketplace.official_credential_rate_limit_cooldown_seconds",
+            "marketplace.official_credential_recheck_scan_interval_seconds",
+            "marketplace.official_credential_health_recheck_interval_seconds",
+            "marketplace.official_credential_grade_recheck_interval_seconds",
+            "marketplace.official_credential_failed_recheck_interval_seconds",
+            "marketplace.official_credential_recheck_batch_size",
+            "marketplace.official_credential_recheck_lock_seconds",
+            "marketplace.official_credential_supplier_recheck_min_interval_seconds",
+            "marketplace.official_credential_supplier_recheck_daily_limit",
+            "marketplace.official_credential_recheck_jitter_seconds",
+            "marketplace.official_credential_availability_window_days"
         ]
     );
 }
@@ -849,8 +889,13 @@ async fn pricing_rejects_missing_or_invalid_source_fields() {
         .as_object_mut()
         .expect("pricing object")
         .insert("model_price".to_owned(), json!({"": 1}));
+    let mut missing_marketplace = pricing_data();
+    missing_marketplace
+        .as_object_mut()
+        .expect("pricing object")
+        .remove("marketplace");
 
-    for data in [missing, invalid] {
+    for data in [missing, invalid, missing_marketplace] {
         let server = MockServer::start().await;
         let mut client = authenticated_client(&server).await;
         Mock::given(method("GET"))

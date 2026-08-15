@@ -42,6 +42,27 @@ pub struct VideoSettingConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MarketplaceConfig {
+    marketplace_enabled: bool,
+    provider_self_apply_enabled: bool,
+    official_groups_selectable_enabled: bool,
+    marketplace_commission_bps: i64,
+    marketplace_probe_interval_minutes: i64,
+    official_credential_recheck_enabled: bool,
+    official_credential_rate_limit_cooldown_seconds: i64,
+    official_credential_recheck_scan_interval_seconds: i64,
+    official_credential_health_recheck_interval_seconds: i64,
+    official_credential_grade_recheck_interval_seconds: i64,
+    official_credential_failed_recheck_interval_seconds: i64,
+    official_credential_recheck_batch_size: i64,
+    official_credential_recheck_lock_seconds: i64,
+    official_credential_supplier_recheck_min_interval_seconds: i64,
+    official_credential_supplier_recheck_daily_limit: i64,
+    official_credential_recheck_jitter_seconds: i64,
+    official_credential_availability_window_days: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct VideoSalesPolicy {
     pub public_model: String,
     pub official_no_video_micros: i64,
@@ -96,6 +117,7 @@ pub struct PricingConfig {
     home_pricing: HomePricingConfig,
     #[serde(default)]
     video_setting: VideoSettingConfig,
+    marketplace: MarketplaceConfig,
     #[serde(default)]
     pub video_sales_policies: Vec<VideoSalesPolicy>,
     #[serde(default)]
@@ -233,6 +255,122 @@ impl PricingConfig {
             "video_setting.video_playground_real_token_enabled",
             bool_string(self.video_setting.video_playground_real_token_enabled),
         ));
+        let marketplace_options = [
+            (
+                "MarketplaceEnabled",
+                "marketplace.marketplace_enabled",
+                bool_string(self.marketplace.marketplace_enabled).to_owned(),
+            ),
+            (
+                "ProviderSelfApplyEnabled",
+                "marketplace.provider_self_apply_enabled",
+                bool_string(self.marketplace.provider_self_apply_enabled).to_owned(),
+            ),
+            (
+                "OfficialGroupsSelectableEnabled",
+                "marketplace.official_groups_selectable_enabled",
+                bool_string(self.marketplace.official_groups_selectable_enabled).to_owned(),
+            ),
+            (
+                "MarketplaceCommissionBps",
+                "marketplace.marketplace_commission_bps",
+                self.marketplace.marketplace_commission_bps.to_string(),
+            ),
+            (
+                "MarketplaceProbeIntervalMinutes",
+                "marketplace.marketplace_probe_interval_minutes",
+                self.marketplace
+                    .marketplace_probe_interval_minutes
+                    .to_string(),
+            ),
+            (
+                "OfficialCredentialRecheckEnabled",
+                "marketplace.official_credential_recheck_enabled",
+                bool_string(self.marketplace.official_credential_recheck_enabled).to_owned(),
+            ),
+            (
+                "OfficialCredentialRateLimitCooldownSeconds",
+                "marketplace.official_credential_rate_limit_cooldown_seconds",
+                self.marketplace
+                    .official_credential_rate_limit_cooldown_seconds
+                    .to_string(),
+            ),
+            (
+                "OfficialCredentialRecheckScanIntervalSeconds",
+                "marketplace.official_credential_recheck_scan_interval_seconds",
+                self.marketplace
+                    .official_credential_recheck_scan_interval_seconds
+                    .to_string(),
+            ),
+            (
+                "OfficialCredentialHealthRecheckIntervalSeconds",
+                "marketplace.official_credential_health_recheck_interval_seconds",
+                self.marketplace
+                    .official_credential_health_recheck_interval_seconds
+                    .to_string(),
+            ),
+            (
+                "OfficialCredentialGradeRecheckIntervalSeconds",
+                "marketplace.official_credential_grade_recheck_interval_seconds",
+                self.marketplace
+                    .official_credential_grade_recheck_interval_seconds
+                    .to_string(),
+            ),
+            (
+                "OfficialCredentialFailedRecheckIntervalSeconds",
+                "marketplace.official_credential_failed_recheck_interval_seconds",
+                self.marketplace
+                    .official_credential_failed_recheck_interval_seconds
+                    .to_string(),
+            ),
+            (
+                "OfficialCredentialRecheckBatchSize",
+                "marketplace.official_credential_recheck_batch_size",
+                self.marketplace
+                    .official_credential_recheck_batch_size
+                    .to_string(),
+            ),
+            (
+                "OfficialCredentialRecheckLockSeconds",
+                "marketplace.official_credential_recheck_lock_seconds",
+                self.marketplace
+                    .official_credential_recheck_lock_seconds
+                    .to_string(),
+            ),
+            (
+                "OfficialCredentialSupplierRecheckMinIntervalSeconds",
+                "marketplace.official_credential_supplier_recheck_min_interval_seconds",
+                self.marketplace
+                    .official_credential_supplier_recheck_min_interval_seconds
+                    .to_string(),
+            ),
+            (
+                "OfficialCredentialSupplierRecheckDailyLimit",
+                "marketplace.official_credential_supplier_recheck_daily_limit",
+                self.marketplace
+                    .official_credential_supplier_recheck_daily_limit
+                    .to_string(),
+            ),
+            (
+                "OfficialCredentialRecheckJitterSeconds",
+                "marketplace.official_credential_recheck_jitter_seconds",
+                self.marketplace
+                    .official_credential_recheck_jitter_seconds
+                    .to_string(),
+            ),
+            (
+                "OfficialCredentialAvailabilityWindowDays",
+                "marketplace.official_credential_availability_window_days",
+                self.marketplace
+                    .official_credential_availability_window_days
+                    .to_string(),
+            ),
+        ];
+        options.extend(
+            marketplace_options
+                .into_iter()
+                .map(|(key, source_field, value)| exact_option(key, source_field, &value)),
+        );
         Ok(options)
     }
 }
@@ -356,12 +494,13 @@ mod tests {
             "completion_ratio": {"output": 3},
             "image_ratio": {"image": 4},
             "audio_ratio": {"audio": 5},
-            "audio_completion_ratio": {"audio-output": 6}
+            "audio_completion_ratio": {"audio-output": 6},
+            "marketplace": marketplace_config()
         }))
         .expect("parse source pricing");
 
         let options = config.options().expect("build pricing options");
-        assert_eq!(options.len(), 19);
+        assert_eq!(options.len(), 36);
         assert!(
             options
                 .iter()
@@ -370,6 +509,20 @@ mod tests {
         assert_eq!(options[0].key, "ModelPrice");
         assert_eq!(options[0].source_field, "model_price");
         assert_eq!(options[0].canonical_json, r#"{"fixed":2.0}"#);
+        let marketplace_enabled = options
+            .iter()
+            .find(|option| option.key == "MarketplaceEnabled")
+            .expect("marketplace enabled option");
+        assert_eq!(
+            marketplace_enabled.source_field,
+            "marketplace.marketplace_enabled"
+        );
+        assert_eq!(marketplace_enabled.canonical_json, "true");
+        let availability_window = options
+            .iter()
+            .find(|option| option.key == "OfficialCredentialAvailabilityWindowDays")
+            .expect("credential availability option");
+        assert_eq!(availability_window.canonical_json, "30");
         assert!(options.iter().all(|option| option.sha256.len() == 64));
     }
 
@@ -379,6 +532,7 @@ mod tests {
             "model_price": {}, "model_ratio": {}, "cache_ratio": {},
             "create_cache_ratio": {}, "completion_ratio": {}, "image_ratio": {},
             "audio_ratio": {}, "audio_completion_ratio": {},
+            "marketplace": marketplace_config(),
             "home_pricing": {
                 "table": "[{\"model\":\"seedance-2.0\",\"note\":\"private\"}]",
                 "title": "", "description": "", "enabled": true
@@ -397,7 +551,8 @@ mod tests {
             "create_cache_ratio": {},
             "completion_ratio": {},
             "image_ratio": {},
-            "audio_ratio": {}
+            "audio_ratio": {},
+            "marketplace": marketplace_config()
         });
         assert!(PricingConfig::from_value(missing).is_err());
 
@@ -409,7 +564,8 @@ mod tests {
             "completion_ratio": {},
             "image_ratio": {},
             "audio_ratio": {},
-            "audio_completion_ratio": {}
+            "audio_completion_ratio": {},
+            "marketplace": marketplace_config()
         });
         assert!(PricingConfig::from_value(invalid).is_err());
     }
@@ -428,5 +584,27 @@ mod tests {
             canonical_price_json(r#"{"z":2,"a":1}"#).expect("canonicalize"),
             r#"{"a":1.0,"z":2.0}"#
         );
+    }
+
+    fn marketplace_config() -> Value {
+        serde_json::json!({
+            "marketplace_enabled": true,
+            "provider_self_apply_enabled": false,
+            "official_groups_selectable_enabled": true,
+            "marketplace_commission_bps": 2000,
+            "marketplace_probe_interval_minutes": 10,
+            "official_credential_recheck_enabled": true,
+            "official_credential_rate_limit_cooldown_seconds": 60,
+            "official_credential_recheck_scan_interval_seconds": 300,
+            "official_credential_health_recheck_interval_seconds": 21600,
+            "official_credential_grade_recheck_interval_seconds": 604800,
+            "official_credential_failed_recheck_interval_seconds": 900,
+            "official_credential_recheck_batch_size": 50,
+            "official_credential_recheck_lock_seconds": 600,
+            "official_credential_supplier_recheck_min_interval_seconds": 900,
+            "official_credential_supplier_recheck_daily_limit": 10,
+            "official_credential_recheck_jitter_seconds": 300,
+            "official_credential_availability_window_days": 30
+        })
     }
 }
