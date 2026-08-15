@@ -28,10 +28,23 @@ pub enum Command {
     Rollback(RollbackArgs),
     /// Remove locally stored session credentials.
     Logout(DeploymentArgs),
+    /// Check for or install a newer meowai-deploy release.
+    Update(UpdateArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct DeploymentArgs {}
+
+#[derive(Debug, Args)]
+pub struct UpdateArgs {
+    /// Check the latest release without replacing the current binary.
+    #[arg(long)]
+    pub check: bool,
+
+    /// Install an available update without asking for confirmation.
+    #[arg(long)]
+    pub yes: bool,
+}
 
 #[derive(Debug, Args)]
 pub struct SyncArgs {

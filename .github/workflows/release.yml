@@ -1,0 +1,61 @@
+name: Release CLI
+
+on:
+  push:
+    tags:
+      - 'v*'
+  release:
+    types:
+      - published
+
+permissions:
+  contents: write
+
+jobs:
+  release-linux-amd64:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Verify tag matches Cargo version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+          test "${GITHUB_REF_NAME}" = "v${version}"
+
+      - name: Build release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +stable build --release --locked
+          mkdir -p dist/package
+          install -m 0755 target/release/meowai-deploy dist/package/meowai-deploy
+          tar -C dist/package -czf dist/meowai-deploy-linux-amd64.tar.gz meowai-deploy
+          (cd dist && sha256sum meowai-deploy-linux-amd64.tar.gz > checksums-sha256.txt)
+
+      - name: Create GitHub Release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${GITHUB_REF_NAME}"
+          dist/meowai-deploy-linux-amd64.tar.gz
+          dist/checksums-sha256.txt
+          --verify-tag
+          --generate-notes
+          --title "${GITHUB_REF_NAME}"
+
+      - name: Upload assets to published Release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release upload "${GITHUB_REF_NAME}"
+          dist/meowai-deploy-linux-amd64.tar.gz
+          dist/checksums-sha256.txt
+          --clobber

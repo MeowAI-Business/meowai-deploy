@@ -4,11 +4,13 @@ mod config;
 mod doctor;
 mod error;
 mod pricing;
+mod registry;
 mod security;
 pub mod source;
 mod state;
 mod storage;
 mod target;
+mod updater;
 
 use clap::Parser;
 use cli::Cli;

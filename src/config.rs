@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     cli::OnboardArgs,
     error::{AppError, Result},
+    registry::latest_image_digest,
     source::{SourceAccountMode, SourceClient, SourceCredentials, SourceIdentity},
     target::TargetExecutor,
 };
@@ -23,7 +24,7 @@ use crate::{
 pub const DEFAULT_SOURCE_URL: &str = "https://enterprise.meowai.net";
 pub const DEFAULT_NEWAPI_PORT: u16 = 3000;
 pub const DEFAULT_KUMA_PORT: u16 = 3001;
-pub const DEFAULT_IMAGE_REF: &str = "cd920e55641a90bf64e97adc89705d09fd6581e8";
+pub const DEFAULT_IMAGE: &str = "ghcr.io/moorcorpa/new-api-outgap";
 
 static PROMPT_SECTION: Mutex<Option<String>> = Mutex::new(None);
 
@@ -79,8 +80,8 @@ impl Default for DeploymentConfig {
             newapi_admin_password: None,
             kuma_admin_username: "admin".to_owned(),
             kuma_admin_password: None,
-            image: "ghcr.io/moorcorpa/new-api-outgap".to_owned(),
-            image_ref: DEFAULT_IMAGE_REF.to_owned(),
+            image: DEFAULT_IMAGE.to_owned(),
+            image_ref: String::new(),
         }
     }
 }
@@ -110,7 +111,8 @@ target = "local"
 newapi_admin_username = "admin"
 kuma_admin_username = "admin"
 image = "ghcr.io/moorcorpa/new-api-outgap"
-image_ref = "cd920e55641a90bf64e97adc89705d09fd6581e8"
+# Leave empty to resolve the immutable digest currently published as latest.
+image_ref = ""
 
 # Passwords may be supplied through the environment or an interactive prompt.
 # Source account password uses MEOWAI_DEPLOY_SOURCE_PASSWORD.
@@ -157,6 +159,13 @@ image_ref = "cd920e55641a90bf64e97adc89705d09fd6581e8"
                 env::var("MEOWAI_DEPLOY_KUMA_ADMIN_PASSWORD").unwrap_or_else(|_| random_secret()),
             );
         }
+    }
+
+    pub async fn resolve_image_ref(&mut self) -> Result<()> {
+        if self.image_ref.trim().is_empty() {
+            self.image_ref = latest_image_digest(&self.image).await?;
+        }
+        Ok(())
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -449,7 +458,7 @@ async fn prompt_config(
     let kuma_admin_username =
         prompt_username("管理员凭证", "Uptime Kuma 管理员用户名", "admin", None)?;
     let kuma_admin_password = Some(prompt_secret("管理员凭证", "Uptime Kuma 管理员密码")?);
-    let image_ref = prompt_image_ref("镜像版本")?;
+    let image_ref = prompt_image_ref("镜像版本", DEFAULT_IMAGE).await?;
     let mut config = DeploymentConfig {
         source_url,
         source_account_mode,
@@ -597,15 +606,36 @@ fn prompt_port(
     }
 }
 
-fn prompt_image_ref(section: &str) -> Result<String> {
-    let mut error = None;
+async fn prompt_image_ref(section: &str, image: &str) -> Result<String> {
+    prompt_screen(section)?;
+    let mut latest = latest_image_digest(image).await;
+    let mut error = latest
+        .as_ref()
+        .err()
+        .map(|_| "最新构建获取失败；手动输入，或留空重试".to_owned());
     loop {
         prompt_screen(section)?;
         let label = retry_label("上游 commit SHA/digest", error.as_deref(), 3)?;
-        let image_ref: String =
-            prompt_io(input(label).default_input(DEFAULT_IMAGE_REF).interact())?;
+        let image_ref: String = if let Ok(digest) = &latest {
+            prompt_io(input(label).default_input(digest).interact())?
+        } else {
+            prompt_io(input(label).required(false).interact())?
+        };
+        if image_ref.trim().is_empty() {
+            latest = latest_image_digest(image).await;
+            error = latest
+                .as_ref()
+                .err()
+                .map(|_| "最新构建获取失败；手动输入，或留空重试".to_owned());
+            continue;
+        }
         if is_immutable_image_ref(&image_ref) {
-            redraw_success("上游 commit SHA/digest", &image_ref, "格式有效", 3)?;
+            let status = if latest.as_ref().is_ok_and(|digest| digest == &image_ref) {
+                "最新成功构建"
+            } else {
+                "格式有效"
+            };
+            redraw_success("上游 commit SHA/digest", &image_ref, status, 3)?;
             return Ok(image_ref);
         }
         error = Some("必须是 7-64 位十六进制 SHA 或 sha256 digest".to_owned());
@@ -729,6 +759,8 @@ mod tests {
     fn defaults_are_deploy_defaults() {
         let mut config = DeploymentConfig::default();
         config.normalize();
+        config.image_ref =
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned();
         assert_eq!(config.container_name, "newapi");
         assert_eq!(config.website_name, "newapi");
         assert_eq!(config.newapi_port, DEFAULT_NEWAPI_PORT);

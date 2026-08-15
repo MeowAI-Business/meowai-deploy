@@ -13,6 +13,7 @@ pub const CONFIG_FILE: &str = "deployment.toml";
 pub const STATE_FILE: &str = "state.json";
 pub const CREDENTIALS_FILE: &str = "credentials.env";
 pub const SESSION_FILE: &str = "session.json";
+pub const UPDATE_CHECK_FILE: &str = "update-check.json";
 
 pub fn directory() -> Result<PathBuf> {
     if let Some(path) = env::var_os("MEOWAI_DEPLOY_HOME") {

@@ -9,7 +9,9 @@ fn help_lists_supported_commands() {
     let output = binary().arg("--help").output().expect("run help");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    for command in ["doctor", "onboard", "sync", "status", "rollback", "logout"] {
+    for command in [
+        "doctor", "onboard", "sync", "status", "rollback", "logout", "update",
+    ] {
         assert!(
             stdout.contains(command),
             "missing {command} in help: {stdout}"
@@ -93,5 +95,6 @@ fn installer_is_a_verified_bash_script() {
     let script = std::fs::read_to_string(path).expect("read install script");
     assert!(script.starts_with("#!/usr/bin/env bash"));
     assert!(script.contains("sha256sum"));
+    assert!(script.contains("checksums-sha256.txt"));
     assert!(script.contains("MEOWAI_DEPLOY_RELEASE_BASE_URL"));
 }

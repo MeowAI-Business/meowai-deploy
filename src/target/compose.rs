@@ -5,7 +5,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde_json::json;
 
 use crate::{
-    config::DeploymentConfig,
+    config::{DEFAULT_IMAGE, DeploymentConfig},
     error::{AppError, Result},
     security::{random_secret, validate_env_value},
     state::DeploymentState,
@@ -450,6 +450,11 @@ fn render_compose(config: &DeploymentConfig, runtime: &DeploymentRuntime) -> Res
 fn image_reference(image: &str, image_ref: &str) -> String {
     if image_ref.starts_with("sha256:") {
         format!("{image}@{image_ref}")
+    } else if image == DEFAULT_IMAGE
+        && image_ref.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && image_ref.len() >= 7
+    {
+        format!("{image}:sha-{}", &image_ref[..7])
     } else {
         format!("{image}:{image_ref}")
     }
@@ -574,6 +579,19 @@ mod tests {
         assert_eq!(
             container_source_url("https://source.example").expect("keep source"),
             "https://source.example"
+        );
+    }
+
+    #[test]
+    fn default_image_accepts_digest_and_commit_pins() {
+        let digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            image_reference(DEFAULT_IMAGE, digest),
+            format!("{DEFAULT_IMAGE}@{digest}")
+        );
+        assert_eq!(
+            image_reference(DEFAULT_IMAGE, "7ab352138e4837608b8acdfa92a51f7809c9443d"),
+            format!("{DEFAULT_IMAGE}:sha-7ab3521")
         );
     }
 }

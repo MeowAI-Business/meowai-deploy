@@ -16,9 +16,13 @@ use crate::{
     target::compose::DeploymentRuntime,
     target::kuma,
     target::newapi::NewApiClient,
+    updater,
 };
 
 pub async fn run(cli: Cli) -> Result<()> {
+    if !matches!(cli.command, Some(Command::Update(_))) {
+        updater::check_periodically().await;
+    }
     match cli.command {
         None => print_help(),
         Some(Command::Doctor(args)) => doctor::run(&args).await,
@@ -27,6 +31,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Some(Command::Status(args)) => run_status(&args).await,
         Some(Command::Rollback(args)) => run_rollback(&args).await,
         Some(Command::Logout(args)) => run_logout(&args).await,
+        Some(Command::Update(args)) => updater::run(&args).await,
     }
 }
 
@@ -49,6 +54,7 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
         config.apply_cli_target(args);
         config.normalize();
         config.resolve_passwords();
+        config.resolve_image_ref().await?;
         config.validate()?;
         let (source, identity) = authenticate_source(&config).await?;
         (config, source, identity)
