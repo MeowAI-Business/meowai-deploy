@@ -7,6 +7,7 @@ use serde_json::json;
 use crate::{
     config::{DEFAULT_IMAGE, DeploymentConfig},
     error::{AppError, Result},
+    registry::credentials_from_env,
     security::{random_secret, validate_env_value},
     state::DeploymentState,
     storage::{self, CONFIG_FILE, CREDENTIALS_FILE, STATE_FILE},
@@ -235,6 +236,18 @@ impl DeploymentRuntime {
             let compose = render_compose(config, self)?;
             self.executor
                 .write_file(COMPOSE_FILE, compose.as_bytes(), false)?;
+            if let Some(credentials) = credentials_from_env()? {
+                let registry = config.image.split('/').next().ok_or_else(|| {
+                    AppError::InvalidConfig(
+                        "image must include a registry and repository".to_owned(),
+                    )
+                })?;
+                self.executor.pull_image_with_registry_credentials(
+                    &image_reference(&config.image, &config.image_ref),
+                    registry,
+                    &credentials,
+                )?;
+            }
             self.executor.compose(
                 &config.container_name,
                 &["up", "-d", "postgres", "redis", "new-api"],
@@ -358,6 +371,8 @@ fn render_compose(config: &DeploymentConfig, runtime: &DeploymentRuntime) -> Res
     );
     let newapi = json!({
         "image": image,
+        "platform": "linux/amd64",
+        "pull_policy": "missing",
         "container_name": config.container_name,
         "restart": "unless-stopped",
         "ports": [format!("{}:{}:3000", config.newapi_bind, runtime.state.newapi_port)],
@@ -564,6 +579,8 @@ mod tests {
         assert!(value["services"]["postgres"].get("ports").is_none());
         assert!(value["services"]["redis"].get("ports").is_none());
         assert_eq!(value["services"]["uptime-kuma"]["image"], KUMA_IMAGE);
+        assert_eq!(value["services"]["new-api"]["platform"], "linux/amd64");
+        assert_eq!(value["services"]["new-api"]["pull_policy"], "missing");
         assert_eq!(
             value["services"]["new-api"]["environment"]["PUBLIC_STATUS_SOURCE_URL"],
             "http://host.docker.internal:3004/api/onboard/status/snapshot"

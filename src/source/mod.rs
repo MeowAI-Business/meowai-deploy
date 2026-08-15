@@ -252,6 +252,10 @@ impl SourceClient {
         Ok(())
     }
 
+    pub async fn validate_session(&mut self) -> SourceResult<()> {
+        self.refresh_session().await
+    }
+
     fn endpoint(&self, path: &str) -> SourceResult<Url> {
         self.base_url
             .join(path.trim_start_matches('/'))

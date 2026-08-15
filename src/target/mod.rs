@@ -17,6 +17,7 @@ use shell_escape::escape;
 use crate::{
     config::Target,
     error::{AppError, Result},
+    registry::RegistryCredentials,
     security::{sha256_hex, write_private_file},
 };
 
@@ -178,6 +179,31 @@ impl TargetExecutor {
             directory = quote_path(&self.directory),
             project = quote(project),
         ))
+    }
+
+    pub fn pull_image_with_registry_credentials(
+        &self,
+        image: &str,
+        registry: &str,
+        credentials: &RegistryCredentials,
+    ) -> Result<Output> {
+        tracing::debug!(
+            registry,
+            target = %self.label(),
+            "pulling image with temporary registry credentials"
+        );
+        let script = format!(
+            r#"set -eu
+registry_config=$(mktemp -d)
+trap 'rm -rf "$registry_config"' EXIT HUP INT TERM
+printf '%s' {password} | docker --config "$registry_config" login {registry} --username {username} --password-stdin >/dev/null
+docker --config "$registry_config" pull --platform linux/amd64 {image}"#,
+            password = quote(credentials.password()),
+            registry = quote(registry),
+            username = quote(credentials.username()),
+            image = quote(image),
+        );
+        self.run_script(&script)
     }
 
     pub fn endpoint(&self, target_port: u16) -> Result<TargetEndpoint> {

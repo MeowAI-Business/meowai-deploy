@@ -21,9 +21,11 @@ At the image step, `onboard` resolves the manifest currently published as `lates
 
 The GHCR package must permit the target host to pull it. Automatic resolution fails explicitly when the package is private or unavailable and never falls back to an old embedded version.
 
+For a temporary private package, set `MEOWAI_DEPLOY_REGISTRY_USERNAME` and `MEOWAI_DEPLOY_REGISTRY_PASSWORD` together. The CLI uses them both to resolve the manifest and to run the initial target-side Compose pull with an isolated temporary Docker configuration. The temporary configuration is removed after the pull, and the credentials are not persisted in deployment configuration, state, or logs.
+
 ## Local state
 
-CLI-owned state is stored in `~/.meowai-deploy` rather than the user-selected target installation directory. The directory is mode `0700`; `deployment.toml`, `state.json`, `credentials.env`, and `session.json` are mode `0600`. `session.json` contains the revocable source access/refresh session so later `sync` commands do not store or require the source password. Set `MEOWAI_DEPLOY_HOME` to an absolute path only when an isolated state directory is required.
+CLI-owned state is stored in `~/.meowai-deploy` rather than the user-selected target installation directory. The directory is mode `0700`; `deployment.toml`, `state.json`, `credentials.env`, `session.json`, and `meowai-deploy.log` are mode `0600`. The log defaults to debug level and never intentionally includes passwords, tokens, or keys. Set `MEOWAI_DEPLOY_LOG` to override the file log filter. `session.json` contains the revocable source access/refresh session so later `sync` commands do not store or require the source password. Set `MEOWAI_DEPLOY_HOME` to an absolute path only when an isolated state directory is required.
 
 The target installation directory contains only Docker runtime artifacts: `docker-compose.yml`, a mode-`0600` `secrets.env` copy required by Compose, and persistent service data. The source account password is never written to either location.
 

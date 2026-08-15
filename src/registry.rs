@@ -1,4 +1,7 @@
+use std::env;
+
 use reqwest::{Client, Response, StatusCode, header};
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -16,11 +19,48 @@ pub async fn latest_image_digest(image: &str) -> Result<String> {
     RegistryClient::new(image)?.latest_digest().await
 }
 
+#[derive(Clone)]
+pub struct RegistryCredentials {
+    username: String,
+    password: SecretString,
+}
+
+impl RegistryCredentials {
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    pub fn password(&self) -> &str {
+        self.password.expose_secret()
+    }
+}
+
+pub fn credentials_from_env() -> Result<Option<RegistryCredentials>> {
+    let username = env::var("MEOWAI_DEPLOY_REGISTRY_USERNAME")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let password = env::var("MEOWAI_DEPLOY_REGISTRY_PASSWORD")
+        .ok()
+        .filter(|value| !value.is_empty());
+    match (username, password) {
+        (Some(username), Some(password)) => Ok(Some(RegistryCredentials {
+            username,
+            password: SecretString::from(password),
+        })),
+        (None, None) => Ok(None),
+        _ => Err(AppError::InvalidConfig(
+            "MEOWAI_DEPLOY_REGISTRY_USERNAME and MEOWAI_DEPLOY_REGISTRY_PASSWORD must be set together"
+                .to_owned(),
+        )),
+    }
+}
+
 struct RegistryClient {
     client: Client,
     registry: String,
     repository: String,
     base_url: Url,
+    credentials: Option<RegistryCredentials>,
 }
 
 #[derive(Deserialize)]
@@ -47,10 +87,20 @@ impl RegistryClient {
         };
         let base_url = Url::parse(&format!("{scheme}://{registry}"))
             .map_err(|error| AppError::Message(format!("invalid image registry URL: {error}")))?;
-        Self::with_base(image, base_url)
+        let credentials = credentials_from_env()?;
+        Self::with_base_and_credentials(image, base_url, credentials)
     }
 
+    #[cfg(test)]
     fn with_base(image: &str, base_url: Url) -> Result<Self> {
+        Self::with_base_and_credentials(image, base_url, None)
+    }
+
+    fn with_base_and_credentials(
+        image: &str,
+        base_url: Url,
+        credentials: Option<RegistryCredentials>,
+    ) -> Result<Self> {
         let (registry, repository) = image.split_once('/').ok_or_else(|| {
             AppError::InvalidConfig("image must include a registry and repository".to_owned())
         })?;
@@ -65,6 +115,7 @@ impl RegistryClient {
             registry: registry.to_owned(),
             repository: repository.to_owned(),
             base_url,
+            credentials,
         })
     }
 
@@ -73,7 +124,9 @@ impl RegistryClient {
             .base_url
             .join(&format!("/v2/{}/manifests/latest", self.repository))
             .map_err(|error| AppError::Message(format!("build manifest URL: {error}")))?;
+        tracing::debug!(registry = %self.registry, repository = %self.repository, "requesting latest image manifest");
         let response = self.manifest_request(manifest_url.clone(), None).await?;
+        tracing::debug!(status = %response.status(), "latest image manifest response received");
         if response.status() != StatusCode::UNAUTHORIZED {
             return manifest_digest(response).await;
         }
@@ -90,6 +143,7 @@ impl RegistryClient {
             .and_then(parse_bearer_challenge)?;
         let token = self.fetch_token(challenge).await?;
         let response = self.manifest_request(manifest_url, Some(&token)).await?;
+        tracing::debug!(status = %response.status(), "authenticated image manifest response received");
         manifest_digest(response).await
     }
 
@@ -106,6 +160,9 @@ impl RegistryClient {
 
     async fn fetch_token(&self, challenge: BearerChallenge) -> Result<String> {
         let mut request = self.client.get(challenge.realm);
+        if let Some(credentials) = &self.credentials {
+            request = request.basic_auth(credentials.username(), Some(credentials.password()));
+        }
         if let Some(service) = challenge.service.as_deref() {
             request = request.query(&[("service", service)]);
         }
@@ -118,6 +175,7 @@ impl RegistryClient {
             .send()
             .await
             .map_err(|error| AppError::Message(format!("request registry token: {error}")))?;
+        tracing::debug!(status = %response.status(), registry = %self.registry, "registry token response received");
         if !response.status().is_success() {
             return Err(AppError::Message(format!(
                 "registry token request failed with HTTP {} for {}",
@@ -235,6 +293,10 @@ mod tests {
                 "scope",
                 "repository:moorcorpa/new-api-outgap:pull",
             ))
+            .and(header(
+                "authorization",
+                "Basic bW9vcmNvcnBhOnRlc3QtdG9rZW4=",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "token": "registry-token"
             })))
@@ -254,9 +316,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = RegistryClient::with_base(
+        let client = RegistryClient::with_base_and_credentials(
             "ghcr.io/moorcorpa/new-api-outgap",
             Url::parse(&server.uri()).expect("mock URL"),
+            Some(RegistryCredentials {
+                username: "moorcorpa".to_owned(),
+                password: SecretString::from("test-token".to_owned()),
+            }),
         )
         .expect("registry client");
         assert_eq!(client.latest_digest().await.expect("latest digest"), DIGEST);

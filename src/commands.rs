@@ -1,16 +1,16 @@
 use std::collections::BTreeSet;
 
 use clap::CommandFactory;
-use cliclack::{confirm, spinner};
+use cliclack::{confirm, select, spinner};
 use console::style;
 use secrecy::ExposeSecret;
 
 use crate::{
     cli::{Cli, Command, DeploymentArgs, OnboardArgs, RollbackArgs, SyncArgs},
-    config::{DeploymentConfig, authenticate_source, interactive_config},
+    config::{DeploymentConfig, authenticate_source, interactive_config, reauthenticate_source},
     doctor,
     error::{AppError, Result},
-    source::SourceClient,
+    source::{SourceClient, SourceError},
     state::unix_timestamp,
     storage::{self, CONFIG_FILE, SESSION_FILE},
     target::compose::DeploymentRuntime,
@@ -49,7 +49,32 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
             "--non-interactive requires --config FILE".to_owned(),
         ));
     }
-    let (mut config, mut source, identity) = if let Some(path) = &args.config {
+    let resume_existing = if args.config.is_none() && storage::exists(CONFIG_FILE)? {
+        let action: String = select("检测到已保存的部署配置")
+            .item(
+                "resume".to_owned(),
+                "继续上次部署",
+                "使用上次表单、会话和已生成凭证",
+            )
+            .item("reconfigure".to_owned(), "重新填写", "重新进入完整配置向导")
+            .initial_value("resume".to_owned())
+            .interact()
+            .map_err(AppError::from_prompt)?;
+        println!();
+        action == "resume"
+    } else {
+        false
+    };
+    let (mut config, mut source, identity) = if resume_existing {
+        let mut config = load_deployment_config()?;
+        config.resolve_passwords();
+        let source = source_for_operation(&config).await?;
+        let identity = source
+            .identity()
+            .cloned()
+            .ok_or_else(|| AppError::State("source session has no identity".to_owned()))?;
+        (config, source, identity)
+    } else if let Some(path) = &args.config {
         let mut config = DeploymentConfig::from_file(path)?;
         config.apply_cli_target(args);
         config.normalize();
@@ -82,6 +107,7 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
     if !confirmed {
         return Err(AppError::Cancelled);
     }
+    persist_deployment_config(&config)?;
     println!();
 
     let progress = spinner();
@@ -232,6 +258,15 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
         "已同步 {} 个 public status 监控",
         deployment.state.kuma_monitors.len()
     ));
+    deployment.state.last_sync_at = unix_timestamp();
+    deployment.state.last_sync_success = true;
+    deployment.state.mark_phase(
+        "onboard",
+        "DONE",
+        "base services, pricing, channels and public status initialized",
+    );
+    deployment.persist_state()?;
+    persist_source_session(&source)?;
     print_success("下游基础服务、管理员、价格、渠道和 public status 初始化完成");
     Ok(())
 }
@@ -488,6 +523,12 @@ fn load_deployment_config() -> Result<DeploymentConfig> {
     Ok(config)
 }
 
+fn persist_deployment_config(config: &DeploymentConfig) -> Result<()> {
+    let content = toml::to_string_pretty(config)
+        .map_err(|error| AppError::State(format!("serialize deployment.toml: {error}")))?;
+    storage::write(CONFIG_FILE, content.as_bytes())
+}
+
 fn ensure_compatible_current_deployment(config: &DeploymentConfig) -> Result<()> {
     if !storage::exists(CONFIG_FILE)? {
         return Ok(());
@@ -508,11 +549,34 @@ async fn source_for_operation(config: &DeploymentConfig) -> Result<SourceClient>
     if let Some(content) = storage::read(SESSION_FILE)? {
         let persisted = serde_json::from_slice(&content)
             .map_err(|error| AppError::State(format!("parse session.json: {error}")))?;
-        return SourceClient::from_session(&config.source_url, persisted).map_err(AppError::from);
+        let mut source = SourceClient::from_session(&config.source_url, persisted)?;
+        match source.validate_session().await {
+            Ok(()) => {
+                persist_source_session(&source)?;
+                return Ok(source);
+            }
+            Err(error) if is_source_authentication_error(&error) => {}
+            Err(error) => return Err(error.into()),
+        }
     }
-    let (source, _) = authenticate_source(config).await?;
+    let (source, _) = if config.source_password.is_some() {
+        authenticate_source(config).await?
+    } else {
+        reauthenticate_source(config).await?
+    };
     persist_source_session(&source)?;
     Ok(source)
+}
+
+fn is_source_authentication_error(error: &SourceError) -> bool {
+    match error {
+        SourceError::AuthenticationRequired => true,
+        SourceError::HttpStatus { status, .. } => {
+            *status == reqwest::StatusCode::UNAUTHORIZED
+                || *status == reqwest::StatusCode::FORBIDDEN
+        }
+        _ => false,
+    }
 }
 
 fn persist_source_session(source: &SourceClient) -> Result<()> {

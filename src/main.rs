@@ -12,6 +12,8 @@ mod storage;
 mod target;
 mod updater;
 
+use std::env;
+
 use clap::Parser;
 use cli::Cli;
 use cliclack::{Theme, ThemeState};
@@ -57,14 +59,27 @@ async fn main() {
 
 async fn run() -> Result<()> {
     cliclack::set_theme(MeowAiTheme);
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .with_target(false)
-        .try_init()
-        .ok();
+    let log_filter = || {
+        tracing_subscriber::EnvFilter::try_new(env::var("MEOWAI_DEPLOY_LOG").unwrap_or_else(|_| {
+            "meowai_deploy=debug,reqwest=warn,hyper=warn,h2=warn,rustls=warn".to_owned()
+        }))
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("meowai_deploy=debug"))
+    };
+    if let Ok(log_file) = storage::open_log_file() {
+        tracing_subscriber::fmt()
+            .with_env_filter(log_filter())
+            .with_writer(log_file)
+            .with_target(false)
+            .with_ansi(false)
+            .try_init()
+            .ok();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(log_filter())
+            .with_target(false)
+            .try_init()
+            .ok();
+    }
 
     let cli = Cli::parse();
     commands::run(cli).await

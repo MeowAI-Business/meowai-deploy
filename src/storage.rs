@@ -1,5 +1,6 @@
 use std::{
-    env, fs,
+    env,
+    fs::{self, OpenOptions},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
@@ -14,6 +15,7 @@ pub const STATE_FILE: &str = "state.json";
 pub const CREDENTIALS_FILE: &str = "credentials.env";
 pub const SESSION_FILE: &str = "session.json";
 pub const UPDATE_CHECK_FILE: &str = "update-check.json";
+pub const LOG_FILE: &str = "meowai-deploy.log";
 
 pub fn directory() -> Result<PathBuf> {
     if let Some(path) = env::var_os("MEOWAI_DEPLOY_HOME") {
@@ -53,6 +55,22 @@ pub fn write(name: &str, content: &[u8]) -> Result<()> {
     validate_name(name)?;
     let root = ensure_directory()?;
     write_private_file(&root.join(name), content)
+}
+
+pub fn open_log_file() -> Result<fs::File> {
+    let root = ensure_directory()?;
+    let path = root.join(LOG_FILE);
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|source| AppError::WriteFile {
+            path: path.clone(),
+            source,
+        })?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+        .map_err(|source| AppError::WriteFile { path, source })?;
+    Ok(file)
 }
 
 pub fn remove(name: &str) -> Result<bool> {

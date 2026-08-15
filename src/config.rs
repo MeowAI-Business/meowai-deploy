@@ -326,6 +326,46 @@ pub async fn authenticate_source(
     Ok((source, identity))
 }
 
+pub async fn reauthenticate_source(
+    config: &DeploymentConfig,
+) -> Result<(SourceClient, SourceIdentity)> {
+    let mut source = SourceClient::new(&config.source_url)?;
+    source.check_connectivity().await?;
+    let mut account_error = None;
+    loop {
+        prompt_screen("源站重新登录")?;
+        let label = retry_label(
+            &format!("{} 的源站密码", config.source_username),
+            account_error.as_deref(),
+            3,
+        )?;
+        let source_password = prompt_io(password(label).mask('•').interact())?;
+        let credentials = match SourceCredentials::new(
+            config.source_username.clone(),
+            SecretString::from(source_password),
+        ) {
+            Ok(credentials) => credentials,
+            Err(_) => {
+                account_error = Some("密码长度不符合要求".to_owned());
+                continue;
+            }
+        };
+        match source
+            .authenticate(SourceAccountMode::Login, &credentials)
+            .await
+        {
+            Ok(identity) => {
+                redraw_success("源站账号", &config.source_username, "登录成功", 3)?;
+                finish_prompt_flow()?;
+                return Ok((source, identity));
+            }
+            Err(_) => {
+                account_error = Some("登录失败，请检查密码".to_owned());
+            }
+        }
+    }
+}
+
 async fn prompt_config(
     args: &OnboardArgs,
 ) -> Result<(DeploymentConfig, SourceClient, SourceIdentity)> {
@@ -612,7 +652,7 @@ async fn prompt_image_ref(section: &str, image: &str) -> Result<String> {
     let mut error = latest
         .as_ref()
         .err()
-        .map(|_| "最新构建获取失败；手动输入，或留空重试".to_owned());
+        .map(|error| format!("最新构建获取失败：{error}；手动输入，或留空重试"));
     loop {
         prompt_screen(section)?;
         let label = retry_label("上游 commit SHA/digest", error.as_deref(), 3)?;
@@ -626,7 +666,7 @@ async fn prompt_image_ref(section: &str, image: &str) -> Result<String> {
             error = latest
                 .as_ref()
                 .err()
-                .map(|_| "最新构建获取失败；手动输入，或留空重试".to_owned());
+                .map(|error| format!("最新构建获取失败：{error}；手动输入，或留空重试"));
             continue;
         }
         if is_immutable_image_ref(&image_ref) {
