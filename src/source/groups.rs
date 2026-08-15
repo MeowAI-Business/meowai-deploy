@@ -20,6 +20,8 @@ pub struct SourceGroup {
     pub group_name: String,
     pub description: String,
     pub ratio: serde_json::Value,
+    pub topup_ratio: Option<serde_json::Value>,
+    pub user_selectable: bool,
     pub models: Vec<String>,
 }
 
@@ -70,8 +72,14 @@ pub struct TokenSync {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct RawGroup {
     #[serde(default)]
-    desc: String,
+    description: String,
     ratio: serde_json::Value,
+    #[serde(default)]
+    topup_ratio: Option<serde_json::Value>,
+    #[serde(default)]
+    user_selectable: bool,
+    #[serde(default)]
+    models: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -128,27 +136,20 @@ struct TokenKeys {
 
 impl SourceClient {
     pub async fn groups(&mut self) -> SourceResult<GroupCatalog> {
+        const ENDPOINT: &str = "/api/onboard/groups";
         let envelope = self
-            .authenticated_request::<BTreeMap<String, RawGroup>>(
-                Method::GET,
-                "/api/user/self/groups",
-                None,
-            )
+            .authenticated_request::<BTreeMap<String, RawGroup>>(Method::GET, ENDPOINT, None)
             .await?;
-        let raw_groups = require_data(envelope, "/api/user/self/groups")?;
+        let raw_groups = require_data(envelope, ENDPOINT)?;
         if raw_groups.is_empty() {
             return Err(SourceError::EmptyGroups);
         }
         let mut groups = Vec::with_capacity(raw_groups.len());
-        for (name, group) in raw_groups {
-            let query = url::form_urlencoded::Serializer::new(String::new())
-                .append_pair("group", &name)
-                .finish();
-            let path = format!("/api/user/models?{query}");
-            let envelope = self
-                .authenticated_request::<Vec<String>>(Method::GET, &path, None)
-                .await?;
-            let mut models = require_data(envelope, &path)?;
+        for (name, group) in raw_groups
+            .into_iter()
+            .filter(|(name, _)| is_exportable_group(name))
+        {
+            let mut models = group.models;
             models.retain(|model| !model.trim().is_empty());
             models
                 .iter_mut()
@@ -158,14 +159,19 @@ impl SourceClient {
             groups.push(SourceGroup {
                 group_id: name.clone(),
                 group_name: name,
-                description: group.desc,
+                description: group.description,
                 ratio: group.ratio,
+                topup_ratio: group.topup_ratio,
+                user_selectable: group.user_selectable,
                 models,
             });
         }
+        if groups.is_empty() {
+            return Err(SourceError::EmptyGroups);
+        }
         let canonical =
             serde_json::to_vec(&groups).map_err(|error| SourceError::InvalidResponse {
-                endpoint: "/api/user/self/groups".to_owned(),
+                endpoint: ENDPOINT.to_owned(),
                 message: error.to_string(),
             })?;
         let response_sha256 = hex_digest(&canonical);
@@ -424,6 +430,11 @@ impl SourceClient {
     }
 }
 
+fn is_exportable_group(name: &str) -> bool {
+    let normalized = name.trim();
+    !normalized.is_empty() && normalized != "下游" && !normalized.starts_with("official-")
+}
+
 fn desired_token<'a>(id: Option<i64>, name: &'a str, group: &'a str) -> DesiredToken<'a> {
     DesiredToken {
         id,
@@ -543,6 +554,8 @@ mod unit_tests {
             group_name: "超长分组".repeat(12),
             description: String::new(),
             ratio: serde_json::json!(1),
+            topup_ratio: None,
+            user_selectable: false,
             models: vec!["gpt-test".to_owned()],
         }];
         let first = desired_token_names(&groups).expect("build token name");
@@ -559,6 +572,8 @@ mod unit_tests {
             group_name: "default".to_owned(),
             description: String::new(),
             ratio: serde_json::json!(1),
+            topup_ratio: None,
+            user_selectable: false,
             models: vec![],
         }];
 

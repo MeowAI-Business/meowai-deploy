@@ -376,8 +376,16 @@ impl NewApiClient {
         }
 
         let mut ratios = BTreeMap::new();
+        let mut topup_ratios = BTreeMap::new();
+        let mut user_usable_groups = BTreeMap::new();
         for group in &catalog.groups {
-            ratios.insert(group.group_name.clone(), 1.0_f64);
+            ratios.insert(group.group_name.clone(), group.ratio.clone());
+            if let Some(topup_ratio) = &group.topup_ratio {
+                topup_ratios.insert(group.group_name.clone(), topup_ratio.clone());
+            }
+            if group.user_selectable {
+                user_usable_groups.insert(group.group_name.clone(), group.description.clone());
+            }
         }
         self.update_option(
             "GroupRatio",
@@ -385,6 +393,55 @@ impl NewApiClient {
                 .map_err(|error| AppError::Target(format!("serialize GroupRatio: {error}")))?,
         )
         .await?;
+        self.update_option(
+            "TopupGroupRatio",
+            &serde_json::to_string(&topup_ratios)
+                .map_err(|error| AppError::Target(format!("serialize TopupGroupRatio: {error}")))?,
+        )
+        .await?;
+        self.update_option(
+            "UserUsableGroups",
+            &serde_json::to_string(&user_usable_groups).map_err(|error| {
+                AppError::Target(format!("serialize UserUsableGroups: {error}"))
+            })?,
+        )
+        .await?;
+
+        let returned_options = self.options().await?;
+        for (key, expected) in [
+            (
+                "GroupRatio",
+                serde_json::to_value(&ratios).map_err(|error| {
+                    AppError::Target(format!("serialize GroupRatio verification: {error}"))
+                })?,
+            ),
+            (
+                "TopupGroupRatio",
+                serde_json::to_value(&topup_ratios).map_err(|error| {
+                    AppError::Target(format!("serialize TopupGroupRatio verification: {error}"))
+                })?,
+            ),
+            (
+                "UserUsableGroups",
+                serde_json::to_value(&user_usable_groups).map_err(|error| {
+                    AppError::Target(format!("serialize UserUsableGroups verification: {error}"))
+                })?,
+            ),
+        ] {
+            let returned = returned_options.get(key).ok_or_else(|| {
+                AppError::Target(format!(
+                    "downstream option {key} is missing after group sync"
+                ))
+            })?;
+            let returned: Value = serde_json::from_str(returned).map_err(|error| {
+                AppError::Target(format!("decode downstream option {key}: {error}"))
+            })?;
+            if returned != expected {
+                return Err(AppError::Target(format!(
+                    "downstream option {key} does not match the source after group sync"
+                )));
+            }
+        }
 
         let existing = self.channels().await?;
         let mut result = ChannelSyncResult::default();

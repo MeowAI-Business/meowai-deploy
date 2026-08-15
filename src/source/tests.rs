@@ -291,38 +291,33 @@ async fn groups_are_complete_sorted_and_hashed_deterministically() {
     let server = MockServer::start().await;
     let mut client = authenticated_client(&server).await;
     Mock::given(method("GET"))
-        .and(path("/api/user/self/groups"))
+        .and(path("/api/onboard/groups"))
         .and(header("authorization", "Bearer access-one"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "success": true,
             "message": "",
             "data": {
-                "vip": {"desc": "VIP", "ratio": 1.5},
-                "auto": {"desc": "Auto", "ratio": "自动"},
-                "default": {"desc": "Default", "ratio": 1}
+                "vip": {
+                    "description": "VIP", "ratio": 1.5, "topup_ratio": 1.2,
+                    "user_selectable": true, "models": ["gpt-vip", "shared"]
+                },
+                "default": {
+                    "description": "Default", "ratio": 1, "topup_ratio": null,
+                    "user_selectable": false, "models": ["gpt-default", "shared"]
+                },
+                "official-openai": {
+                    "description": "Official", "ratio": 1, "topup_ratio": null,
+                    "user_selectable": true, "models": ["gpt-official"]
+                },
+                "下游": {
+                    "description": "Deployment", "ratio": 1, "topup_ratio": null,
+                    "user_selectable": false, "models": ["gpt-deployment"]
+                }
             }
         })))
         .expect(2)
         .mount(&server)
         .await;
-    for (group, models) in [
-        ("auto", json!(["gpt-auto"])),
-        ("default", json!(["gpt-default", "shared"])),
-        ("vip", json!(["gpt-vip", "shared"])),
-    ] {
-        Mock::given(method("GET"))
-            .and(path("/api/user/models"))
-            .and(query_param("group", group))
-            .and(header("authorization", "Bearer access-one"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "success": true,
-                "message": "",
-                "data": models
-            })))
-            .expect(2)
-            .mount(&server)
-            .await;
-    }
 
     let first = client.groups().await.expect("read groups");
     let second = client.groups().await.expect("read groups again");
@@ -332,10 +327,12 @@ async fn groups_are_complete_sorted_and_hashed_deterministically() {
         .iter()
         .map(|group| group.group_name.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(names, ["auto", "default", "vip"]);
+    assert_eq!(names, ["default", "vip"]);
     assert_eq!(first.response_sha256, second.response_sha256);
     assert_eq!(first.groups, second.groups);
-    assert_eq!(first.groups[2].models, ["gpt-vip", "shared"]);
+    assert_eq!(first.groups[1].models, ["gpt-vip", "shared"]);
+    assert_eq!(first.groups[1].topup_ratio, Some(json!(1.2)));
+    assert!(first.groups[1].user_selectable);
 }
 
 #[derive(Clone)]
@@ -692,25 +689,16 @@ async fn expired_access_token_refreshes_before_group_read() {
         .mount(&server)
         .await;
     Mock::given(method("GET"))
-        .and(path("/api/user/self/groups"))
+        .and(path("/api/onboard/groups"))
         .and(header("authorization", "Bearer fresh-access"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "success": true,
             "message": "",
-            "data": {"default": {"desc": "Default", "ratio": 1}}
+            "data": {"default": {
+                "description": "Default", "ratio": 1, "topup_ratio": null,
+                "user_selectable": true, "models": ["gpt-test"]
+            }}
         })))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/api/user/models"))
-        .and(query_param("group", "default"))
-        .and(header("authorization", "Bearer fresh-access"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "success": true,
-            "message": "",
-            "data": ["gpt-test"]
-        })))
-        .expect(1)
         .mount(&server)
         .await;
     let mut client = SourceClient::new(&server.uri()).expect("create source client");
@@ -1003,6 +991,8 @@ fn group(name: &str, ratio: impl Into<Value>) -> SourceGroup {
         group_name: name.to_owned(),
         description: name.to_owned(),
         ratio: ratio.into(),
+        topup_ratio: None,
+        user_selectable: false,
         models: vec![format!("{name}-model")],
     }
 }
