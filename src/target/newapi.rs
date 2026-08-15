@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use crate::{
     config::DeploymentConfig,
     error::{AppError, Result},
-    pricing::PricingConfig,
+    pricing::{PricingConfig, VideoCapabilityPolicy, VideoCostPolicy, VideoSalesPolicy},
     security::sha256_hex,
     source::{GroupCatalog, TokenBinding},
     state::ChannelState,
@@ -18,6 +18,7 @@ use crate::{
 const CHANNEL_TYPE_NEWAPI: i64 = 60;
 const CHANNEL_STATUS_ENABLED: i64 = 1;
 const CHANNEL_STATUS_MANUALLY_DISABLED: i64 = 2;
+const CHANNEL_SOURCE_NAME: &str = "MeowAI";
 
 pub struct NewApiClient {
     endpoint: TargetEndpoint,
@@ -79,6 +80,39 @@ struct RemoteChannel {
 struct OptionEntry {
     key: String,
     value: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct VideoPricingResponse {
+    sales: Vec<VideoSalesPolicy>,
+    costs: Vec<RemoteVideoCostPolicy>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoteVideoCostPolicy {
+    provider: String,
+    public_model: String,
+    upstream_group_rate_bps: i64,
+    promotion_rate_bps: i64,
+    #[serde(default)]
+    promotion_scope: String,
+    #[serde(default)]
+    promotion_effective_from: i64,
+    #[serde(default)]
+    promotion_effective_until: i64,
+    effective_from: i64,
+    #[serde(default)]
+    effective_until: i64,
+    evidence_status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoteVideoCapabilityPolicy {
+    public_model: String,
+    capabilities_json: String,
+    effective_from: i64,
+    #[serde(default)]
+    effective_until: i64,
 }
 
 impl NewApiClient {
@@ -153,13 +187,12 @@ impl NewApiClient {
             let returned = options.get(option.key).ok_or_else(|| {
                 AppError::Target(format!("downstream option {} was not returned", option.key))
             })?;
-            let canonical = crate::pricing::canonical_price_json(returned).map_err(|error| {
+            if !option.matches(returned).map_err(|error| {
                 AppError::Target(format!(
                     "downstream option {} is invalid after import: {error}",
                     option.key
                 ))
-            })?;
-            if canonical != option.canonical_json {
+            })? {
                 return Err(AppError::Target(format!(
                     "downstream option {} differs after import",
                     option.key
@@ -167,7 +200,129 @@ impl NewApiClient {
             }
             hashes.insert(option.source_field.to_owned(), option.sha256.clone());
         }
+        self.import_video_policies(source_pricing).await?;
+        for (name, value) in [
+            (
+                "video_sales_policies",
+                serde_json::to_value(&source_pricing.video_sales_policies),
+            ),
+            (
+                "video_cost_policies",
+                serde_json::to_value(&source_pricing.video_cost_policies),
+            ),
+            (
+                "video_capabilities",
+                serde_json::to_value(&source_pricing.video_capabilities),
+            ),
+        ] {
+            let value = value.map_err(|error| AppError::State(error.to_string()))?;
+            hashes.insert(
+                name.to_owned(),
+                sha256_hex(
+                    serde_json::to_string(&value)
+                        .map_err(|error| AppError::State(error.to_string()))?
+                        .as_bytes(),
+                ),
+            );
+        }
         Ok(hashes)
+    }
+
+    async fn import_video_policies(&self, source: &PricingConfig) -> Result<()> {
+        let current: VideoPricingResponse = self
+            .request(Method::GET, "/api/option/video-pricing", None, true)
+            .await?;
+        for desired in &source.video_cost_policies {
+            let matched = current
+                .costs
+                .iter()
+                .any(|policy| remote_cost_matches(policy, desired));
+            if !matched {
+                let mut body = serde_json::to_value(desired).map_err(|error| {
+                    AppError::Target(format!("serialize video cost policy: {error}"))
+                })?;
+                body["status"] = Value::String("active".to_owned());
+                body["reason"] = Value::String("meowai-deploy source sync".to_owned());
+                self.request_no_data(
+                    Method::POST,
+                    "/api/option/video-pricing/costs",
+                    Some(body),
+                    true,
+                )
+                .await?;
+            }
+        }
+        for desired in &source.video_sales_policies {
+            if !current.sales.iter().any(|policy| policy == desired) {
+                let mut body = serde_json::to_value(desired).map_err(|error| {
+                    AppError::Target(format!("serialize video sales policy: {error}"))
+                })?;
+                body["status"] = Value::String("active".to_owned());
+                body["reason"] = Value::String("meowai-deploy source sync".to_owned());
+                self.request_no_data(
+                    Method::POST,
+                    "/api/option/video-pricing/sales",
+                    Some(body),
+                    true,
+                )
+                .await?;
+            }
+        }
+
+        let current_capabilities: Vec<RemoteVideoCapabilityPolicy> = self
+            .request(Method::GET, "/api/option/video-capabilities", None, true)
+            .await?;
+        for desired in &source.video_capabilities {
+            let matched = current_capabilities
+                .iter()
+                .any(|policy| remote_capability_matches(policy, desired));
+            if !matched {
+                let mut body = serde_json::to_value(desired).map_err(|error| {
+                    AppError::Target(format!("serialize video capability policy: {error}"))
+                })?;
+                body["status"] = Value::String("active".to_owned());
+                body["reason"] = Value::String("meowai-deploy source sync".to_owned());
+                self.request_no_data(
+                    Method::POST,
+                    "/api/option/video-capabilities",
+                    Some(body),
+                    true,
+                )
+                .await?;
+            }
+        }
+
+        let refreshed: VideoPricingResponse = self
+            .request(Method::GET, "/api/option/video-pricing", None, true)
+            .await?;
+        if source
+            .video_sales_policies
+            .iter()
+            .any(|desired| !refreshed.sales.iter().any(|policy| policy == desired))
+            || source.video_cost_policies.iter().any(|desired| {
+                !refreshed
+                    .costs
+                    .iter()
+                    .any(|policy| remote_cost_matches(policy, desired))
+            })
+        {
+            return Err(AppError::Target(
+                "downstream Seedance pricing differs after import".to_owned(),
+            ));
+        }
+        let refreshed_capabilities: Vec<RemoteVideoCapabilityPolicy> = self
+            .request(Method::GET, "/api/option/video-capabilities", None, true)
+            .await?;
+        if source.video_capabilities.iter().any(|desired| {
+            !refreshed_capabilities
+                .iter()
+                .any(|policy| remote_capability_matches(policy, desired))
+        }) {
+            return Err(AppError::Target(
+                "downstream Seedance capabilities differ after import".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     pub async fn sync_channels(
@@ -222,15 +377,17 @@ impl NewApiClient {
                     "multiple downstream channels use managed tag {tag}"
                 )));
             }
-            let desired =
-                DesiredChannel::new(config, container_source_url, group, binding, tag.clone())?;
+            let desired = DesiredChannel::new(container_source_url, group, binding, tag.clone())?;
             let old = previous.get(&group.group_id);
             let channel_id = if let Some(channel) = matching.first() {
                 let key_changed = old
                     .map(|state| state.key_sha256 != desired.key_sha256)
                     .unwrap_or(false);
+                let legacy_name = format!("{} / {}", config.website_name, group.group_name);
+                let is_legacy_name_only =
+                    is_legacy_name_only_change(channel, &desired, &legacy_name, key_changed);
                 if channel_needs_update(channel, &desired) || key_changed {
-                    if !force && old.is_some() {
+                    if !force && old.is_some() && !is_legacy_name_only {
                         return Err(AppError::Target(format!(
                             "managed downstream channel {} drifted; rerun sync with --force",
                             channel.id
@@ -459,6 +616,35 @@ impl NewApiClient {
     }
 }
 
+fn remote_cost_matches(remote: &RemoteVideoCostPolicy, desired: &VideoCostPolicy) -> bool {
+    let scope = if remote.promotion_scope.trim().is_empty() {
+        None
+    } else {
+        serde_json::from_str::<Value>(&remote.promotion_scope).ok()
+    };
+    remote.provider == desired.provider
+        && remote.public_model == desired.public_model
+        && remote.upstream_group_rate_bps == desired.upstream_group_rate_bps
+        && remote.promotion_rate_bps == desired.promotion_rate_bps
+        && scope == desired.promotion_scope
+        && remote.promotion_effective_from == desired.promotion_effective_from
+        && remote.promotion_effective_until == desired.promotion_effective_until
+        && remote.effective_from == desired.effective_from
+        && remote.effective_until == desired.effective_until
+        && remote.evidence_status == desired.evidence_status
+}
+
+fn remote_capability_matches(
+    remote: &RemoteVideoCapabilityPolicy,
+    desired: &VideoCapabilityPolicy,
+) -> bool {
+    remote.public_model == desired.public_model
+        && remote.effective_from == desired.effective_from
+        && remote.effective_until == desired.effective_until
+        && serde_json::from_str::<Value>(&remote.capabilities_json)
+            .is_ok_and(|value| value == desired.capabilities)
+}
+
 struct DesiredChannel {
     name: String,
     base_url: String,
@@ -472,7 +658,6 @@ struct DesiredChannel {
 
 impl DesiredChannel {
     fn new(
-        config: &DeploymentConfig,
         container_source_url: &str,
         group: &crate::source::SourceGroup,
         binding: &TokenBinding,
@@ -480,7 +665,7 @@ impl DesiredChannel {
     ) -> Result<Self> {
         let models = group.models.join(",");
         let key = binding.api_key().expose_secret().to_owned();
-        let name = format!("{} / {}", config.website_name, group.group_name);
+        let name = managed_channel_name(&group.group_name);
         let base_url = container_source_url.trim_end_matches('/').to_owned();
         let key_sha256 = sha256_hex(key.as_bytes());
         let fingerprint = json!({
@@ -527,6 +712,10 @@ impl DesiredChannel {
     }
 }
 
+fn managed_channel_name(group_name: &str) -> String {
+    format!("{CHANNEL_SOURCE_NAME} / {group_name}")
+}
+
 fn channel_tag(deployment_id: &str, group_id: &str) -> String {
     format!(
         "meowai-deploy:{deployment_id}:{}",
@@ -537,6 +726,11 @@ fn channel_tag(deployment_id: &str, group_id: &str) -> String {
 fn channel_needs_update(current: &RemoteChannel, desired: &DesiredChannel) -> bool {
     current.channel_type != CHANNEL_TYPE_NEWAPI
         || current.name != desired.name
+        || channel_needs_update_except_name(current, desired)
+}
+
+fn channel_needs_update_except_name(current: &RemoteChannel, desired: &DesiredChannel) -> bool {
+    current.channel_type != CHANNEL_TYPE_NEWAPI
         || current
             .base_url
             .as_deref()
@@ -546,6 +740,17 @@ fn channel_needs_update(current: &RemoteChannel, desired: &DesiredChannel) -> bo
         || current.models != desired.models
         || current.group != desired.group
         || current.tag.as_deref() != Some(desired.tag.as_str())
+}
+
+fn is_legacy_name_only_change(
+    current: &RemoteChannel,
+    desired: &DesiredChannel,
+    legacy_name: &str,
+    key_changed: bool,
+) -> bool {
+    !key_changed
+        && current.name == legacy_name
+        && !channel_needs_update_except_name(current, desired)
 }
 
 #[cfg(test)]
@@ -571,6 +776,11 @@ mod tests {
     }
 
     #[test]
+    fn channel_name_identifies_the_upstream_provider() {
+        assert_eq!(managed_channel_name("default"), "MeowAI / default");
+    }
+
+    #[test]
     fn readback_comparison_normalizes_a_trailing_base_url_slash() {
         let desired = DesiredChannel {
             name: "site / default".to_owned(),
@@ -593,6 +803,74 @@ mod tests {
             tag: Some(desired.tag.clone()),
         };
         assert!(!channel_needs_update(&current, &desired));
+    }
+
+    #[test]
+    fn legacy_downstream_site_prefix_is_a_name_only_change() {
+        let desired = DesiredChannel {
+            name: "MeowAI / default".to_owned(),
+            base_url: "https://source.example".to_owned(),
+            key: "sk-secret".to_owned(),
+            key_sha256: "hash".to_owned(),
+            models: "gpt-test".to_owned(),
+            group: "default".to_owned(),
+            tag: "tag".to_owned(),
+            config_sha256: "hash".to_owned(),
+        };
+        let current = RemoteChannel {
+            id: 1,
+            channel_type: CHANNEL_TYPE_NEWAPI,
+            name: "Downstream Site / default".to_owned(),
+            status: CHANNEL_STATUS_ENABLED,
+            base_url: Some(desired.base_url.clone()),
+            models: desired.models.clone(),
+            group: desired.group.clone(),
+            tag: Some(desired.tag.clone()),
+        };
+
+        assert!(channel_needs_update(&current, &desired));
+        assert!(!channel_needs_update_except_name(&current, &desired));
+        assert!(is_legacy_name_only_change(
+            &current,
+            &desired,
+            "Downstream Site / default",
+            false
+        ));
+    }
+
+    #[test]
+    fn video_policy_readback_accepts_omitted_zero_time_fields() {
+        let pricing: VideoPricingResponse = serde_json::from_value(json!({
+            "sales": [{
+                "public_model": "seedance-2.0",
+                "official_no_video_micros": 46000000,
+                "official_with_video_micros": 46000000,
+                "customer_rate_bps": 8300,
+                "effective_from": 100
+            }],
+            "costs": [{
+                "provider": "4api-seedance-cn",
+                "public_model": "seedance-2.0",
+                "upstream_group_rate_bps": 7000,
+                "promotion_rate_bps": 10000,
+                "promotion_scope": "",
+                "effective_from": 100,
+                "evidence_status": "unverified"
+            }]
+        }))
+        .expect("decode downstream video pricing response");
+        assert_eq!(pricing.sales[0].effective_until, 0);
+        assert_eq!(pricing.costs[0].promotion_effective_from, 0);
+        assert_eq!(pricing.costs[0].promotion_effective_until, 0);
+        assert_eq!(pricing.costs[0].effective_until, 0);
+
+        let capabilities: Vec<RemoteVideoCapabilityPolicy> = serde_json::from_value(json!([{
+            "public_model": "seedance-2.0",
+            "capabilities_json": "{}",
+            "effective_from": 100
+        }]))
+        .expect("decode downstream video capabilities response");
+        assert_eq!(capabilities[0].effective_until, 0);
     }
 
     #[tokio::test]
@@ -621,7 +899,7 @@ mod tests {
                 "success": true,
                 "message": ""
             })))
-            .expect(8)
+            .expect(20)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -634,6 +912,26 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
+        Mock::given(method("GET"))
+            .and(path("/api/option/video-pricing"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "message": "",
+                "data": {"sales": [], "costs": []}
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/option/video-capabilities"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "message": "",
+                "data": []
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
 
         let port = server.address().port();
         let executor = TargetExecutor::new(Target::Local, PathBuf::from("/tmp/meowai-deploy-test"));
@@ -644,7 +942,7 @@ mod tests {
             .import_pricing(&source_pricing)
             .await
             .expect("import source pricing");
-        assert_eq!(hashes.len(), 8);
+        assert_eq!(hashes.len(), 23);
         assert_eq!(hashes.get("model_price").map(String::len), Some(64));
     }
 }

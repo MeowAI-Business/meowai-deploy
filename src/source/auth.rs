@@ -68,6 +68,11 @@ struct AccountRequest<'a> {
 }
 
 #[derive(Debug, Deserialize)]
+struct OnboardAccessData {
+    allowed: bool,
+}
+
+#[derive(Debug, Deserialize)]
 pub(super) struct LoginData {
     #[serde(default)]
     pub(super) access_token: Option<String>,
@@ -135,5 +140,17 @@ impl SourceClient {
             return Err(SourceError::TwoFactorRequired);
         }
         self.set_session(data)
+    }
+
+    pub async fn check_onboard_access(&mut self) -> SourceResult<()> {
+        const ENDPOINT: &str = "/api/onboard/access";
+        let envelope = self
+            .authenticated_request::<OnboardAccessData>(Method::GET, ENDPOINT, None)
+            .await?;
+        let data = require_data(envelope, ENDPOINT)?;
+        if !data.allowed {
+            return Err(SourceError::ApprovalRequired);
+        }
+        Ok(())
     }
 }

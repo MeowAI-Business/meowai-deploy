@@ -7,6 +7,7 @@ mod pricing;
 mod registry;
 mod security;
 pub mod source;
+mod source_key_store;
 mod state;
 mod storage;
 mod target;
@@ -44,6 +45,17 @@ impl Theme for MeowAiTheme {
 
     fn submit_symbol(&self) -> String {
         style("◇").cyan().to_string()
+    }
+
+    fn format_footer(&self, state: &ThemeState) -> String {
+        match state {
+            ThemeState::Submit => "\n".to_owned(),
+            ThemeState::Active => format!("{}\n", style("└").cyan()),
+            ThemeState::Cancel => format!("{}  Operation cancelled.\n", style("└").red()),
+            ThemeState::Error(message) => {
+                format!("{}  {}\n", style("└").yellow(), style(message).yellow())
+            }
+        }
     }
 }
 

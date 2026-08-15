@@ -56,6 +56,9 @@ pub enum SourceError {
     #[error("source account requires 2FA; log in on the website before continuing")]
     TwoFactorRequired,
 
+    #[error("需要上游批准后才能部署")]
+    ApprovalRequired,
+
     #[error("source authentication is required")]
     AuthenticationRequired,
 
@@ -121,6 +124,12 @@ struct ApiEnvelope<T> {
     #[serde(default)]
     message: String,
     data: Option<T>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiErrorEnvelope {
+    #[serde(default)]
+    code: String,
 }
 
 impl SourceClient {
@@ -411,6 +420,15 @@ async fn parse_response<T: DeserializeOwned>(
         });
     }
     if !status.is_success() {
+        if status == StatusCode::FORBIDDEN {
+            let error = response.json::<ApiErrorEnvelope>().await.ok();
+            if error
+                .as_ref()
+                .is_some_and(|error| error.code == "ONBOARD_APPROVAL_REQUIRED")
+            {
+                return Err(SourceError::ApprovalRequired);
+            }
+        }
         return Err(SourceError::HttpStatus {
             endpoint: endpoint.to_owned(),
             status,

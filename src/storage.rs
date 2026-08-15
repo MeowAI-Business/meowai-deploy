@@ -14,8 +14,11 @@ pub const CONFIG_FILE: &str = "deployment.toml";
 pub const STATE_FILE: &str = "state.json";
 pub const CREDENTIALS_FILE: &str = "credentials.env";
 pub const SESSION_FILE: &str = "session.json";
+pub const SOURCE_STATUS_KEYS_FILE: &str = "source-status-keys.json";
 pub const UPDATE_CHECK_FILE: &str = "update-check.json";
 pub const LOG_FILE: &str = "meowai-deploy.log";
+
+const DEPLOYMENT_FILES: [&str; 4] = [CONFIG_FILE, STATE_FILE, CREDENTIALS_FILE, SESSION_FILE];
 
 pub fn directory() -> Result<PathBuf> {
     if let Some(path) = env::var_os("MEOWAI_DEPLOY_HOME") {
@@ -84,7 +87,7 @@ pub fn remove(name: &str) -> Result<bool> {
 }
 
 pub fn clear_deployment() -> Result<()> {
-    for name in [CONFIG_FILE, STATE_FILE, CREDENTIALS_FILE, SESSION_FILE] {
+    for name in DEPLOYMENT_FILES {
         remove(name)?;
     }
     Ok(())
@@ -112,4 +115,14 @@ fn validate_name(name: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clearing_a_deployment_preserves_account_status_keys() {
+        assert!(!DEPLOYMENT_FILES.contains(&SOURCE_STATUS_KEYS_FILE));
+    }
 }

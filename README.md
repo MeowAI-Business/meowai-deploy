@@ -27,6 +27,8 @@ For a temporary private package, set `MEOWAI_DEPLOY_REGISTRY_USERNAME` and `MEOW
 
 CLI-owned state is stored in `~/.meowai-deploy` rather than the user-selected target installation directory. The directory is mode `0700`; `deployment.toml`, `state.json`, `credentials.env`, `session.json`, and `meowai-deploy.log` are mode `0600`. The log defaults to debug level and never intentionally includes passwords, tokens, or keys. Set `MEOWAI_DEPLOY_LOG` to override the file log filter. `session.json` contains the revocable source access/refresh session so later `sync` commands do not store or require the source password. Set `MEOWAI_DEPLOY_HOME` to an absolute path only when an isolated state directory is required.
 
+Use `meowai-deploy clean` to remove the downstream containers, generated Compose files, and bind-mounted data while keeping the saved onboard form, generated administrator credentials, deployment state, and source login session. Run `meowai-deploy onboard` afterward and choose to resume the saved deployment. `rollback` additionally removes the saved deployment files from `~/.meowai-deploy`.
+
 The target installation directory contains only Docker runtime artifacts: `docker-compose.yml`, a mode-`0600` `secrets.env` copy required by Compose, and persistent service data. The source account password is never written to either location.
 
 ## Doctor

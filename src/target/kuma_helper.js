@@ -81,6 +81,18 @@ function parseJsonField(value, fallback) {
     }
 }
 
+function normalizeMonitorPayload(monitor) {
+    monitor.accepted_statuscodes = parseJsonField(monitor.accepted_statuscodes, ["200-299"]);
+    monitor.conditions = parseJsonField(monitor.conditions, []);
+    monitor.rabbitmqNodes = parseJsonField(monitor.rabbitmqNodes, []);
+    monitor.kafkaProducerBrokers = parseJsonField(monitor.kafkaProducerBrokers, []);
+    monitor.kafkaProducerSaslOptions = parseJsonField(monitor.kafkaProducerSaslOptions, {
+        mechanism: "None",
+    });
+    monitor.notificationIDList = monitor.notificationIDList || {};
+    return monitor;
+}
+
 function configHash(monitor, key) {
     const keyHash = crypto.createHash("sha256").update(key).digest("hex");
     const stable = {
@@ -99,13 +111,13 @@ function configHash(monitor, key) {
     return crypto.createHash("sha256").update(JSON.stringify(stable)).digest("hex");
 }
 
-function desiredMonitor(source, existing, input) {
+function desiredMonitor(source, existing, input, parentID) {
     const url = `${input.source_base_url.replace(/\/$/, "")}/api/onboard/status/monitors/${encodeURIComponent(String(source.id))}`;
     const marker = `meowai-deploy:${input.deployment_id}:source-monitor:${source.id}`;
     const monitor = existing ? { ...existing } : {
         name: source.name,
         description: marker,
-        parent: null,
+        parent: parentID,
         type: "keyword",
         subtype: null,
         url,
@@ -138,6 +150,7 @@ function desiredMonitor(source, existing, input) {
     monitor.name = source.name;
     monitor.description = marker;
     monitor.type = "keyword";
+    monitor.parent = parentID;
     monitor.url = url;
     monitor.method = "GET";
     monitor.headers = JSON.stringify({ Authorization: `Bearer ${input.status_key}` });
@@ -151,11 +164,8 @@ function desiredMonitor(source, existing, input) {
     monitor.notificationIDList = {};
     monitor.active = source.display_enabled !== false;
     monitor.weight = (Number(source.sort_order) + 1) * 1000;
-    monitor.conditions = parseJsonField(monitor.conditions, []);
-    monitor.rabbitmqNodes = parseJsonField(monitor.rabbitmqNodes, []);
-    monitor.kafkaProducerBrokers = parseJsonField(monitor.kafkaProducerBrokers, []);
     monitor.id = existing ? existing.id : undefined;
-    return { monitor, marker, url };
+    return { monitor: normalizeMonitorPayload(monitor), marker, url };
 }
 
 function monitorDrifted(existing, desired) {
@@ -163,6 +173,7 @@ function monitorDrifted(existing, desired) {
     return existing.name !== desired.name
         || existing.url !== desired.url
         || existing.type !== "keyword"
+        || Number(existing.parent || 0) !== Number(desired.parent || 0)
         || existing.keyword !== '"success":true'
         || existing.headers !== desired.headers
         || Number(existing.interval) !== Number(desired.interval)
@@ -207,21 +218,82 @@ async function sync(input) {
         if (!monitorListAck || !monitorListAck.ok) throw new Error(monitorListAck?.msg || "Kuma monitor list failed");
         const monitorList = await monitorListPromise;
         const existingByMarker = new Map();
+        const existingGroupByMarker = new Map();
         for (const monitor of Object.values(monitorList || {})) {
             const marker = String(monitor.description || "");
-            if (!marker.startsWith(`meowai-deploy:${input.deployment_id}:source-monitor:`)) continue;
-            if (existingByMarker.has(marker)) throw new Error(`duplicate managed Kuma monitor marker: ${marker}`);
-            existingByMarker.set(marker, monitor);
+            if (marker.startsWith(`meowai-deploy:${input.deployment_id}:source-monitor:`)) {
+                if (existingByMarker.has(marker)) throw new Error(`duplicate managed Kuma monitor marker: ${marker}`);
+                existingByMarker.set(marker, monitor);
+            } else if (marker.startsWith(`meowai-deploy:${input.deployment_id}:source-group:`)) {
+                if (existingGroupByMarker.has(marker)) throw new Error(`duplicate managed Kuma group marker: ${marker}`);
+                existingGroupByMarker.set(marker, monitor);
+            }
         }
 
         const groups = [];
         const groupsByID = new Map();
+        const groupMonitorByID = new Map();
+        for (const source of input.manifest.monitors || []) {
+            const groupKey = String(source.group_id || source.group || "default");
+            if (groupsByID.has(groupKey)) continue;
+            const groupName = source.group || groupKey;
+            const marker = `meowai-deploy:${input.deployment_id}:source-group:${groupKey}`;
+            const existing = existingGroupByMarker.get(marker);
+            const groupMonitor = existing ? { ...existing } : {
+                name: groupName,
+                description: marker,
+                parent: null,
+                type: "group",
+                interval: 60,
+                retryInterval: 60,
+                timeout: 48,
+                maxretries: 0,
+                accepted_statuscodes: ["200-299"],
+                notificationIDList: {},
+                conditions: [],
+                rabbitmqNodes: [],
+                kafkaProducerBrokers: [],
+                kafkaProducerSaslOptions: { mechanism: "None" },
+                active: true,
+                weight: (groups.length + 1) * 1000,
+            };
+            groupMonitor.name = groupName;
+            groupMonitor.description = marker;
+            groupMonitor.parent = null;
+            groupMonitor.type = "group";
+            groupMonitor.active = true;
+            groupMonitor.id = existing ? existing.id : undefined;
+            normalizeMonitorPayload(groupMonitor);
+            const result = existing
+                ? await emit(socket, "editMonitor", groupMonitor)
+                : await emit(socket, "add", groupMonitor);
+            if (!result || !result.ok) {
+                throw new Error(`Kuma group sync failed for ${groupName}: ${result?.msg || "unknown error"}`);
+            }
+            const groupMonitorID = Number(result.monitorID || existing?.id);
+            if (!Number.isInteger(groupMonitorID) || groupMonitorID <= 0) throw new Error(`Kuma returned invalid group monitor ID for ${groupKey}`);
+            const publicGroup = { name: groupName, monitorList: [] };
+            groupsByID.set(groupKey, publicGroup);
+            groupMonitorByID.set(groupKey, groupMonitorID);
+            groups.push(publicGroup);
+            existingGroupByMarker.delete(marker);
+        }
+
+        for (const monitor of existingGroupByMarker.values()) {
+            if (monitor.active !== false) {
+                const paused = await emit(socket, "pauseMonitor", monitor.id);
+                if (!paused || !paused.ok) throw new Error(paused?.msg || `Kuma group disable failed for ${monitor.id}`);
+            }
+        }
+
         const seenMarkers = new Set();
         const monitorStates = [];
         for (const source of input.manifest.monitors || []) {
             const marker = `meowai-deploy:${input.deployment_id}:source-monitor:${source.id}`;
             const existing = existingByMarker.get(marker);
-            const desired = desiredMonitor(source, existing, input);
+            const groupKey = String(source.group_id || source.group || "default");
+            const parentID = groupMonitorByID.get(groupKey);
+            const desired = desiredMonitor(source, existing, input, parentID);
             if (existing && monitorDrifted(existing, desired.monitor) && !input.force) {
                 throw new Error(`managed Kuma monitor ${existing.id} drifted; rerun sync with --force`);
             }
@@ -235,13 +307,7 @@ async function sync(input) {
             const monitorID = Number(result.monitorID || existing?.id);
             if (!Number.isInteger(monitorID) || monitorID <= 0) throw new Error(`Kuma returned invalid monitor ID for ${source.id}`);
             seenMarkers.add(marker);
-            const groupKey = String(source.group_id || source.group || "default");
-            let group = groupsByID.get(groupKey);
-            if (!group) {
-                group = { name: source.group || groupKey, monitorList: [] };
-                groupsByID.set(groupKey, group);
-                groups.push(group);
-            }
+            const group = groupsByID.get(groupKey);
             group.monitorList.push({ id: monitorID, sendUrl: false });
             monitorStates.push({
                 source_monitor_id: String(source.id),

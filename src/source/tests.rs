@@ -106,6 +106,51 @@ async fn authenticated_client(server: &MockServer) -> SourceClient {
 }
 
 #[tokio::test]
+async fn onboard_access_accepts_approved_account() {
+    let server = MockServer::start().await;
+    let mut client = authenticated_client(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/onboard/access"))
+        .and(header("authorization", "Bearer access-one"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "message": "",
+            "data": {"allowed": true}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    client
+        .check_onboard_access()
+        .await
+        .expect("approved account");
+}
+
+#[tokio::test]
+async fn onboard_access_reports_upstream_approval_requirement() {
+    let server = MockServer::start().await;
+    let mut client = authenticated_client(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/onboard/access"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+            "success": false,
+            "code": "ONBOARD_APPROVAL_REQUIRED",
+            "message": "需要上游批准后才能部署"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let error = client
+        .check_onboard_access()
+        .await
+        .expect_err("unapproved account must be rejected");
+    assert!(matches!(error, SourceError::ApprovalRequired));
+    assert_eq!(error.to_string(), "需要上游批准后才能部署");
+}
+
+#[tokio::test]
 async fn register_then_login_uses_standard_account_endpoints() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

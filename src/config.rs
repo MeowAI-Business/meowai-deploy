@@ -5,7 +5,7 @@ use std::{
     sync::Mutex,
 };
 
-use cliclack::{input, intro, outro, password, select};
+use cliclack::{input, intro, outro, password, select, spinner};
 use console::{Term, style};
 use rand::{Rng, distributions::Alphanumeric};
 use reqwest::Url;
@@ -323,6 +323,7 @@ pub async fn authenticate_source(
     let identity = source
         .authenticate(config.source_account_mode, &credentials)
         .await?;
+    source.check_onboard_access().await?;
     Ok((source, identity))
 }
 
@@ -355,7 +356,13 @@ pub async fn reauthenticate_source(
             .await
         {
             Ok(identity) => {
-                redraw_success("源站账号", &config.source_username, "登录成功", 3)?;
+                source.check_onboard_access().await?;
+                redraw_success(
+                    "源站账号",
+                    &config.source_username,
+                    "登录成功 · 已获上游批准",
+                    3,
+                )?;
                 finish_prompt_flow()?;
                 return Ok((source, identity));
             }
@@ -425,10 +432,11 @@ async fn prompt_config(
         };
         match source.authenticate(source_account_mode, &credentials).await {
             Ok(identity) => {
+                source.check_onboard_access().await?;
                 let status = if source_account_mode == SourceAccountMode::Register {
-                    "注册成功"
+                    "注册成功 · 已获上游批准"
                 } else {
-                    "登录成功"
+                    "登录成功 · 已获上游批准"
                 };
                 redraw_success("源站账号", &source_username, status, 6)?;
                 break (source_username, Some(source_password), identity);
@@ -648,7 +656,7 @@ fn prompt_port(
 
 async fn prompt_image_ref(section: &str, image: &str) -> Result<String> {
     prompt_screen(section)?;
-    let mut latest = latest_image_digest(image).await;
+    let mut latest = fetch_latest_image_digest(image).await;
     let mut error = latest
         .as_ref()
         .err()
@@ -662,7 +670,7 @@ async fn prompt_image_ref(section: &str, image: &str) -> Result<String> {
             prompt_io(input(label).required(false).interact())?
         };
         if image_ref.trim().is_empty() {
-            latest = latest_image_digest(image).await;
+            latest = fetch_latest_image_digest(image).await;
             error = latest
                 .as_ref()
                 .err()
@@ -679,6 +687,21 @@ async fn prompt_image_ref(section: &str, image: &str) -> Result<String> {
             return Ok(image_ref);
         }
         error = Some("必须是 7-64 位十六进制 SHA 或 sha256 digest".to_owned());
+    }
+}
+
+async fn fetch_latest_image_digest(image: &str) -> Result<String> {
+    let progress = spinner();
+    progress.start("正在获取上游最新成功构建镜像");
+    match latest_image_digest(image).await {
+        Ok(digest) => {
+            progress.stop("已获取上游最新成功构建镜像");
+            Ok(digest)
+        }
+        Err(error) => {
+            progress.error("获取上游最新成功构建镜像失败");
+            Err(error)
+        }
     }
 }
 

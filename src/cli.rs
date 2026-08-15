@@ -24,6 +24,8 @@ pub enum Command {
     Sync(SyncArgs),
     /// Show the current deployment state.
     Status(DeploymentArgs),
+    /// Remove downstream services and data while preserving local onboard state.
+    Clean(CleanArgs),
     /// Remove resources created by this deployment.
     Rollback(RollbackArgs),
     /// Remove locally stored session credentials.
@@ -34,6 +36,13 @@ pub enum Command {
 
 #[derive(Debug, Args)]
 pub struct DeploymentArgs {}
+
+#[derive(Debug, Args)]
+pub struct CleanArgs {
+    /// Confirm deletion of downstream containers, generated files, and data.
+    #[arg(long)]
+    pub yes: bool,
+}
 
 #[derive(Debug, Args)]
 pub struct UpdateArgs {

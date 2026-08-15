@@ -1,18 +1,19 @@
 use std::collections::BTreeSet;
 
 use clap::CommandFactory;
-use cliclack::{confirm, select, spinner};
+use cliclack::{confirm, select};
 use console::style;
 use secrecy::ExposeSecret;
 
 use crate::{
-    cli::{Cli, Command, DeploymentArgs, OnboardArgs, RollbackArgs, SyncArgs},
+    cli::{CleanArgs, Cli, Command, DeploymentArgs, OnboardArgs, RollbackArgs, SyncArgs},
     config::{DeploymentConfig, authenticate_source, interactive_config, reauthenticate_source},
     doctor,
     error::{AppError, Result},
-    source::{SourceClient, SourceError},
-    state::unix_timestamp,
-    storage::{self, CONFIG_FILE, SESSION_FILE},
+    source::{SourceClient, SourceError, StatusKeyProvision},
+    source_key_store,
+    state::{DeploymentState, unix_timestamp},
+    storage::{self, CONFIG_FILE, CREDENTIALS_FILE, SESSION_FILE, STATE_FILE},
     target::compose::DeploymentRuntime,
     target::kuma,
     target::newapi::NewApiClient,
@@ -29,6 +30,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Some(Command::Onboard(args)) => run_onboard(&args).await,
         Some(Command::Sync(args)) => run_sync(&args).await,
         Some(Command::Status(args)) => run_status(&args).await,
+        Some(Command::Clean(args)) => run_clean(&args).await,
         Some(Command::Rollback(args)) => run_rollback(&args).await,
         Some(Command::Logout(args)) => run_logout(&args).await,
         Some(Command::Update(args)) => updater::run(&args).await,
@@ -49,22 +51,30 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
             "--non-interactive requires --config FILE".to_owned(),
         ));
     }
-    let resume_existing = if args.config.is_none() && storage::exists(CONFIG_FILE)? {
+    let existing_action = if args.config.is_none() && storage::exists(CONFIG_FILE)? {
         let action: String = select("检测到已保存的部署配置")
             .item(
                 "resume".to_owned(),
                 "继续上次部署",
                 "使用上次表单、会话和已生成凭证",
             )
-            .item("reconfigure".to_owned(), "重新填写", "重新进入完整配置向导")
+            .item(
+                "replace".to_owned(),
+                "清理当前部署并重新填写",
+                "确认删除当前下游后部署新站点；保留账号级源站资源",
+            )
             .initial_value("resume".to_owned())
             .interact()
             .map_err(AppError::from_prompt)?;
         println!();
-        action == "resume"
+        Some(action)
     } else {
-        false
+        None
     };
+    if existing_action.as_deref() == Some("replace") {
+        clear_current_deployment_before_onboard().await?;
+    }
+    let resume_existing = existing_action.as_deref() == Some("resume");
     let (mut config, mut source, identity) = if resume_existing {
         let mut config = load_deployment_config()?;
         config.resolve_passwords();
@@ -110,32 +120,32 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
     persist_deployment_config(&config)?;
     println!();
 
-    let progress = spinner();
-    progress.start("读取源站分组");
+    print_action("读取源站分组");
     let catalog = source.groups().await?;
-    progress.stop(format!("已读取 {} 个可见分组", catalog.groups.len()));
+    print_done(&format!("已读取 {} 个可见分组", catalog.groups.len()));
 
-    progress.start("读取源站价格配置");
+    print_action("读取源站价格、首页和 Seedance 配置");
     let source_pricing = source.pricing().await?;
-    progress.stop("已读取并校验 8 个源站价格配置");
+    print_done("源站价格、首页和 Seedance 配置已读取并校验");
 
-    progress.start("同步源站分组 Token");
+    print_action("同步源站分组 Token");
     let token_sync = source
         .ensure_group_tokens(&config.deployment_id(), &catalog)
         .await?;
-    progress.stop("源站分组 Token 已就绪");
+    print_done("源站分组 Token 已就绪");
 
-    progress.start("准备源站 public status Key");
-    let status_key = source.ensure_onboard_status_key().await?;
-    progress.stop(if status_key.created {
-        "源站 public status Key 已创建"
+    print_action("准备源站公共状态密钥");
+    let (status_key, shared_status_key) =
+        resolve_source_status_key(&mut source, &config, identity.user_id).await?;
+    print_done(if status_key.created {
+        "源站公共状态密钥已创建"
     } else {
-        "源站 public status Key 已复用"
+        "源站公共状态密钥已复用"
     });
     print_message(
         "源站资源",
         &format!(
-            "账号：{}\n分组：{}\nToken：新建 {}，复用 {}，修正 {}\nstatus Key：{}\n分组响应哈希：{}",
+            "账号：{}\n分组：{}\nToken：新建 {}，复用 {}，修正 {}\n公共状态密钥：{}\n分组响应哈希：{}",
             identity.username,
             catalog.groups.len(),
             token_sync.created,
@@ -150,15 +160,21 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
         ),
     );
 
-    progress.start("准备下游部署状态");
+    print_action("准备下游部署状态");
     let mut deployment = DeploymentRuntime::prepare(
         &config,
         identity.user_id,
         &catalog.response_sha256,
         status_key.metadata.id,
-        status_key.key(),
+        shared_status_key.as_ref(),
     )?;
-    progress.stop("下游部署状态已就绪");
+    source_key_store::save(
+        &config.source_url,
+        identity.user_id,
+        status_key.metadata.id,
+        &deployment.secrets.public_status_source_key,
+    )?;
+    print_done("下游部署状态已就绪");
     if deployment.credentials_should_display {
         print_message(
             "管理员凭证",
@@ -171,30 +187,32 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
             ),
         );
     }
-    progress.start("部署 New API、PostgreSQL 和 Redis");
+    print_action("部署 New API、PostgreSQL 和 Redis");
     deployment.deploy_base_stack(&config)?;
-    progress.stop(format!(
+    print_done(&format!(
         "基础服务已就绪，New API 端口 {}",
         deployment.state.newapi_port
     ));
-    progress.start("初始化下游管理员和站点配置");
+    print_action("初始化下游管理员和站点配置");
     let mut downstream = NewApiClient::connect(&deployment.executor, deployment.state.newapi_port)?;
     downstream
         .initialize_and_login(&config, &deployment.secrets.newapi_admin_password)
         .await?;
     downstream.configure_site(&config.website_name).await?;
-    progress.stop("下游管理员已生成，站点配置已写入");
+    print_done("下游管理员已生成，站点配置已写入");
 
-    progress.start("导入下游价格配置");
+    print_action("导入价格表、Seedance 定价和能力配置");
     let pricing_hashes = downstream.import_pricing(&source_pricing).await?;
     deployment.state.pricing_sha256 = pricing_hashes;
-    deployment
-        .state
-        .mark_phase("pricing", "DONE", "8 个价格 option 已写入并回读一致");
+    deployment.state.mark_phase(
+        "pricing",
+        "DONE",
+        "价格表、Seedance 定价和能力配置已写入并回读一致",
+    );
     deployment.persist_state()?;
-    progress.stop("8 个价格配置已校验");
+    print_done("价格表、Seedance 定价和能力配置已校验");
 
-    progress.start("同步下游分组渠道");
+    print_action("同步下游分组渠道");
     let (channel_result, channels) = downstream
         .sync_channels(
             &config,
@@ -215,18 +233,18 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
         ),
     );
     deployment.persist_state()?;
-    progress.stop(format!(
+    print_done(&format!(
         "下游渠道已同步：新建 {}，复用 {}，更新 {}",
         channel_result.created, channel_result.reused, channel_result.updated
     ));
-    progress.start("部署 Uptime Kuma 2.5.0");
+    print_action("部署 Uptime Kuma 2.5.0");
     deployment.deploy_kuma(&config)?;
-    progress.stop(format!(
+    print_done(&format!(
         "Uptime Kuma 已就绪，端口 {}",
         deployment.state.kuma_port
     ));
 
-    progress.start("克隆 public status 页面和监控");
+    print_action("克隆公共状态页、分组和监控");
     let manifest = source
         .onboard_status_manifest(&deployment.secrets.public_status_source_key)
         .await?;
@@ -254,8 +272,8 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
         ),
     );
     deployment.persist_state()?;
-    progress.stop(format!(
-        "已同步 {} 个 public status 监控",
+    print_done(&format!(
+        "已同步 {} 个公共状态监控",
         deployment.state.kuma_monitors.len()
     ));
     deployment.state.last_sync_at = unix_timestamp();
@@ -267,7 +285,7 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
     );
     deployment.persist_state()?;
     persist_source_session(&source)?;
-    print_success("下游基础服务、管理员、价格、渠道和 public status 初始化完成");
+    print_success("下游基础服务、管理员、价格、渠道和公共状态初始化完成");
     Ok(())
 }
 
@@ -320,7 +338,24 @@ async fn run_sync_inner(
     let status_key = source.ensure_onboard_status_key().await?;
     if let Some(key) = status_key.key() {
         deployment.secrets.public_status_source_key = key.clone();
+    } else if deployment.state.status_key_id != 0
+        && deployment.state.status_key_id != status_key.metadata.id
+    {
+        deployment.secrets.public_status_source_key =
+            source_key_store::load(&config.source_url, identity.user_id, status_key.metadata.id)?
+                .ok_or_else(|| {
+                AppError::State(
+                    "源站公共状态密钥已更换，但这台机器没有保存新密钥内容；请运行 onboard 恢复"
+                        .to_owned(),
+                )
+            })?;
     }
+    source_key_store::save(
+        &config.source_url,
+        identity.user_id,
+        status_key.metadata.id,
+        &deployment.secrets.public_status_source_key,
+    )?;
     deployment.state.source_user_id = identity.user_id;
     deployment.state.source_group_sha256 = catalog.response_sha256.clone();
     deployment.state.status_key_id = status_key.metadata.id;
@@ -348,9 +383,11 @@ async fn run_sync_inner(
     deployment.state.channels = channels;
     if let Some(source_pricing) = &source_pricing {
         deployment.state.pricing_sha256 = downstream.import_pricing(source_pricing).await?;
-        deployment
-            .state
-            .mark_phase("pricing", "DONE", "8 个价格 option 已重新导入并回读一致");
+        deployment.state.mark_phase(
+            "pricing",
+            "DONE",
+            "价格表、Seedance 定价和能力配置已重新导入并回读一致",
+        );
     }
 
     deployment.deploy_kuma(config)?;
@@ -458,6 +495,26 @@ async fn run_logout(_args: &DeploymentArgs) -> Result<()> {
     Ok(())
 }
 
+async fn run_clean(args: &CleanArgs) -> Result<()> {
+    if !args.yes {
+        let confirmed =
+            confirm("删除下游容器、生成配置和数据，但保留 onboard 配置、凭证和登录会话？")
+                .initial_value(false)
+                .interact()
+                .map_err(AppError::from_prompt)?;
+        if !confirmed {
+            return Err(AppError::Cancelled);
+        }
+    }
+
+    let mut config = load_deployment_config()?;
+    config.resolve_passwords();
+    let deployment = DeploymentRuntime::prepare(&config, 0, "", 0, None)?;
+    clean_downstream(&config, &deployment)?;
+    print_success("下游容器、生成配置和数据已清理；onboard 配置、凭证和登录会话已保留");
+    Ok(())
+}
+
 async fn run_rollback(args: &RollbackArgs) -> Result<()> {
     if !args.yes {
         let confirmed = confirm("删除本次部署创建的下游容器、配置和数据？")
@@ -469,7 +526,7 @@ async fn run_rollback(args: &RollbackArgs) -> Result<()> {
         }
     }
     if args.revoke_source && !args.yes {
-        let confirmed = confirm("同时撤销源站分组 Token 和 public status Key？")
+        let confirmed = confirm("同时撤销源站分组 Token 和公共状态密钥？")
             .initial_value(false)
             .interact()
             .map_err(AppError::from_prompt)?;
@@ -498,20 +555,60 @@ async fn run_rollback(args: &RollbackArgs) -> Result<()> {
             .revoke_deployment_tokens(&deployment.state.deployment_id)
             .await?;
         source.revoke_onboard_status_key().await?;
+        source_key_store::remove(&config.source_url, identity.user_id)?;
         print_success(&format!(
-            "已撤销源站资源：{} 个分组 Token 和 1 个 status Key",
+            "已撤销源站资源：{} 个分组 Token 和 1 个公共状态密钥",
             revoked_tokens
         ));
+    } else if deployment.state.source_user_id > 0 && deployment.state.status_key_id > 0 {
+        source_key_store::save(
+            &config.source_url,
+            deployment.state.source_user_id,
+            deployment.state.status_key_id,
+            &deployment.secrets.public_status_source_key,
+        )?;
     }
 
+    clean_downstream(&config, &deployment)?;
+    storage::clear_deployment()?;
+    print_success("下游 Compose 项目、配置和数据已清理");
+    Ok(())
+}
+
+fn clean_downstream(config: &DeploymentConfig, deployment: &DeploymentRuntime) -> Result<()> {
     deployment
         .executor
         .compose(&config.container_name, &["down", "--remove-orphans"])?;
     deployment
         .executor
         .run_in_directory("rm -f secrets.env docker-compose.yml kuma-helper.js\nrm -rf data")?;
+    Ok(())
+}
+
+async fn clear_current_deployment_before_onboard() -> Result<()> {
+    let has_state = storage::exists(STATE_FILE)?;
+    let has_credentials = storage::exists(CREDENTIALS_FILE)?;
+    if has_state && has_credentials {
+        return run_rollback(&RollbackArgs {
+            yes: false,
+            revoke_source: false,
+        })
+        .await;
+    }
+    if has_state || has_credentials {
+        return Err(AppError::State(
+            "当前部署状态或凭证不完整，无法安全清理；请先检查 ~/.meowai-deploy".to_owned(),
+        ));
+    }
+    let confirmed = confirm("删除当前未完成的 onboard 配置并重新填写？")
+        .initial_value(false)
+        .interact()
+        .map_err(AppError::from_prompt)?;
+    if !confirmed {
+        return Err(AppError::Cancelled);
+    }
     storage::clear_deployment()?;
-    print_success("下游 Compose 项目、配置和数据已清理");
+    print_success("已清理未完成的 onboard 配置");
     Ok(())
 }
 
@@ -552,6 +649,7 @@ async fn source_for_operation(config: &DeploymentConfig) -> Result<SourceClient>
         let mut source = SourceClient::from_session(&config.source_url, persisted)?;
         match source.validate_session().await {
             Ok(()) => {
+                source.check_onboard_access().await?;
                 persist_source_session(&source)?;
                 return Ok(source);
             }
@@ -586,6 +684,71 @@ fn persist_source_session(source: &SourceClient) -> Result<()> {
     storage::write(SESSION_FILE, &content)
 }
 
+async fn resolve_source_status_key(
+    source: &mut SourceClient,
+    config: &DeploymentConfig,
+    source_user_id: i64,
+) -> Result<(StatusKeyProvision, Option<secrecy::SecretString>)> {
+    source_key_store::ensure_writable()?;
+    let mut provision = source.ensure_onboard_status_key().await?;
+    if let Some(key) = provision.key() {
+        let key = key.clone();
+        source_key_store::save(
+            &config.source_url,
+            source_user_id,
+            provision.metadata.id,
+            &key,
+        )?;
+        return Ok((provision, Some(key)));
+    }
+    if let Some(key) =
+        source_key_store::load(&config.source_url, source_user_id, provision.metadata.id)?
+    {
+        return Ok((provision, Some(key)));
+    }
+    if current_deployment_has_status_key(source_user_id, provision.metadata.id)? {
+        return Ok((provision, None));
+    }
+
+    let confirmed = confirm(
+        "源站已有公共状态密钥，但这台机器没有保存密钥内容。继续会生成新密钥，其他正在使用旧密钥的下游状态页会失效。是否继续？",
+    )
+    .initial_value(true)
+    .interact()
+    .map_err(AppError::from_prompt)?;
+    if !confirmed {
+        return Err(AppError::State(
+            "未生成新公共状态密钥；旧密钥仍然有效，未作修改".to_owned(),
+        ));
+    }
+    source.revoke_onboard_status_key().await?;
+    source_key_store::remove(&config.source_url, source_user_id)?;
+    provision = source.ensure_onboard_status_key().await?;
+    let key = provision
+        .key()
+        .cloned()
+        .ok_or_else(|| AppError::State("源站生成新公共状态密钥后没有返回密钥内容".to_owned()))?;
+    source_key_store::save(
+        &config.source_url,
+        source_user_id,
+        provision.metadata.id,
+        &key,
+    )?;
+    Ok((provision, Some(key)))
+}
+
+fn current_deployment_has_status_key(source_user_id: i64, status_key_id: i64) -> Result<bool> {
+    if !storage::exists(CREDENTIALS_FILE)? {
+        return Ok(false);
+    }
+    let Some(content) = storage::read(STATE_FILE)? else {
+        return Ok(false);
+    };
+    let state: DeploymentState = serde_json::from_slice(&content)
+        .map_err(|error| AppError::State(format!("parse {STATE_FILE}: {error}")))?;
+    Ok(state.source_user_id == source_user_id && state.status_key_id == status_key_id)
+}
+
 fn print_deployment_preview(config: &DeploymentConfig) {
     println!("{}", style("部署预览").bold());
     println!();
@@ -618,6 +781,14 @@ fn print_message(title: &str, message: &str) {
         println!("  {line}");
     }
     println!();
+}
+
+fn print_action(message: &str) {
+    println!("{} {}", style("→").cyan(), style(message).cyan());
+}
+
+fn print_done(message: &str) {
+    println!("{} {}", style("✓").green(), message);
 }
 
 fn print_success(message: &str) {
