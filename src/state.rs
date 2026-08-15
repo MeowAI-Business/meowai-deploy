@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+pub const DOWNSTREAM_CLEANUP_PHASE: &str = "downstream_cleanup";
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ResourcePhase {
     pub status: String,

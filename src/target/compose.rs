@@ -9,7 +9,7 @@ use crate::{
     error::{AppError, Result},
     registry::credentials_from_env,
     security::{random_secret, validate_env_value},
-    state::DeploymentState,
+    state::{DOWNSTREAM_CLEANUP_PHASE, DeploymentState},
     storage::{self, CONFIG_FILE, CREDENTIALS_FILE, STATE_FILE},
     target::TargetExecutor,
 };
@@ -48,7 +48,7 @@ impl DeploymentSecrets {
         Ok(secrets)
     }
 
-    fn parse(content: &[u8]) -> Result<Self> {
+    pub(crate) fn parse(content: &[u8]) -> Result<Self> {
         let content = std::str::from_utf8(content)
             .map_err(|_| AppError::State("secrets.env is not UTF-8".to_owned()))?;
         let mut values = BTreeMap::new();
@@ -178,7 +178,7 @@ impl DeploymentRuntime {
             && state.source_user_id != source_user_id
         {
             return Err(AppError::State(format!(
-                "deployment belongs to source user {}, not {}",
+                "当前部署属于源站用户 {}，与本次登录用户 {} 不一致",
                 state.source_user_id, source_user_id
             )));
         }
@@ -202,7 +202,7 @@ impl DeploymentRuntime {
             (None, Some(key)) => DeploymentSecrets::create(config, key)?,
             (None, None) => {
                 return Err(AppError::State(
-                    "the source reused an existing status key, but this deployment has no saved plaintext key; revoke the source key and rerun onboard"
+                    "源站已存在公共状态密钥，但本机没有保存密钥内容，无法继续部署；请重新运行 onboard，并按提示生成新的公共状态密钥"
                         .to_owned(),
                 ));
             }
@@ -225,6 +225,7 @@ impl DeploymentRuntime {
     }
 
     pub fn deploy_base_stack(&mut self, config: &DeploymentConfig) -> Result<()> {
+        self.state.phases.remove(DOWNSTREAM_CLEANUP_PHASE);
         self.state.mark_phase(
             "base_stack",
             "IN_PROGRESS",
@@ -503,12 +504,12 @@ fn validate_existing_state(
         || state.directory != config.directory.to_string_lossy()
     {
         return Err(AppError::State(
-            "state.json belongs to a different deployment".to_owned(),
+            "state.json 属于另一个部署，无法继续操作".to_owned(),
         ));
     }
     if state.target_fingerprint != target_fingerprint {
         return Err(AppError::State(
-            "target host fingerprint changed since the previous run".to_owned(),
+            "目标主机与上次部署时不一致，无法继续操作".to_owned(),
         ));
     }
     if state.image != config.image || state.image_ref != config.image_ref {

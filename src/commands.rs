@@ -12,11 +12,14 @@ use crate::{
     error::{AppError, Result},
     source::{SourceClient, SourceError, StatusKeyProvision},
     source_key_store,
-    state::{DeploymentState, unix_timestamp},
+    state::{DOWNSTREAM_CLEANUP_PHASE, DeploymentState, unix_timestamp},
     storage::{self, CONFIG_FILE, CREDENTIALS_FILE, SESSION_FILE, STATE_FILE},
-    target::compose::DeploymentRuntime,
     target::kuma,
     target::newapi::NewApiClient,
+    target::{
+        TargetExecutor,
+        compose::{DeploymentRuntime, DeploymentSecrets},
+    },
     updater,
 };
 
@@ -316,7 +319,7 @@ async fn run_sync_inner(
         .ok_or_else(|| AppError::State("source session has no identity".to_owned()))?;
     if deployment.state.source_user_id != 0 && deployment.state.source_user_id != identity.user_id {
         return Err(AppError::State(format!(
-            "deployment belongs to source user {}, not {}",
+            "当前部署属于源站用户 {}，与本次登录用户 {} 不一致",
             deployment.state.source_user_id, identity.user_id
         )));
     }
@@ -514,8 +517,17 @@ async fn run_clean(args: &CleanArgs) -> Result<()> {
 
     let mut config = load_deployment_config()?;
     config.resolve_passwords();
-    let deployment = DeploymentRuntime::prepare(&config, 0, "", 0, None)?;
-    clean_downstream(&config, &deployment)?;
+    let executor = TargetExecutor::new(config.target.clone(), config.directory.clone());
+    executor.validate_access()?;
+    clean_downstream(&config, &executor)?;
+    if let Some(mut state) = load_saved_deployment_state()? {
+        state.mark_phase(
+            DOWNSTREAM_CLEANUP_PHASE,
+            "DONE",
+            "downstream resources removed",
+        );
+        persist_deployment_state(&state)?;
+    }
     print_success("下游容器、生成配置和数据已清理；onboard 配置、凭证和登录会话已保留");
     Ok(())
 }
@@ -544,16 +556,21 @@ async fn run_rollback(args: &RollbackArgs) -> Result<()> {
 
     let mut config = load_deployment_config()?;
     config.resolve_passwords();
-    let deployment = DeploymentRuntime::prepare(&config, 0, "", 0, None)?;
+    let executor = TargetExecutor::new(config.target.clone(), config.directory.clone());
+    executor.validate_access()?;
+    let state = load_saved_deployment_state()?;
+    if let Some(state) = &state {
+        validate_cleanup_state(&config, &executor, state)?;
+    }
     if args.revoke_source {
         let mut source = source_for_operation(&config).await?;
         let identity = source
             .identity()
             .cloned()
             .ok_or_else(|| AppError::State("source session has no identity".to_owned()))?;
-        if deployment.state.source_user_id != 0
-            && deployment.state.source_user_id != identity.user_id
-        {
+        if state.as_ref().is_some_and(|state| {
+            state.source_user_id != 0 && state.source_user_id != identity.user_id
+        }) {
             return Err(AppError::State(
                 "source account does not own this deployment".to_owned(),
             ));
@@ -565,28 +582,74 @@ async fn run_rollback(args: &RollbackArgs) -> Result<()> {
             "已撤销源站资源：{} 个分组 Token 和 1 个公共状态密钥",
             revoked_tokens
         ));
-    } else if deployment.state.source_user_id > 0 && deployment.state.status_key_id > 0 {
-        source_key_store::save(
-            &config.source_url,
-            deployment.state.source_user_id,
-            deployment.state.status_key_id,
-            &deployment.secrets.public_status_source_key,
-        )?;
+    } else if let (Some(state), Some(content)) = (state.as_ref(), storage::read(CREDENTIALS_FILE)?)
+    {
+        if state.source_user_id > 0 && state.status_key_id > 0 {
+            let secrets = DeploymentSecrets::parse(&content)?;
+            source_key_store::save(
+                &config.source_url,
+                state.source_user_id,
+                state.status_key_id,
+                &secrets.public_status_source_key,
+            )?;
+        }
     }
 
-    clean_downstream(&config, &deployment)?;
+    clean_downstream(&config, &executor)?;
     storage::clear_deployment()?;
     print_success("下游 Compose 项目、配置和数据已清理");
     Ok(())
 }
 
-fn clean_downstream(config: &DeploymentConfig, deployment: &DeploymentRuntime) -> Result<()> {
-    deployment
-        .executor
-        .compose(&config.container_name, &["down", "--remove-orphans"])?;
-    deployment
-        .executor
+fn clean_downstream(config: &DeploymentConfig, executor: &TargetExecutor) -> Result<()> {
+    executor.compose(&config.container_name, &["down", "--remove-orphans"])?;
+    executor
         .run_in_directory("rm -f secrets.env docker-compose.yml kuma-helper.js\nrm -rf data")?;
+    Ok(())
+}
+
+fn load_saved_deployment_state() -> Result<Option<DeploymentState>> {
+    storage::read(STATE_FILE)?
+        .map(|content| {
+            serde_json::from_slice(&content)
+                .map_err(|error| AppError::State(format!("parse {STATE_FILE}: {error}")))
+        })
+        .transpose()
+}
+
+fn persist_deployment_state(state: &DeploymentState) -> Result<()> {
+    let content = serde_json::to_vec_pretty(state)
+        .map_err(|error| AppError::State(format!("serialize {STATE_FILE}: {error}")))?;
+    storage::write(STATE_FILE, &content)
+}
+
+fn downstream_was_cleaned() -> Result<bool> {
+    Ok(load_saved_deployment_state()?.is_some_and(|state| {
+        state
+            .phases
+            .get(DOWNSTREAM_CLEANUP_PHASE)
+            .is_some_and(|phase| phase.status == "DONE")
+    }))
+}
+
+fn validate_cleanup_state(
+    config: &DeploymentConfig,
+    executor: &TargetExecutor,
+    state: &DeploymentState,
+) -> Result<()> {
+    if state.deployment_id != config.deployment_id()
+        || state.container_name != config.container_name
+        || state.directory != config.directory.to_string_lossy()
+    {
+        return Err(AppError::State(
+            "state.json 属于另一个部署，无法执行清理".to_owned(),
+        ));
+    }
+    if state.target_fingerprint != executor.fingerprint()? {
+        return Err(AppError::State(
+            "目标主机与上次部署时不一致，无法执行清理".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -594,6 +657,11 @@ async fn clear_current_deployment_before_onboard() -> Result<()> {
     let has_state = storage::exists(STATE_FILE)?;
     let has_credentials = storage::exists(CREDENTIALS_FILE)?;
     if has_state && has_credentials {
+        if downstream_was_cleaned()? {
+            storage::clear_deployment()?;
+            print_success("已清除保留的 onboard 配置，可以重新填写");
+            return Ok(());
+        }
         return run_rollback(&RollbackArgs {
             yes: false,
             revoke_source: false,
