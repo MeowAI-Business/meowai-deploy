@@ -224,7 +224,10 @@ impl DeploymentRuntime {
         Ok(runtime)
     }
 
-    pub fn deploy_base_stack(&mut self, config: &DeploymentConfig) -> Result<()> {
+    pub fn deploy_base_stack<F>(&mut self, config: &DeploymentConfig, mut progress: F) -> Result<()>
+    where
+        F: FnMut(&str),
+    {
         self.state.phases.remove(DOWNSTREAM_CLEANUP_PHASE);
         self.state.mark_phase(
             "base_stack",
@@ -234,10 +237,12 @@ impl DeploymentRuntime {
         self.persist_state()?;
 
         let result = (|| {
+            progress("正在写入 Docker Compose 部署配置");
             let compose = render_compose(config, self)?;
             self.executor
                 .write_file(COMPOSE_FILE, compose.as_bytes(), false)?;
             if let Some(credentials) = credentials_from_env()? {
+                progress("正在认证镜像仓库并拉取 New API 镜像");
                 let registry = config.image.split('/').next().ok_or_else(|| {
                     AppError::InvalidConfig(
                         "image must include a registry and repository".to_owned(),
@@ -249,11 +254,13 @@ impl DeploymentRuntime {
                     &credentials,
                 )?;
             }
+            progress("正在创建并启动 PostgreSQL、Redis 和 New API 容器");
             self.executor.compose(
                 &config.container_name,
                 &["up", "-d", "postgres", "redis", "new-api"],
             )?;
-            self.wait_for_base_stack(config)?;
+            progress("容器已启动，正在检查服务健康状态");
+            self.wait_for_base_stack(config, &mut progress)?;
             let image_output = self.executor.run_script(&format!(
                 "docker inspect --format '{{{{.Image}}}}' {}",
                 config.container_name
@@ -282,7 +289,10 @@ impl DeploymentRuntime {
         }
     }
 
-    pub fn deploy_kuma(&mut self, config: &DeploymentConfig) -> Result<()> {
+    pub fn deploy_kuma<F>(&mut self, config: &DeploymentConfig, mut progress: F) -> Result<()>
+    where
+        F: FnMut(&str),
+    {
         self.state.mark_phase(
             "kuma_stack",
             "IN_PROGRESS",
@@ -290,12 +300,15 @@ impl DeploymentRuntime {
         );
         self.persist_state()?;
         let result = (|| {
+            progress("正在写入 Uptime Kuma 部署配置");
             let compose = render_compose(config, self)?;
             self.executor
                 .write_file(COMPOSE_FILE, compose.as_bytes(), false)?;
+            progress("正在创建并启动 Uptime Kuma 容器");
             self.executor
                 .compose(&config.container_name, &["up", "-d", "uptime-kuma"])?;
-            self.wait_for_kuma(config)
+            progress("Uptime Kuma 容器已启动，正在检查服务状态");
+            self.wait_for_kuma(config, &mut progress)
         })();
         match result {
             Ok(()) => {
@@ -331,35 +344,128 @@ impl DeploymentRuntime {
         storage::write(STATE_FILE, &state)
     }
 
-    fn wait_for_base_stack(&self, config: &DeploymentConfig) -> Result<()> {
+    fn wait_for_base_stack<F>(&self, config: &DeploymentConfig, progress: &mut F) -> Result<()>
+    where
+        F: FnMut(&str),
+    {
         let postgres_container = format!("{}-postgres", config.container_name);
         let redis_container = format!("{}-redis", config.container_name);
         let script = format!(
-            "set -eu\nfor attempt in $(seq 1 120); do\n  pg=$(docker inspect --format '{{{{if .State.Health}}}}{{{{.State.Health.Status}}}}{{{{else}}}}none{{{{end}}}}' {pg} 2>/dev/null || true)\n  redis=$(docker inspect --format '{{{{if .State.Health}}}}{{{{.State.Health.Status}}}}{{{{else}}}}none{{{{end}}}}' {redis} 2>/dev/null || true)\n  if [ \"$pg\" = healthy ] && [ \"$redis\" = healthy ] && curl --fail --silent --max-time 2 http://127.0.0.1:{port}/api/status >/dev/null; then exit 0; fi\n  sleep 1\ndone\necho 'containers did not become healthy before timeout' >&2\ndocker compose --env-file secrets.env -p {project} ps >&2 || true\nexit 1",
+            r#"set -eu
+newapi={newapi}
+pg_container={pg}
+redis_container={redis}
+last=''
+for attempt in $(seq 1 120); do
+  pg=$(docker inspect --format '{{{{if .State.Health}}}}{{{{.State.Health.Status}}}}{{{{else}}}}none{{{{end}}}}' "$pg_container" 2>/dev/null || true)
+  redis=$(docker inspect --format '{{{{if .State.Health}}}}{{{{.State.Health.Status}}}}{{{{else}}}}none{{{{end}}}}' "$redis_container" 2>/dev/null || true)
+  new_state=$(docker inspect --format '{{{{.State.Status}}}}' "$newapi" 2>/dev/null || true)
+  new_health=$(docker inspect --format '{{{{if .State.Health}}}}{{{{.State.Health.Status}}}}{{{{else}}}}none{{{{end}}}}' "$newapi" 2>/dev/null || true)
+  new_restarts=$(docker inspect --format '{{{{.RestartCount}}}}' "$newapi" 2>/dev/null || true)
+  new_state=${{new_state:-missing}}
+  new_health=${{new_health:-none}}
+  new_restarts=${{new_restarts:-0}}
+  signature="$pg|$redis|$new_state|$new_health|$new_restarts"
+  if [ "$signature" != "$last" ] || [ $((attempt % 10)) -eq 1 ]; then
+    elapsed=$((attempt - 1))
+    printf '已等待 %ss · PostgreSQL %s · Redis %s · New API %s/%s · 重启 %s 次\n' "$elapsed" "$pg" "$redis" "$new_state" "$new_health" "$new_restarts"
+    last=$signature
+  fi
+  if [ "$pg" = healthy ] && [ "$redis" = healthy ] && curl --fail --silent --max-time 2 http://127.0.0.1:{port}/api/status >/dev/null; then
+    printf 'PostgreSQL、Redis 和 New API 均已就绪\n'
+    exit 0
+  fi
+  if [ "$new_state" = restarting ] && [ "$new_restarts" -ge 2 ]; then
+    echo "New API 容器已连续重启 $new_restarts 次，停止等待" >&2
+    docker inspect --format '容器状态={{{{.State.Status}}}}，退出码={{{{.State.ExitCode}}}}，错误={{{{.State.Error}}}}' "$newapi" >&2 || true
+    docker logs --tail 24 "$newapi" 2>&1 | tail -n 16 >&2 || true
+    exit 1
+  fi
+  if [ "$new_state" = exited ] || [ "$new_state" = dead ] || [ "$new_health" = unhealthy ]; then
+    echo "New API 容器状态异常：$new_state/$new_health" >&2
+    docker inspect --format '容器状态={{{{.State.Status}}}}，退出码={{{{.State.ExitCode}}}}，错误={{{{.State.Error}}}}' "$newapi" >&2 || true
+    docker logs --tail 24 "$newapi" 2>&1 | tail -n 16 >&2 || true
+    exit 1
+  fi
+  sleep 1
+done
+echo '等待基础服务就绪超时（120 秒）' >&2
+docker compose --env-file secrets.env -p {project} ps >&2 || true
+docker logs --tail 24 "$newapi" 2>&1 | tail -n 16 >&2 || true
+exit 1"#,
+            newapi = config.container_name,
             pg = postgres_container,
             redis = redis_container,
             port = self.state.newapi_port,
             project = config.container_name,
         );
-        self.executor.run_script(&format!(
-            "cd {}\n{}",
-            shell_escape::escape(self.executor.directory().to_string_lossy()),
-            script
-        ))?;
+        self.executor.run_script_streaming(
+            &format!(
+                "cd {}\n{}",
+                shell_escape::escape(self.executor.directory().to_string_lossy()),
+                script
+            ),
+            progress,
+        )?;
         Ok(())
     }
 
-    fn wait_for_kuma(&self, config: &DeploymentConfig) -> Result<()> {
+    fn wait_for_kuma<F>(&self, config: &DeploymentConfig, progress: &mut F) -> Result<()>
+    where
+        F: FnMut(&str),
+    {
+        let kuma_container = format!("{}-uptime-kuma", config.container_name);
         let script = format!(
-            "set -eu\nfor attempt in $(seq 1 120); do\n  if curl --fail --silent --max-time 2 http://127.0.0.1:{port}/setup-database-info >/dev/null || curl --fail --silent --max-time 2 http://127.0.0.1:{port}/api/entry-page >/dev/null; then exit 0; fi\n  sleep 1\ndone\necho 'Uptime Kuma did not become reachable before timeout' >&2\ndocker compose --env-file secrets.env -p {project} ps >&2 || true\nexit 1",
+            r#"set -eu
+kuma={kuma}
+last=''
+for attempt in $(seq 1 120); do
+  kuma_state=$(docker inspect --format '{{{{.State.Status}}}}' "$kuma" 2>/dev/null || true)
+  kuma_health=$(docker inspect --format '{{{{if .State.Health}}}}{{{{.State.Health.Status}}}}{{{{else}}}}none{{{{end}}}}' "$kuma" 2>/dev/null || true)
+  kuma_restarts=$(docker inspect --format '{{{{.RestartCount}}}}' "$kuma" 2>/dev/null || true)
+  kuma_state=${{kuma_state:-missing}}
+  kuma_health=${{kuma_health:-none}}
+  kuma_restarts=${{kuma_restarts:-0}}
+  signature="$kuma_state|$kuma_health|$kuma_restarts"
+  if [ "$signature" != "$last" ] || [ $((attempt % 10)) -eq 1 ]; then
+    elapsed=$((attempt - 1))
+    printf '已等待 %ss · Uptime Kuma %s/%s · 重启 %s 次\n' "$elapsed" "$kuma_state" "$kuma_health" "$kuma_restarts"
+    last=$signature
+  fi
+  if curl --fail --silent --max-time 2 http://127.0.0.1:{port}/setup-database-info >/dev/null || curl --fail --silent --max-time 2 http://127.0.0.1:{port}/api/entry-page >/dev/null; then
+    printf 'Uptime Kuma 已就绪\n'
+    exit 0
+  fi
+  if [ "$kuma_state" = restarting ] && [ "$kuma_restarts" -ge 2 ]; then
+    echo "Uptime Kuma 容器已连续重启 $kuma_restarts 次，停止等待" >&2
+    docker inspect --format '容器状态={{{{.State.Status}}}}，退出码={{{{.State.ExitCode}}}}，错误={{{{.State.Error}}}}' "$kuma" >&2 || true
+    docker logs --tail 24 "$kuma" 2>&1 | tail -n 16 >&2 || true
+    exit 1
+  fi
+  if [ "$kuma_state" = exited ] || [ "$kuma_state" = dead ] || [ "$kuma_health" = unhealthy ]; then
+    echo "Uptime Kuma 容器状态异常：$kuma_state/$kuma_health" >&2
+    docker inspect --format '容器状态={{{{.State.Status}}}}，退出码={{{{.State.ExitCode}}}}，错误={{{{.State.Error}}}}' "$kuma" >&2 || true
+    docker logs --tail 24 "$kuma" 2>&1 | tail -n 16 >&2 || true
+    exit 1
+  fi
+  sleep 1
+done
+echo '等待 Uptime Kuma 就绪超时（120 秒）' >&2
+docker compose --env-file secrets.env -p {project} ps >&2 || true
+docker logs --tail 24 "$kuma" 2>&1 | tail -n 16 >&2 || true
+exit 1"#,
+            kuma = kuma_container,
             port = self.state.kuma_port,
             project = config.container_name,
         );
-        self.executor.run_script(&format!(
-            "cd {}\n{}",
-            shell_escape::escape(self.executor.directory().to_string_lossy()),
-            script
-        ))?;
+        self.executor.run_script_streaming(
+            &format!(
+                "cd {}\n{}",
+                shell_escape::escape(self.executor.directory().to_string_lossy()),
+                script
+            ),
+            progress,
+        )?;
         Ok(())
     }
 }

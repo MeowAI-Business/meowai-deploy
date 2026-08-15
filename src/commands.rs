@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use clap::CommandFactory;
-use cliclack::{confirm, select};
+use cliclack::{confirm, select, spinner};
 use console::style;
 use secrecy::ExposeSecret;
 
@@ -188,12 +188,7 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
             ),
         );
     }
-    print_action("部署 New API、PostgreSQL 和 Redis");
-    deployment.deploy_base_stack(&config)?;
-    print_done(&format!(
-        "基础服务已就绪，New API 端口 {}",
-        deployment.state.newapi_port
-    ));
+    deploy_base_stack_with_progress(&mut deployment, &config)?;
     print_action("初始化下游管理员和站点配置");
     let mut downstream = NewApiClient::connect(&deployment.executor, deployment.state.newapi_port)?;
     downstream
@@ -238,12 +233,7 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
         "下游渠道已同步：新建 {}，复用 {}，更新 {}",
         channel_result.created, channel_result.reused, channel_result.updated
     ));
-    print_action("部署 Uptime Kuma 2.5.0");
-    deployment.deploy_kuma(&config)?;
-    print_done(&format!(
-        "Uptime Kuma 已就绪，端口 {}",
-        deployment.state.kuma_port
-    ));
+    deploy_kuma_with_progress(&mut deployment, &config)?;
 
     print_action("克隆公共状态页、分组和监控");
     let manifest = source
@@ -311,7 +301,7 @@ async fn run_sync_inner(
     config: &DeploymentConfig,
     deployment: &mut DeploymentRuntime,
 ) -> Result<()> {
-    deployment.deploy_base_stack(config)?;
+    deploy_base_stack_with_progress(deployment, config)?;
     let mut source = source_for_operation(config).await?;
     let identity = source
         .identity()
@@ -394,7 +384,7 @@ async fn run_sync_inner(
         );
     }
 
-    deployment.deploy_kuma(config)?;
+    deploy_kuma_with_progress(deployment, config)?;
     let manifest = source
         .onboard_status_manifest(&deployment.secrets.public_status_source_key)
         .await?;
@@ -841,6 +831,48 @@ fn print_deployment_preview(config: &DeploymentConfig) {
     );
     print_field("镜像", &format!("{}@{}", config.image, config.image_ref));
     println!();
+}
+
+fn deploy_base_stack_with_progress(
+    deployment: &mut DeploymentRuntime,
+    config: &DeploymentConfig,
+) -> Result<()> {
+    let progress = spinner();
+    progress.start("正在准备 New API、PostgreSQL 和 Redis");
+    match deployment.deploy_base_stack(config, |message| progress.set_message(message)) {
+        Ok(()) => {
+            progress.stop(format!(
+                "基础服务已就绪，New API 端口 {}",
+                deployment.state.newapi_port
+            ));
+            Ok(())
+        }
+        Err(error) => {
+            progress.error("New API、PostgreSQL 和 Redis 部署失败");
+            Err(error)
+        }
+    }
+}
+
+fn deploy_kuma_with_progress(
+    deployment: &mut DeploymentRuntime,
+    config: &DeploymentConfig,
+) -> Result<()> {
+    let progress = spinner();
+    progress.start("正在准备 Uptime Kuma 2.5.0");
+    match deployment.deploy_kuma(config, |message| progress.set_message(message)) {
+        Ok(()) => {
+            progress.stop(format!(
+                "Uptime Kuma 已就绪，端口 {}",
+                deployment.state.kuma_port
+            ));
+            Ok(())
+        }
+        Err(error) => {
+            progress.error("Uptime Kuma 部署失败");
+            Err(error)
+        }
+    }
 }
 
 fn print_field(label: &str, value: &str) {

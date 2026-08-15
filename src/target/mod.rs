@@ -5,10 +5,11 @@ pub mod newapi;
 use std::{
     borrow::Cow,
     fs,
-    io::Write,
+    io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::{Child, Command, Output, Stdio},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -319,6 +320,65 @@ docker --config "$registry_config" pull --platform linux/amd64 {image}"#,
         require_success("target script", output)
     }
 
+    pub fn run_script_streaming<F>(&self, script: &str, mut on_stdout: F) -> Result<Output>
+    where
+        F: FnMut(&str),
+    {
+        let mut child = self.spawn_script(script)?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| AppError::Target("target shell stdout unavailable".to_owned()))?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| AppError::Target("target shell stderr unavailable".to_owned()))?;
+        let stderr_reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes)?;
+            Ok::<Vec<u8>, std::io::Error>(bytes)
+        });
+
+        let mut stdout_bytes = Vec::new();
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut line = Vec::new();
+            let read = match reader.read_until(b'\n', &mut line) {
+                Ok(read) => read,
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = stderr_reader.join();
+                    return Err(AppError::Target(format!("read target output: {error}")));
+                }
+            };
+            if read == 0 {
+                break;
+            }
+            stdout_bytes.extend_from_slice(&line);
+            let text = String::from_utf8_lossy(&line);
+            let text = text.trim_end_matches(['\r', '\n']);
+            if !text.is_empty() {
+                on_stdout(text);
+            }
+        }
+        let status = child
+            .wait()
+            .map_err(|error| AppError::Target(format!("wait for target shell: {error}")))?;
+        let stderr = stderr_reader
+            .join()
+            .map_err(|_| AppError::Target("target stderr reader panicked".to_owned()))?
+            .map_err(|error| AppError::Target(format!("read target error output: {error}")))?;
+        require_success(
+            "target script",
+            Output {
+                status,
+                stdout: stdout_bytes,
+                stderr,
+            },
+        )
+    }
+
     pub fn run_in_directory(&self, script: &str) -> Result<Output> {
         self.run_script(&format!(
             "set -eu\ncd {}\n{}",
@@ -328,6 +388,12 @@ docker --config "$registry_config" pull --platform linux/amd64 {image}"#,
     }
 
     fn run_script_raw(&self, script: &str) -> Result<Output> {
+        self.spawn_script(script)?
+            .wait_with_output()
+            .map_err(|error| AppError::Target(format!("wait for target shell: {error}")))
+    }
+
+    fn spawn_script(&self, script: &str) -> Result<Child> {
         match &self.target {
             Target::Local => {
                 let mut child = Command::new("sh")
@@ -337,15 +403,15 @@ docker --config "$registry_config" pull --platform linux/amd64 {image}"#,
                     .stderr(Stdio::piped())
                     .spawn()
                     .map_err(|error| AppError::Target(format!("failed to start shell: {error}")))?;
-                child
+                let mut stdin = child
                     .stdin
-                    .as_mut()
-                    .ok_or_else(|| AppError::Target("target shell stdin unavailable".to_owned()))?
+                    .take()
+                    .ok_or_else(|| AppError::Target("target shell stdin unavailable".to_owned()))?;
+                stdin
                     .write_all(script.as_bytes())
                     .map_err(|error| AppError::Target(format!("write shell input: {error}")))?;
-                child
-                    .wait_with_output()
-                    .map_err(|error| AppError::Target(format!("wait for shell: {error}")))
+                drop(stdin);
+                Ok(child)
             }
             Target::Ssh { destination } => {
                 let mut child = Command::new("ssh")
@@ -356,15 +422,15 @@ docker --config "$registry_config" pull --platform linux/amd64 {image}"#,
                     .stderr(Stdio::piped())
                     .spawn()
                     .map_err(|error| AppError::Target(format!("failed to start ssh: {error}")))?;
-                child
+                let mut stdin = child
                     .stdin
-                    .as_mut()
-                    .ok_or_else(|| AppError::Target("ssh stdin unavailable".to_owned()))?
+                    .take()
+                    .ok_or_else(|| AppError::Target("ssh stdin unavailable".to_owned()))?;
+                stdin
                     .write_all(script.as_bytes())
                     .map_err(|error| AppError::Target(format!("write ssh input: {error}")))?;
-                child
-                    .wait_with_output()
-                    .map_err(|error| AppError::Target(format!("wait for ssh: {error}")))
+                drop(stdin);
+                Ok(child)
             }
         }
     }
@@ -423,14 +489,20 @@ fn require_success(operation: &str, output: Output) -> Result<Output> {
 
 fn target_output_error(operation: &str, output: &Output) -> AppError {
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let detail = stderr.lines().take(8).collect::<Vec<_>>().join(" | ");
+    let detail = stderr
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .take(24)
+        .map(|line| format!("  {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
     AppError::Target(format!(
         "{operation} exited with {}{}",
         output.status,
         if detail.is_empty() {
             String::new()
         } else {
-            format!(": {detail}")
+            format!("\n{detail}")
         }
     ))
 }
@@ -484,5 +556,38 @@ mod tests {
             path,
             remote_upload_path("docker-compose.yml", Path::new("/tmp/local-b"))
         );
+    }
+
+    #[test]
+    fn streaming_scripts_report_stdout_lines() {
+        let executor = TargetExecutor::new(
+            Target::Local,
+            tempfile::tempdir()
+                .expect("create temporary directory")
+                .path()
+                .to_owned(),
+        );
+        let mut lines = Vec::new();
+        let output = executor
+            .run_script_streaming("printf 'starting\\nhealthy\\n'", |line| {
+                lines.push(line.to_owned())
+            })
+            .expect("run streaming script");
+        assert_eq!(lines, ["starting", "healthy"]);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "starting\nhealthy\n"
+        );
+    }
+
+    #[test]
+    fn target_errors_keep_diagnostics_on_separate_lines() {
+        let output = Command::new("sh")
+            .args(["-c", "printf 'first\\nsecond\\n' >&2; exit 1"])
+            .output()
+            .expect("run failing command");
+        let error = target_output_error("probe", &output).to_string();
+        assert!(error.contains("probe exited with exit status: 1"));
+        assert!(error.contains("\n  first\n  second"));
     }
 }
