@@ -18,6 +18,7 @@ use super::error::ApplicationError;
 #[serde(rename_all = "snake_case")]
 pub enum OperationKind {
     Onboard,
+    Status,
     Sync,
     Clean,
     Rollback,

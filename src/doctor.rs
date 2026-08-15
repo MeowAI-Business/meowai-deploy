@@ -80,14 +80,14 @@ fn check_architecture_for(operating_system: &str, architecture: &str) -> Check {
         "aarch64" => Some("arm64"),
         _ => None,
     };
-    if matches!(operating_system, "linux" | "macos") && architecture_name.is_some() {
+    if let (true, Some(architecture_name)) = (
+        matches!(operating_system, "linux" | "macos"),
+        architecture_name,
+    ) {
         Check {
             name: "architecture".to_owned(),
             status: CheckStatus::Pass,
-            detail: format!(
-                "{operating_system} {} supported",
-                architecture_name.expect("supported architecture")
-            ),
+            detail: format!("{operating_system} {} supported", architecture_name),
             blocking: true,
         }
     } else {
@@ -99,29 +99,6 @@ fn check_architecture_for(operating_system: &str, architecture: &str) -> Check {
             ),
             blocking: true,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn architecture_check_accepts_linux_and_macos_on_amd64_and_arm64() {
-        for (operating_system, architecture) in [
-            ("linux", "x86_64"),
-            ("linux", "aarch64"),
-            ("macos", "x86_64"),
-            ("macos", "aarch64"),
-        ] {
-            let check = check_architecture_for(operating_system, architecture);
-            assert!(matches!(check.status, CheckStatus::Pass));
-            assert!(check.blocking);
-        }
-        assert!(matches!(
-            check_architecture_for("linux", "riscv64").status,
-            CheckStatus::Fail
-        ));
     }
 }
 
@@ -294,5 +271,28 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.1} GiB", bytes as f64 / GIB as f64)
     } else {
         format!("{} MiB", bytes / (1024 * 1024))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn architecture_check_accepts_linux_and_macos_on_amd64_and_arm64() {
+        for (operating_system, architecture) in [
+            ("linux", "x86_64"),
+            ("linux", "aarch64"),
+            ("macos", "x86_64"),
+            ("macos", "aarch64"),
+        ] {
+            let check = check_architecture_for(operating_system, architecture);
+            assert!(matches!(check.status, CheckStatus::Pass));
+            assert!(check.blocking);
+        }
+        assert!(matches!(
+            check_architecture_for("linux", "riscv64").status,
+            CheckStatus::Fail
+        ));
     }
 }

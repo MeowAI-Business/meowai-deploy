@@ -4,6 +4,7 @@ mod commands;
 mod config;
 mod doctor;
 mod error;
+mod platform;
 mod pricing;
 mod registry;
 mod security;
@@ -13,6 +14,7 @@ mod state;
 mod storage;
 mod target;
 mod updater;
+mod web;
 
 use std::env;
 

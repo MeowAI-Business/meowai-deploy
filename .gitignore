@@ -7,3 +7,5 @@ state.json
 secrets.env
 deployment.toml
 
+webui/node_modules/
+webui/dist/
