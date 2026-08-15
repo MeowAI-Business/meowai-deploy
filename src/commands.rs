@@ -127,9 +127,9 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
     let catalog = source.groups().await?;
     print_done(&format!("已读取 {} 个可见分组", catalog.groups.len()));
 
-    print_action("读取源站价格、首页、Seedance 和市场配置");
+    print_action("读取源站价格、计费、分组行为、首页、Seedance 和市场配置");
     let source_pricing = source.pricing().await?;
-    print_done("源站价格、首页、Seedance 和市场配置已读取并校验");
+    print_done("源站价格、计费、分组行为、首页、Seedance 和市场配置已读取并校验");
 
     print_action("同步源站分组 Token");
     let token_sync = source.ensure_group_tokens(&catalog).await?;
@@ -202,16 +202,16 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
     downstream.configure_site(&config.website_name).await?;
     print_done("下游管理员已生成，站点配置已写入");
 
-    print_action("导入价格表、Seedance 和市场配置");
+    print_action("导入价格、计费、分组行为、价格表、Seedance 和市场配置");
     let pricing_hashes = downstream.import_pricing(&source_pricing).await?;
     deployment.state.pricing_sha256 = pricing_hashes;
     deployment.state.mark_phase(
         "pricing",
         "DONE",
-        "价格表、Seedance 和市场配置已写入并回读一致",
+        "价格、计费、分组行为、价格表、Seedance 和市场配置已写入并回读一致",
     );
     deployment.persist_state()?;
-    print_done("价格表、Seedance 和市场配置已校验");
+    print_done("价格、计费、分组行为、价格表、Seedance 和市场配置已校验");
 
     print_action("同步下游分组渠道");
     let (channel_result, channels) = downstream
@@ -390,7 +390,7 @@ async fn run_sync_inner(
         deployment.state.mark_phase(
             "pricing",
             "DONE",
-            "价格表、Seedance 和市场配置已重新导入并回读一致",
+            "价格、计费、分组行为、价格表、Seedance 和市场配置已重新导入并回读一致",
         );
     }
 

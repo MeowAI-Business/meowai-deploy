@@ -99,6 +99,33 @@ pub struct VideoCapabilityPolicy {
     pub effective_until: i64,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct GeneralSettingConfig {
+    pub quota_display_type: String,
+    pub custom_currency_symbol: String,
+    pub custom_currency_exchange_rate: f64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct QuotaSettingConfig {
+    pub enable_free_model_pre_consume: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct BillingSettingConfig {
+    pub billing_task_estimate: BTreeMap<String, String>,
+    pub billing_task_deposit: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct GroupBehaviorConfig {
+    pub group_group_ratio: BTreeMap<String, BTreeMap<String, f64>>,
+    pub group_special_usable_group: BTreeMap<String, BTreeMap<String, String>>,
+    pub auto_groups: Vec<String>,
+    pub max_token_auto_groups: i64,
+    pub default_use_auto_group: bool,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct PricingConfig {
     model_price: StrictPriceMap,
@@ -113,6 +140,26 @@ pub struct PricingConfig {
     billing_mode: BTreeMap<String, String>,
     #[serde(default)]
     billing_expr: BTreeMap<String, String>,
+    #[serde(default)]
+    general_setting: GeneralSettingConfig,
+    #[serde(default)]
+    quota_per_unit: f64,
+    #[serde(default)]
+    usd_exchange_rate: f64,
+    #[serde(default)]
+    display_token_stat_enabled: bool,
+    #[serde(default)]
+    display_in_currency_enabled: bool,
+    #[serde(default)]
+    pre_consumed_quota: i64,
+    #[serde(default)]
+    quota_setting: QuotaSettingConfig,
+    #[serde(default)]
+    billing_setting: BillingSettingConfig,
+    #[serde(default)]
+    tool_prices: BTreeMap<String, f64>,
+    #[serde(default)]
+    group_behavior: GroupBehaviorConfig,
     #[serde(default)]
     home_pricing: HomePricingConfig,
     #[serde(default)]
@@ -174,36 +221,143 @@ impl PricingConfig {
         })
         .collect::<Result<Vec<_>>>()?;
 
-        let mut add_json =
-            |key: &'static str, source_field: &'static str, value: &Value| -> Result<()> {
-                let canonical_json = canonical_json_value(value)?;
-                options.push(PricingOption {
-                    key,
-                    source_field,
-                    sha256: sha256_hex(canonical_json.as_bytes()),
-                    canonical_json,
-                    comparison: PricingComparison::Json,
-                });
-                Ok(())
-            };
+        let add_json = |options: &mut Vec<PricingOption>,
+                        key: &'static str,
+                        source_field: &'static str,
+                        value: &Value|
+         -> Result<()> {
+            let canonical_json = canonical_json_value(value)?;
+            options.push(PricingOption {
+                key,
+                source_field,
+                sha256: sha256_hex(canonical_json.as_bytes()),
+                canonical_json,
+                comparison: PricingComparison::Json,
+            });
+            Ok(())
+        };
         add_json(
+            &mut options,
             "billing_setting.billing_mode",
             "billing_mode",
             &serde_json::to_value(&self.billing_mode)
                 .map_err(|error| AppError::State(error.to_string()))?,
         )?;
         add_json(
+            &mut options,
             "billing_setting.billing_expr",
             "billing_expr",
             &serde_json::to_value(&self.billing_expr)
                 .map_err(|error| AppError::State(error.to_string()))?,
         )?;
+        add_json(
+            &mut options,
+            "billing_setting.billing_task_estimate",
+            "billing_setting.billing_task_estimate",
+            &serde_json::to_value(&self.billing_setting.billing_task_estimate)
+                .map_err(|error| AppError::State(error.to_string()))?,
+        )?;
+        add_json(
+            &mut options,
+            "billing_setting.billing_task_deposit",
+            "billing_setting.billing_task_deposit",
+            &serde_json::to_value(&self.billing_setting.billing_task_deposit)
+                .map_err(|error| AppError::State(error.to_string()))?,
+        )?;
+        add_json(
+            &mut options,
+            "tool_price_setting.prices",
+            "tool_prices",
+            &serde_json::to_value(&self.tool_prices)
+                .map_err(|error| AppError::State(error.to_string()))?,
+        )?;
+        add_json(
+            &mut options,
+            "GroupGroupRatio",
+            "group_behavior.group_group_ratio",
+            &serde_json::to_value(&self.group_behavior.group_group_ratio)
+                .map_err(|error| AppError::State(error.to_string()))?,
+        )?;
+        add_json(
+            &mut options,
+            "group_ratio_setting.group_special_usable_group",
+            "group_behavior.group_special_usable_group",
+            &serde_json::to_value(&self.group_behavior.group_special_usable_group)
+                .map_err(|error| AppError::State(error.to_string()))?,
+        )?;
+        add_json(
+            &mut options,
+            "AutoGroups",
+            "group_behavior.auto_groups",
+            &serde_json::to_value(&self.group_behavior.auto_groups)
+                .map_err(|error| AppError::State(error.to_string()))?,
+        )?;
+        options.push(exact_option(
+            "MaxTokenAutoGroups",
+            "group_behavior.max_token_auto_groups",
+            &self.group_behavior.max_token_auto_groups.to_string(),
+        ));
+        options.push(exact_option(
+            "DefaultUseAutoGroup",
+            "group_behavior.default_use_auto_group",
+            bool_string(self.group_behavior.default_use_auto_group),
+        ));
+        options.push(exact_option(
+            "QuotaPerUnit",
+            "quota_per_unit",
+            &format_float(self.quota_per_unit),
+        ));
+        options.push(exact_option(
+            "USDExchangeRate",
+            "usd_exchange_rate",
+            &format_float(self.usd_exchange_rate),
+        ));
+        options.push(exact_option(
+            "DisplayTokenStatEnabled",
+            "display_token_stat_enabled",
+            bool_string(self.display_token_stat_enabled),
+        ));
+        options.push(exact_option(
+            "DisplayInCurrencyEnabled",
+            "display_in_currency_enabled",
+            bool_string(self.display_in_currency_enabled),
+        ));
+        options.push(exact_option(
+            "PreConsumedQuota",
+            "pre_consumed_quota",
+            &self.pre_consumed_quota.to_string(),
+        ));
+        options.push(exact_option(
+            "general_setting.quota_display_type",
+            "general_setting.quota_display_type",
+            &self.general_setting.quota_display_type,
+        ));
+        options.push(exact_option(
+            "general_setting.custom_currency_symbol",
+            "general_setting.custom_currency_symbol",
+            &self.general_setting.custom_currency_symbol,
+        ));
+        options.push(exact_option(
+            "general_setting.custom_currency_exchange_rate",
+            "general_setting.custom_currency_exchange_rate",
+            &format_float(self.general_setting.custom_currency_exchange_rate),
+        ));
+        options.push(exact_option(
+            "quota_setting.enable_free_model_pre_consume",
+            "quota_setting.enable_free_model_pre_consume",
+            bool_string(self.quota_setting.enable_free_model_pre_consume),
+        ));
         if !self.home_pricing.table.is_empty() {
             let table: Value = serde_json::from_str(&self.home_pricing.table).map_err(|error| {
                 AppError::State(format!("invalid source home pricing table: {error}"))
             })?;
             ensure_home_pricing_has_no_notes(&table)?;
-            add_json("home_setting.pricing_table", "home_pricing.table", &table)?;
+            add_json(
+                &mut options,
+                "home_setting.pricing_table",
+                "home_pricing.table",
+                &table,
+            )?;
         } else {
             options.push(exact_option(
                 "home_setting.pricing_table",
@@ -394,6 +548,10 @@ fn bool_string(value: bool) -> &'static str {
     if value { "true" } else { "false" }
 }
 
+fn format_float(value: f64) -> String {
+    value.to_string()
+}
+
 fn exact_option(key: &'static str, source_field: &'static str, value: &str) -> PricingOption {
     PricingOption {
         key,
@@ -500,7 +658,7 @@ mod tests {
         .expect("parse source pricing");
 
         let options = config.options().expect("build pricing options");
-        assert_eq!(options.len(), 36);
+        assert_eq!(options.len(), 53);
         assert!(
             options
                 .iter()

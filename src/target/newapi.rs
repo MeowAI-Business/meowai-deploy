@@ -1076,6 +1076,29 @@ mod tests {
             "image_ratio": {"image": 4},
             "audio_ratio": {"audio": 5},
             "audio_completion_ratio": {"audio-output": 6},
+            "general_setting": {
+                "quota_display_type": "CNY",
+                "custom_currency_symbol": "CNY",
+                "custom_currency_exchange_rate": 7.3
+            },
+            "quota_per_unit": 500000,
+            "usd_exchange_rate": 7.3,
+            "display_token_stat_enabled": true,
+            "display_in_currency_enabled": true,
+            "pre_consumed_quota": 500,
+            "quota_setting": {"enable_free_model_pre_consume": false},
+            "billing_setting": {
+                "billing_task_estimate": {"video-model": "{\"1080p\":300000}"},
+                "billing_task_deposit": {"video-model": "20"}
+            },
+            "tool_prices": {"web_search": 12},
+            "group_behavior": {
+                "group_group_ratio": {"vip": {"default": 0.9}},
+                "group_special_usable_group": {"vip": {"+:seedance-cn": "video"}},
+                "auto_groups": ["default", "vip"],
+                "max_token_auto_groups": 5,
+                "default_use_auto_group": true
+            },
             "marketplace": {
                 "marketplace_enabled": true,
                 "provider_self_apply_enabled": false,
@@ -1110,7 +1133,7 @@ mod tests {
                 "success": true,
                 "message": ""
             })))
-            .expect(36)
+            .expect(53)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -1153,7 +1176,7 @@ mod tests {
             .import_pricing(&source_pricing)
             .await
             .expect("import source pricing");
-        assert_eq!(hashes.len(), 39);
+        assert_eq!(hashes.len(), 56);
         assert_eq!(hashes.get("model_price").map(String::len), Some(64));
     }
 }

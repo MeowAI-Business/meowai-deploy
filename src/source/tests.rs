@@ -67,6 +67,29 @@ fn pricing_data() -> Value {
         "image_ratio": {"image": 4},
         "audio_ratio": {"audio": 5},
         "audio_completion_ratio": {"audio-output": 6},
+        "general_setting": {
+            "quota_display_type": "CNY",
+            "custom_currency_symbol": "CNY",
+            "custom_currency_exchange_rate": 7.3
+        },
+        "quota_per_unit": 500000,
+        "usd_exchange_rate": 7.3,
+        "display_token_stat_enabled": true,
+        "display_in_currency_enabled": true,
+        "pre_consumed_quota": 500,
+        "quota_setting": {"enable_free_model_pre_consume": false},
+        "billing_setting": {
+            "billing_task_estimate": {"video-model": "{\"1080p\":300000}"},
+            "billing_task_deposit": {"video-model": "20"}
+        },
+        "tool_prices": {"web_search": 12},
+        "group_behavior": {
+            "group_group_ratio": {"vip": {"default": 0.9}},
+            "group_special_usable_group": {"vip": {"+:seedance-cn": "video"}},
+            "auto_groups": ["default", "vip"],
+            "max_token_auto_groups": 5,
+            "default_use_auto_group": true
+        },
         "marketplace": marketplace_data()
     })
 }
@@ -894,7 +917,7 @@ async fn pricing_reads_all_authenticated_source_fields() {
 
     let pricing = client.pricing().await.expect("read source pricing");
     let options = pricing.options().expect("build downstream options");
-    assert_eq!(options.len(), 36);
+    assert_eq!(options.len(), 53);
     assert_eq!(
         options
             .iter()
@@ -911,6 +934,23 @@ async fn pricing_reads_all_authenticated_source_fields() {
             "audio_completion_ratio",
             "billing_mode",
             "billing_expr",
+            "billing_setting.billing_task_estimate",
+            "billing_setting.billing_task_deposit",
+            "tool_prices",
+            "group_behavior.group_group_ratio",
+            "group_behavior.group_special_usable_group",
+            "group_behavior.auto_groups",
+            "group_behavior.max_token_auto_groups",
+            "group_behavior.default_use_auto_group",
+            "quota_per_unit",
+            "usd_exchange_rate",
+            "display_token_stat_enabled",
+            "display_in_currency_enabled",
+            "pre_consumed_quota",
+            "general_setting.quota_display_type",
+            "general_setting.custom_currency_symbol",
+            "general_setting.custom_currency_exchange_rate",
+            "quota_setting.enable_free_model_pre_consume",
             "home_pricing.table",
             "home_pricing.title",
             "home_pricing.description",

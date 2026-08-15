@@ -57,7 +57,7 @@ pub struct UpdateArgs {
 
 #[derive(Debug, Args)]
 pub struct SyncArgs {
-    /// Re-import current source pricing, Seedance, and marketplace settings.
+    /// Re-import current source pricing, billing, group behavior, Seedance, and marketplace settings.
     #[arg(long)]
     pub pricing: bool,
 
