@@ -824,7 +824,7 @@ async fn status_client_reads_direct_manifest_snapshot_and_monitor_payloads() {
         "generated_at": "2026-08-14T00:00:00Z",
         "monitors": [{
             "id": "7", "name": "GPT", "type": "http", "sort_order": 0,
-            "group_id": "1", "group": "Official", "interval": 60,
+            "group_id": "1", "group": "渠道状态", "interval": 900,
             "timeout": 10, "retries": 2, "notifications_enabled": false,
             "display_enabled": true
         }]
@@ -841,6 +841,8 @@ async fn status_client_reads_direct_manifest_snapshot_and_monitor_payloads() {
         .expect("read manifest");
     assert_eq!(result.page_name, "MeowAI");
     assert_eq!(result.monitors[0].id, "7");
+    assert_eq!(result.monitors[0].group, "渠道状态");
+    assert_eq!(result.monitors[0].interval, 900);
 
     Mock::given(method("GET"))
         .and(path("/api/onboard/status/snapshot"))
