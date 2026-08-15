@@ -10,7 +10,7 @@ fn help_lists_supported_commands() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     for command in [
-        "doctor", "onboard", "sync", "status", "rollback", "logout", "update",
+        "doctor", "onboard", "sync", "status", "clean", "rollback", "logout", "update",
     ] {
         assert!(
             stdout.contains(command),

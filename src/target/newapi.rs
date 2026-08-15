@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use reqwest::{Client, Method};
 use secrecy::{ExposeSecret, SecretString};
@@ -232,6 +232,16 @@ impl NewApiClient {
         let current: VideoPricingResponse = self
             .request(Method::GET, "/api/option/video-pricing", None, true)
             .await?;
+        let mut imported_sales = HashSet::new();
+        for (index, desired) in source.video_sales_policies.iter().enumerate() {
+            if current.sales.iter().any(|policy| policy == desired)
+                || !sales_can_precede_current_costs(&current, desired)
+            {
+                continue;
+            }
+            self.create_video_sales_policy(desired).await?;
+            imported_sales.insert(index);
+        }
         for desired in &source.video_cost_policies {
             let matched = current
                 .costs
@@ -252,21 +262,13 @@ impl NewApiClient {
                 .await?;
             }
         }
-        for desired in &source.video_sales_policies {
-            if !current.sales.iter().any(|policy| policy == desired) {
-                let mut body = serde_json::to_value(desired).map_err(|error| {
-                    AppError::Target(format!("serialize video sales policy: {error}"))
-                })?;
-                body["status"] = Value::String("active".to_owned());
-                body["reason"] = Value::String("meowai-deploy source sync".to_owned());
-                self.request_no_data(
-                    Method::POST,
-                    "/api/option/video-pricing/sales",
-                    Some(body),
-                    true,
-                )
-                .await?;
+        for (index, desired) in source.video_sales_policies.iter().enumerate() {
+            if current.sales.iter().any(|policy| policy == desired)
+                || imported_sales.contains(&index)
+            {
+                continue;
             }
+            self.create_video_sales_policy(desired).await?;
         }
 
         let current_capabilities: Vec<RemoteVideoCapabilityPolicy> = self
@@ -323,6 +325,20 @@ impl NewApiClient {
             ));
         }
         Ok(())
+    }
+
+    async fn create_video_sales_policy(&self, desired: &VideoSalesPolicy) -> Result<()> {
+        let mut body = serde_json::to_value(desired)
+            .map_err(|error| AppError::Target(format!("serialize video sales policy: {error}")))?;
+        body["status"] = Value::String("active".to_owned());
+        body["reason"] = Value::String("meowai-deploy source sync".to_owned());
+        self.request_no_data(
+            Method::POST,
+            "/api/option/video-pricing/sales",
+            Some(body),
+            true,
+        )
+        .await
     }
 
     pub async fn sync_channels(
@@ -616,6 +632,17 @@ impl NewApiClient {
     }
 }
 
+fn sales_can_precede_current_costs(
+    current: &VideoPricingResponse,
+    desired: &VideoSalesPolicy,
+) -> bool {
+    current
+        .costs
+        .iter()
+        .filter(|cost| cost.public_model == desired.public_model)
+        .all(|cost| desired.customer_rate_bps > cost.upstream_group_rate_bps)
+}
+
 fn remote_cost_matches(remote: &RemoteVideoCostPolicy, desired: &VideoCostPolicy) -> bool {
     let scope = if remote.promotion_scope.trim().is_empty() {
         None
@@ -871,6 +898,58 @@ mod tests {
         }]))
         .expect("decode downstream video capabilities response");
         assert_eq!(capabilities[0].effective_until, 0);
+    }
+
+    #[test]
+    fn video_policy_import_orders_increases_sales_before_costs() {
+        let current: VideoPricingResponse = serde_json::from_value(json!({
+            "sales": [],
+            "costs": [{
+                "provider": "4api-seedance-cn",
+                "public_model": "seedance-2.0",
+                "upstream_group_rate_bps": 7500,
+                "promotion_rate_bps": 10000,
+                "promotion_scope": "",
+                "effective_from": 0,
+                "evidence_status": "unverified"
+            }]
+        }))
+        .expect("decode current video pricing");
+        let desired = VideoSalesPolicy {
+            public_model: "seedance-2.0".to_owned(),
+            official_no_video_micros: 46_000_000,
+            official_with_video_micros: 46_000_000,
+            customer_rate_bps: 9000,
+            effective_from: 0,
+            effective_until: 0,
+        };
+        assert!(sales_can_precede_current_costs(&current, &desired));
+    }
+
+    #[test]
+    fn video_policy_import_orders_decreases_costs_before_sales() {
+        let current: VideoPricingResponse = serde_json::from_value(json!({
+            "sales": [],
+            "costs": [{
+                "provider": "4api-seedance-cn",
+                "public_model": "seedance-2.0",
+                "upstream_group_rate_bps": 7000,
+                "promotion_rate_bps": 10000,
+                "promotion_scope": "",
+                "effective_from": 0,
+                "evidence_status": "unverified"
+            }]
+        }))
+        .expect("decode current video pricing");
+        let desired = VideoSalesPolicy {
+            public_model: "seedance-2.0".to_owned(),
+            official_no_video_micros: 46_000_000,
+            official_with_video_micros: 46_000_000,
+            customer_rate_bps: 6500,
+            effective_from: 0,
+            effective_until: 0,
+        };
+        assert!(!sales_can_precede_current_costs(&current, &desired));
     }
 
     #[tokio::test]

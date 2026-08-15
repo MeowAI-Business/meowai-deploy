@@ -790,7 +790,7 @@ async fn status_client_reads_direct_manifest_snapshot_and_monitor_payloads() {
 }
 
 #[tokio::test]
-async fn pricing_reads_all_eight_authenticated_source_fields() {
+async fn pricing_reads_all_authenticated_source_fields() {
     let server = MockServer::start().await;
     let mut client = authenticated_client(&server).await;
     Mock::given(method("GET"))
@@ -807,7 +807,7 @@ async fn pricing_reads_all_eight_authenticated_source_fields() {
 
     let pricing = client.pricing().await.expect("read source pricing");
     let options = pricing.options().expect("build downstream options");
-    assert_eq!(options.len(), 8);
+    assert_eq!(options.len(), 20);
     assert_eq!(
         options
             .iter()
@@ -821,7 +821,19 @@ async fn pricing_reads_all_eight_authenticated_source_fields() {
             "completion_ratio",
             "image_ratio",
             "audio_ratio",
-            "audio_completion_ratio"
+            "audio_completion_ratio",
+            "billing_mode",
+            "billing_expr",
+            "home_pricing.table",
+            "home_pricing.title",
+            "home_pricing.description",
+            "home_pricing.enabled",
+            "video_setting.video_canonical_api_enabled",
+            "video_setting.seedance_domestic_canonical_enabled",
+            "video_setting.video_asset_affinity_enforced",
+            "video_setting.seedance_completion_token_billing_enabled",
+            "video_setting.video_playground_real_token_enabled",
+            "public_status_url"
         ]
     );
 }
