@@ -97,4 +97,7 @@ fn installer_is_a_verified_bash_script() {
     assert!(script.contains("sha256sum"));
     assert!(script.contains("checksums-sha256.txt"));
     assert!(script.contains("MEOWAI_DEPLOY_RELEASE_BASE_URL"));
+    assert!(script.contains("Added ~/.local/bin to PATH"));
+    assert!(script.contains("Run: meowai-deploy doctor"));
+    assert!(script.contains("Then: meowai-deploy onboard"));
 }

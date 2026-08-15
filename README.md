@@ -19,9 +19,9 @@ Running `meowai-deploy` or `cargo run` without a subcommand only prints help. It
 
 At the image step, `onboard` resolves the manifest currently published as `latest` in `ghcr.io/moorcorpa/new-api-outgap` and stores its immutable `sha256:` digest. A source commit that fails to build or push cannot become this default. Leave `image_ref` empty in a non-interactive configuration to use the same resolution; provide a commit SHA or digest only when intentionally pinning another build.
 
-The GHCR package must permit the target host to pull it. Automatic resolution fails explicitly when the package is private or unavailable and never falls back to an old embedded version.
+The default GHCR package is public, so normal installation and deployment do not require registry credentials. Automatic resolution fails explicitly when the package is unavailable and never falls back to an old embedded version.
 
-For a temporary private package, set `MEOWAI_DEPLOY_REGISTRY_USERNAME` and `MEOWAI_DEPLOY_REGISTRY_PASSWORD` together. The CLI uses them both to resolve the manifest and to run the initial target-side Compose pull with an isolated temporary Docker configuration. The temporary configuration is removed after the pull, and the credentials are not persisted in deployment configuration, state, or logs.
+When testing another private package, set `MEOWAI_DEPLOY_REGISTRY_USERNAME` and `MEOWAI_DEPLOY_REGISTRY_PASSWORD` together. The CLI uses them both to resolve the manifest and to run the initial target-side Compose pull with an isolated temporary Docker configuration. The temporary configuration is removed after the pull, and the credentials are not persisted in deployment configuration, state, or logs.
 
 ## Local state
 
@@ -44,9 +44,11 @@ The command checks the supported architecture, Docker, Docker Compose, curl, tar
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MeowAI-Business/meowai-deploy/main/install.sh | bash
+meowai-deploy doctor
+meowai-deploy onboard
 ```
 
-The script downloads the latest Linux amd64 release archive and checksum list, verifies the archive, and installs it to `~/.local/bin` by default. Set `MEOWAI_DEPLOY_RELEASE_BASE_URL` or `MEOWAI_DEPLOY_INSTALL_DIR` to override those locations.
+The script downloads the latest Linux amd64 release archive and checksum list, verifies the archive, and installs it to `~/.local/bin` by default. If that directory is not already in `PATH`, the installer adds it to the current user's shell profile. Open a new terminal, or run the one-line `export PATH=...` command printed by the installer, before invoking `meowai-deploy` directly. Set `MEOWAI_DEPLOY_RELEASE_BASE_URL` or `MEOWAI_DEPLOY_INSTALL_DIR` to override those locations.
 
 ## Version updates
 
