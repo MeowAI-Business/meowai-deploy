@@ -16,6 +16,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Start the local browser deployment workbench.
+    Web(WebArgs),
     /// Check local or target-host prerequisites.
     Doctor(DoctorArgs),
     /// Start the interactive onboard workflow.
@@ -32,6 +34,13 @@ pub enum Command {
     Logout(DeploymentArgs),
     /// Check for or install a newer meowai-deploy release.
     Update(UpdateArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct WebArgs {
+    /// Print the loopback URL without opening a browser.
+    #[arg(long)]
+    pub no_open: bool,
 }
 
 #[derive(Debug, Args)]
