@@ -71,33 +71,57 @@ pub async fn run(args: &DoctorArgs) -> Result<()> {
 }
 
 fn check_architecture() -> Check {
-    let architecture = std::env::consts::ARCH;
-    let operating_system = std::env::consts::OS;
-    if architecture == "x86_64" && operating_system == "linux" {
+    check_architecture_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn check_architecture_for(operating_system: &str, architecture: &str) -> Check {
+    let architecture_name = match architecture {
+        "x86_64" => Some("amd64"),
+        "aarch64" => Some("arm64"),
+        _ => None,
+    };
+    if matches!(operating_system, "linux" | "macos") && architecture_name.is_some() {
         Check {
             name: "architecture".to_owned(),
             status: CheckStatus::Pass,
-            detail: "linux amd64 target supported".to_owned(),
-            blocking: true,
-        }
-    } else if architecture == "x86_64" {
-        Check {
-            name: "architecture".to_owned(),
-            status: CheckStatus::Warn,
             detail: format!(
-                "{operating_system}/x86_64 development host; deployment target is Linux amd64"
+                "{operating_system} {} supported",
+                architecture_name.expect("supported architecture")
             ),
-            blocking: false,
+            blocking: true,
         }
     } else {
         Check {
             name: "architecture".to_owned(),
             status: CheckStatus::Fail,
             detail: format!(
-                "{operating_system}/{architecture} detected; this release supports Linux amd64 only"
+                "{operating_system}/{architecture} detected; supported targets are Linux and macOS on amd64 or arm64"
             ),
             blocking: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn architecture_check_accepts_linux_and_macos_on_amd64_and_arm64() {
+        for (operating_system, architecture) in [
+            ("linux", "x86_64"),
+            ("linux", "aarch64"),
+            ("macos", "x86_64"),
+            ("macos", "aarch64"),
+        ] {
+            let check = check_architecture_for(operating_system, architecture);
+            assert!(matches!(check.status, CheckStatus::Pass));
+            assert!(check.blocking);
+        }
+        assert!(matches!(
+            check_architecture_for("linux", "riscv64").status,
+            CheckStatus::Fail
+        ));
     }
 }
 

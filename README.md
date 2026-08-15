@@ -48,7 +48,7 @@ meowai-deploy doctor
 meowai-deploy onboard
 ```
 
-The script downloads the latest Linux amd64 release archive and checksum list, verifies the archive, and installs it to `~/.local/bin` by default. If that directory is not already in `PATH`, the installer adds it to the current user's shell profile. Open a new terminal, or run the one-line `export PATH=...` command printed by the installer, before invoking `meowai-deploy` directly. Set `MEOWAI_DEPLOY_RELEASE_BASE_URL` or `MEOWAI_DEPLOY_INSTALL_DIR` to override those locations.
+The script supports Linux and macOS on amd64 and arm64. It downloads the matching release archive and checksum list, verifies the selected archive, and installs it to `~/.local/bin` by default. If that directory is not already in `PATH`, the installer adds it to the current user's shell profile. Open a new terminal, or run the one-line `export PATH=...` command printed by the installer, before invoking `meowai-deploy` directly. Set `MEOWAI_DEPLOY_RELEASE_BASE_URL` or `MEOWAI_DEPLOY_INSTALL_DIR` to override those locations.
 
 ## Version updates
 
@@ -61,4 +61,4 @@ meowai-deploy update --yes
 
 Installed release builds check GitHub Releases at most once every 24 hours in an interactive terminal. A failed check never blocks `doctor`, `onboard`, `sync`, or `status`. The check timestamp is stored in `~/.meowai-deploy/update-check.json`; set `MEOWAI_DEPLOY_DISABLE_UPDATE_CHECK=1` to disable periodic checks.
 
-Release tags use `v<version>` and must match the version in `Cargo.toml`. Pushing such a tag creates a GitHub Release with the Linux amd64 archive and SHA256 checksum. Publishing a Release manually runs the same build and uploads or replaces those assets.
+Release tags use `v<version>` and must match the version in `Cargo.toml`. Pushing such a tag creates a GitHub Release with Linux and macOS archives for amd64 and arm64 plus a combined SHA256 checksum file. Publishing a Release manually runs the same build and uploads or replaces those assets.

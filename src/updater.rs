@@ -14,7 +14,6 @@ use crate::{
 
 const REPOSITORY_OWNER: &str = "MeowAI-Business";
 const REPOSITORY_NAME: &str = "meowai-deploy";
-const RELEASE_TARGET: &str = "linux-amd64";
 const UPDATE_INTERVAL_SECONDS: i64 = 24 * 60 * 60;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -43,11 +42,7 @@ pub async fn run(args: &UpdateArgs) -> Result<()> {
                 .to_owned(),
         ));
     }
-    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        return Err(AppError::Message(
-            "automatic updates currently support Linux amd64 only".to_owned(),
-        ));
-    }
+    release_target(env::consts::OS, env::consts::ARCH)?;
     if !args.yes {
         let confirmed = confirm(format!("更新到 v{}？", latest.version))
             .initial_value(true)
@@ -119,7 +114,7 @@ async fn fetch_latest_release() -> Result<LatestRelease> {
 
 fn install_release(version: &str) -> Result<()> {
     let mut builder = github::Update::configure();
-    configure_builder(&mut builder);
+    configure_builder(&mut builder)?;
     let updater = builder
         .target_version_tag(&format!("v{version}"))
         .show_download_progress(true)
@@ -140,7 +135,7 @@ fn install_release(version: &str) -> Result<()> {
 
 fn update_builder(show_output: bool) -> Result<Box<dyn ReleaseUpdate>> {
     let mut builder = github::Update::configure();
-    configure_builder(&mut builder);
+    configure_builder(&mut builder)?;
     builder
         .show_output(show_output)
         .no_confirm(true)
@@ -148,19 +143,33 @@ fn update_builder(show_output: bool) -> Result<Box<dyn ReleaseUpdate>> {
         .map_err(|error| AppError::Message(format!("configure updater: {error}")))
 }
 
-fn configure_builder(builder: &mut github::UpdateBuilder) {
+fn configure_builder(builder: &mut github::UpdateBuilder) -> Result<()> {
+    let target = release_target(env::consts::OS, env::consts::ARCH)?;
     builder
         .repo_owner(REPOSITORY_OWNER)
         .repo_name(REPOSITORY_NAME)
         .bin_name("meowai-deploy")
         .bin_path_in_archive("meowai-deploy")
-        .target(RELEASE_TARGET)
+        .target(target)
         .current_version(env!("CARGO_PKG_VERSION"));
     if let Ok(url) = env::var("MEOWAI_DEPLOY_GITHUB_API_URL") {
         builder.with_url(url.trim_end_matches('/'));
     }
     if let Ok(token) = env::var("GITHUB_TOKEN") {
         builder.auth_token(&token);
+    }
+    Ok(())
+}
+
+fn release_target(operating_system: &str, architecture: &str) -> Result<&'static str> {
+    match (operating_system, architecture) {
+        ("linux", "x86_64") => Ok("linux-amd64"),
+        ("linux", "aarch64") => Ok("linux-arm64"),
+        ("macos", "x86_64") => Ok("macos-amd64"),
+        ("macos", "aarch64") => Ok("macos-arm64"),
+        _ => Err(AppError::Message(format!(
+            "automatic updates do not support {operating_system}/{architecture}"
+        ))),
     }
 }
 
@@ -213,5 +222,14 @@ mod tests {
         assert!(is_newer("0.9.0", "0.10.0").expect("compare versions"));
         assert!(!is_newer("1.2.0", "1.2.0").expect("compare versions"));
         assert!(!is_newer("2.0.0", "1.9.9").expect("compare versions"));
+    }
+
+    #[test]
+    fn release_target_matches_supported_operating_system_and_architecture() {
+        assert_eq!(release_target("linux", "x86_64").unwrap(), "linux-amd64");
+        assert_eq!(release_target("linux", "aarch64").unwrap(), "linux-arm64");
+        assert_eq!(release_target("macos", "x86_64").unwrap(), "macos-amd64");
+        assert_eq!(release_target("macos", "aarch64").unwrap(), "macos-arm64");
+        assert!(release_target("windows", "x86_64").is_err());
     }
 }

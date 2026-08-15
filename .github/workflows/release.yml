@@ -12,8 +12,21 @@ permissions:
   contents: write
 
 jobs:
-  release-linux-amd64:
-    runs-on: ubuntu-latest
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            runner: ubuntu-latest
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+          - target: macos-amd64
+            runner: macos-15-intel
+          - target: macos-arm64
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -35,8 +48,34 @@ jobs:
           cargo +stable build --release --locked
           mkdir -p dist/package
           install -m 0755 target/release/meowai-deploy dist/package/meowai-deploy
-          tar -C dist/package -czf dist/meowai-deploy-linux-amd64.tar.gz meowai-deploy
-          (cd dist && sha256sum meowai-deploy-linux-amd64.tar.gz > checksums-sha256.txt)
+          tar -C dist/package -czf "dist/meowai-deploy-${{ matrix.target }}.tar.gz" meowai-deploy
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: meowai-deploy-${{ matrix.target }}
+          path: dist/meowai-deploy-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish release assets
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: meowai-deploy-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create checksum list
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum meowai-deploy-*.tar.gz > checksums-sha256.txt
 
       - name: Create GitHub Release
         if: github.event_name == 'push'
@@ -44,7 +83,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: >-
           gh release create "${GITHUB_REF_NAME}"
-          dist/meowai-deploy-linux-amd64.tar.gz
+          dist/meowai-deploy-*.tar.gz
           dist/checksums-sha256.txt
           --verify-tag
           --generate-notes
@@ -56,6 +95,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: >-
           gh release upload "${GITHUB_REF_NAME}"
-          dist/meowai-deploy-linux-amd64.tar.gz
+          dist/meowai-deploy-*.tar.gz
           dist/checksums-sha256.txt
           --clobber
