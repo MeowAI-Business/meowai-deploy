@@ -20,19 +20,35 @@ jobs:
         include:
           - target: linux-amd64
             runner: ubuntu-latest
+            rust_target: x86_64-unknown-linux-musl
+            binary: target/x86_64-unknown-linux-musl/release/meowai-deploy
           - target: linux-arm64
             runner: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-musl
+            binary: target/aarch64-unknown-linux-musl/release/meowai-deploy
           - target: macos-amd64
             runner: macos-15-intel
+            rust_target: x86_64-apple-darwin
+            binary: target/x86_64-apple-darwin/release/meowai-deploy
           - target: macos-arm64
             runner: macos-15
+            rust_target: aarch64-apple-darwin
+            binary: target/aarch64-apple-darwin/release/meowai-deploy
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install stable Rust
-        run: rustup toolchain install stable --profile minimal
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add --toolchain stable "${{ matrix.rust_target }}"
+
+      - name: Install musl build tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
 
       - name: Cache Rust build
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -56,9 +72,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo +stable build --release --locked
+          cargo +stable build --release --locked --target "${{ matrix.rust_target }}"
+          binary="${{ matrix.binary }}"
+          if [ "${{ runner.os }}" = "Linux" ] && readelf -l "$binary" | grep -q 'Requesting program interpreter'; then
+            echo "Linux release binary is dynamically linked" >&2
+            exit 1
+          fi
           mkdir -p dist/package
-          install -m 0755 target/release/meowai-deploy dist/package/meowai-deploy
+          install -m 0755 "$binary" dist/package/meowai-deploy
           tar -C dist/package -czf "dist/meowai-deploy-${{ matrix.target }}.tar.gz" meowai-deploy
 
       - name: Upload build artifact

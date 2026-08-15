@@ -104,3 +104,13 @@ fn installer_is_a_verified_bash_script() {
     assert!(script.contains("Run: meowai-deploy doctor"));
     assert!(script.contains("Then: meowai-deploy onboard"));
 }
+
+#[test]
+fn linux_release_binaries_are_built_with_musl() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/release.yml");
+    let workflow = std::fs::read_to_string(path).expect("read release workflow");
+    assert!(workflow.contains("x86_64-unknown-linux-musl"));
+    assert!(workflow.contains("aarch64-unknown-linux-musl"));
+    assert!(workflow.contains("musl-tools"));
+    assert!(workflow.contains("Requesting program interpreter"));
+}
