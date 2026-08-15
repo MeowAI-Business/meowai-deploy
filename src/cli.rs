@@ -23,13 +23,48 @@ pub enum Command {
     /// Start the interactive onboard workflow.
     Onboard(OnboardArgs),
     /// Synchronize source groups, status and downstream resources.
-    Sync,
+    Sync(SyncArgs),
     /// Show the current deployment state.
-    Status,
+    Status(DeploymentArgs),
     /// Remove resources created by this deployment.
-    Rollback,
+    Rollback(RollbackArgs),
     /// Remove locally stored session credentials.
-    Logout,
+    Logout(DeploymentArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DeploymentArgs {
+    /// Deployment directory containing deployment.toml and state.json.
+    #[arg(long, default_value = "/opt/meowai-deploy/newapi")]
+    pub directory: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct SyncArgs {
+    #[command(flatten)]
+    pub deployment: DeploymentArgs,
+
+    /// Re-import the bundled pricing snapshots. By default pricing is left untouched.
+    #[arg(long)]
+    pub pricing: bool,
+
+    /// Apply managed configuration changes even when a drift was detected.
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct RollbackArgs {
+    #[command(flatten)]
+    pub deployment: DeploymentArgs,
+
+    /// Confirm deletion of the downstream Compose project and its bind-mounted data.
+    #[arg(long)]
+    pub yes: bool,
+
+    /// Also revoke this deployment's source Tokens and public status Key.
+    #[arg(long)]
+    pub revoke_source: bool,
 }
 
 #[derive(Debug, Args)]

@@ -20,6 +20,7 @@ use crate::{
 pub const DEFAULT_SOURCE_URL: &str = "https://enterprise.meowai.net";
 pub const DEFAULT_NEWAPI_PORT: u16 = 3000;
 pub const DEFAULT_KUMA_PORT: u16 = 3001;
+pub const DEFAULT_IMAGE_REF: &str = "cd920e55641a90bf64e97adc89705d09fd6581e8";
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -74,7 +75,7 @@ impl Default for DeploymentConfig {
             kuma_admin_username: "admin".to_owned(),
             kuma_admin_password: None,
             image: "ghcr.io/moorcorpa/new-api-outgap".to_owned(),
-            image_ref: "current-commit-or-digest".to_owned(),
+            image_ref: DEFAULT_IMAGE_REF.to_owned(),
         }
     }
 }
@@ -104,7 +105,7 @@ target = "local"
 newapi_admin_username = "admin"
 kuma_admin_username = "admin"
 image = "ghcr.io/moorcorpa/new-api-outgap"
-image_ref = "current-commit-or-digest"
+image_ref = "cd920e55641a90bf64e97adc89705d09fd6581e8"
 
 # Passwords may be supplied through the environment or an interactive prompt.
 # Source account password uses MEOWAI_DEPLOY_SOURCE_PASSWORD.
@@ -162,6 +163,7 @@ image_ref = "current-commit-or-digest"
             ));
         }
         validate_identifier("container_name", &self.container_name)?;
+        validate_directory(&self.directory)?;
         validate_bind("newapi_bind", &self.newapi_bind)?;
         validate_bind("kuma_bind", &self.kuma_bind)?;
         if self.newapi_port == 0 || self.kuma_port == 0 {
@@ -181,14 +183,20 @@ image_ref = "current-commit-or-digest"
                 "administrator usernames cannot be empty".to_owned(),
             ));
         }
+        if self.newapi_admin_username.len() > 12 {
+            return Err(AppError::InvalidConfig(
+                "New API administrator username must not exceed 12 characters".to_owned(),
+            ));
+        }
         if self.image.trim().is_empty() || self.image_ref.trim().is_empty() {
             return Err(AppError::InvalidConfig(
                 "image and image_ref cannot be empty".to_owned(),
             ));
         }
-        if matches!(self.image_ref.as_str(), "latest" | "main" | "master") {
+        if !is_immutable_image_ref(&self.image_ref) {
             return Err(AppError::InvalidConfig(
-                "image_ref must be a commit SHA or digest, not a mutable tag".to_owned(),
+                "image_ref must be a 7-64 character hexadecimal commit SHA or sha256 digest"
+                    .to_owned(),
             ));
         }
         Ok(())
@@ -356,6 +364,12 @@ fn prompt_config() -> Result<DeploymentConfig> {
     let newapi_admin_password = Some(prompt_secret("New API 管理员密码")?);
     let kuma_admin_username = prompt_username("Uptime Kuma 管理员用户名", "admin")?;
     let kuma_admin_password = Some(prompt_secret("Uptime Kuma 管理员密码")?);
+    prompt_io(log::step("镜像版本"))?;
+    let image_ref: String = prompt_io(
+        input("New API commit SHA/digest")
+            .default_input(DEFAULT_IMAGE_REF)
+            .interact(),
+    )?;
     let config = DeploymentConfig {
         source_url,
         source_account_mode,
@@ -373,6 +387,7 @@ fn prompt_config() -> Result<DeploymentConfig> {
         newapi_admin_password,
         kuma_admin_username,
         kuma_admin_password,
+        image_ref,
         ..DeploymentConfig::default()
     };
     prompt_io(outro("配置输入完成"))?;
@@ -418,6 +433,29 @@ fn prompt_port(label: &str, default: u16) -> Result<u16> {
 
 fn prompt_io<T>(result: io::Result<T>) -> Result<T> {
     result.map_err(AppError::from_prompt)
+}
+
+fn validate_directory(directory: &Path) -> Result<()> {
+    if !directory.is_absolute() {
+        return Err(AppError::InvalidConfig(
+            "directory must be an absolute path".to_owned(),
+        ));
+    }
+    let value = directory.to_string_lossy();
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'_' | b'-' | b'.'))
+    {
+        return Err(AppError::InvalidConfig(
+            "directory may contain only letters, numbers, '/', '_', '-' and '.'".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_immutable_image_ref(value: &str) -> bool {
+    let value = value.strip_prefix("sha256:").unwrap_or(value);
+    (7..=64).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 pub fn random_secret() -> String {

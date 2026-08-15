@@ -37,11 +37,28 @@ fn no_args_prints_help_without_starting_onboard() {
 }
 
 #[test]
-fn unimplemented_command_has_explicit_exit_code() {
-    let output = binary().arg("sync").output().expect("run sync");
-    assert_eq!(output.status.code(), Some(3));
+fn sync_is_implemented_and_exposes_operational_flags() {
+    let help = binary()
+        .args(["sync", "--help"])
+        .output()
+        .expect("run sync help");
+    assert!(help.status.success());
+    let stdout = String::from_utf8_lossy(&help.stdout);
+    for flag in ["--directory", "--pricing", "--force"] {
+        assert!(
+            stdout.contains(flag),
+            "missing {flag} in sync help: {stdout}"
+        );
+    }
+
+    let output = binary()
+        .args(["sync", "--directory", "/path/that/does/not/exist"])
+        .output()
+        .expect("run sync against missing deployment");
+    assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("not implemented in the current release"));
+    assert!(stderr.contains("deployment.toml"));
+    assert!(!stderr.contains("not implemented"));
 }
 
 #[test]

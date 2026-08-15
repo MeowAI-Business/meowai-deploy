@@ -31,8 +31,11 @@ pub enum AppError {
     #[error("操作已取消")]
     Cancelled,
 
-    #[error("{0} is not implemented in the current release")]
-    NotReady(String),
+    #[error("target operation failed: {0}")]
+    Target(String),
+
+    #[error("deployment state is invalid: {0}")]
+    State(String),
 
     #[error(transparent)]
     Source(#[from] crate::source::SourceError),
@@ -43,12 +46,13 @@ impl AppError {
         match self {
             Self::DoctorFailed => 2,
             Self::Cancelled => 130,
-            Self::NotReady(_) => 3,
             Self::InvalidConfig(_)
             | Self::InvalidToml(_)
             | Self::ReadFile { .. }
             | Self::WriteFile { .. }
             | Self::Message(_)
+            | Self::Target(_)
+            | Self::State(_)
             | Self::Source(_) => 1,
         }
     }

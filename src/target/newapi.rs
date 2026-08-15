@@ -1,0 +1,586 @@
+use std::collections::{BTreeMap, HashMap};
+
+use reqwest::{Client, Method};
+use secrecy::{ExposeSecret, SecretString};
+use serde::{Deserialize, de::DeserializeOwned};
+use serde_json::{Value, json};
+
+use crate::{
+    config::DeploymentConfig,
+    error::{AppError, Result},
+    pricing::embedded_pricing,
+    security::sha256_hex,
+    source::{GroupCatalog, TokenBinding},
+    state::ChannelState,
+    target::{TargetEndpoint, TargetExecutor},
+};
+
+const CHANNEL_TYPE_NEWAPI: i64 = 60;
+const CHANNEL_STATUS_ENABLED: i64 = 1;
+const CHANNEL_STATUS_MANUALLY_DISABLED: i64 = 2;
+
+pub struct NewApiClient {
+    endpoint: TargetEndpoint,
+    http: Client,
+    access_token: Option<SecretString>,
+}
+
+#[derive(Debug, Default)]
+pub struct ChannelSyncResult {
+    pub created: usize,
+    pub updated: usize,
+    pub reused: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiEnvelope<T> {
+    success: bool,
+    #[serde(default)]
+    message: String,
+    data: Option<T>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetupData {
+    status: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginData {
+    access_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct Page<T> {
+    items: Vec<T>,
+    total: usize,
+    page: usize,
+    page_size: usize,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RemoteChannel {
+    id: i64,
+    #[serde(rename = "type")]
+    channel_type: i64,
+    name: String,
+    status: i64,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    models: String,
+    #[serde(default)]
+    group: String,
+    #[serde(default)]
+    tag: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OptionEntry {
+    key: String,
+    value: Value,
+}
+
+impl NewApiClient {
+    pub fn connect(executor: &TargetExecutor, port: u16) -> Result<Self> {
+        let endpoint = executor.endpoint(port)?;
+        let http = Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .map_err(|error| AppError::Target(format!("create downstream API client: {error}")))?;
+        Ok(Self {
+            endpoint,
+            http,
+            access_token: None,
+        })
+    }
+
+    pub async fn initialize_and_login(
+        &mut self,
+        config: &DeploymentConfig,
+        password: &SecretString,
+    ) -> Result<()> {
+        let setup: SetupData = self.request(Method::GET, "/api/setup", None, false).await?;
+        if !setup.status {
+            let body = json!({
+                "username": config.newapi_admin_username,
+                "password": password.expose_secret(),
+                "confirmPassword": password.expose_secret(),
+                "SelfUseModeEnabled": false,
+                "DemoSiteEnabled": false
+            });
+            self.request_no_data(Method::POST, "/api/setup", Some(body), false)
+                .await?;
+        }
+        let login: LoginData = self
+            .request(
+                Method::POST,
+                "/api/user/login",
+                Some(json!({
+                    "username": config.newapi_admin_username,
+                    "password": password.expose_secret()
+                })),
+                false,
+            )
+            .await?;
+        if login.access_token.trim().is_empty() {
+            return Err(AppError::Target(
+                "downstream login returned an empty access token".to_owned(),
+            ));
+        }
+        self.access_token = Some(SecretString::from(login.access_token));
+        Ok(())
+    }
+
+    pub async fn configure_site(&self, website_name: &str) -> Result<()> {
+        self.update_option("SystemName", website_name).await?;
+        self.update_option("console_setting.uptime_kuma_enabled", "false")
+            .await
+    }
+
+    pub async fn import_pricing(&self) -> Result<BTreeMap<String, String>> {
+        let snapshots = embedded_pricing()?;
+        for snapshot in &snapshots {
+            self.update_option(snapshot.key, &snapshot.canonical_json)
+                .await?;
+        }
+        let options = self.options().await?;
+        let mut hashes = BTreeMap::new();
+        for snapshot in &snapshots {
+            let returned = options.get(snapshot.key).ok_or_else(|| {
+                AppError::Target(format!(
+                    "downstream option {} was not returned",
+                    snapshot.key
+                ))
+            })?;
+            let canonical = crate::pricing::canonical_price_json(returned).map_err(|error| {
+                AppError::Target(format!(
+                    "downstream option {} is invalid after import: {error}",
+                    snapshot.key
+                ))
+            })?;
+            if canonical != snapshot.canonical_json {
+                return Err(AppError::Target(format!(
+                    "downstream option {} differs after import",
+                    snapshot.key
+                )));
+            }
+            hashes.insert(snapshot.file_name.to_owned(), snapshot.sha256.clone());
+        }
+        Ok(hashes)
+    }
+
+    pub async fn sync_channels(
+        &self,
+        config: &DeploymentConfig,
+        container_source_url: &str,
+        catalog: &GroupCatalog,
+        bindings: &[TokenBinding],
+        previous: &BTreeMap<String, ChannelState>,
+        force: bool,
+    ) -> Result<(ChannelSyncResult, BTreeMap<String, ChannelState>)> {
+        let binding_by_group = bindings
+            .iter()
+            .map(|binding| (binding.group_id.as_str(), binding))
+            .collect::<HashMap<_, _>>();
+        if binding_by_group.len() != catalog.groups.len() {
+            return Err(AppError::Target(
+                "source token bindings do not cover every source group".to_owned(),
+            ));
+        }
+
+        let mut ratios = BTreeMap::new();
+        for group in &catalog.groups {
+            ratios.insert(group.group_name.clone(), 1.0_f64);
+        }
+        self.update_option(
+            "GroupRatio",
+            &serde_json::to_string(&ratios)
+                .map_err(|error| AppError::Target(format!("serialize GroupRatio: {error}")))?,
+        )
+        .await?;
+
+        let existing = self.channels().await?;
+        let mut result = ChannelSyncResult::default();
+        let mut next = BTreeMap::new();
+        for group in &catalog.groups {
+            let binding = binding_by_group
+                .get(group.group_id.as_str())
+                .ok_or_else(|| {
+                    AppError::Target(format!(
+                        "missing token for source group {}",
+                        group.group_name
+                    ))
+                })?;
+            let tag = channel_tag(&config.deployment_id(), &group.group_id);
+            let matching = existing
+                .iter()
+                .filter(|channel| channel.tag.as_deref() == Some(tag.as_str()))
+                .collect::<Vec<_>>();
+            if matching.len() > 1 {
+                return Err(AppError::Target(format!(
+                    "multiple downstream channels use managed tag {tag}"
+                )));
+            }
+            let desired =
+                DesiredChannel::new(config, container_source_url, group, binding, tag.clone())?;
+            let old = previous.get(&group.group_id);
+            let channel_id = if let Some(channel) = matching.first() {
+                let key_changed = old
+                    .map(|state| state.key_sha256 != desired.key_sha256)
+                    .unwrap_or(false);
+                if channel_needs_update(channel, &desired) || key_changed {
+                    if !force && old.is_some() {
+                        return Err(AppError::Target(format!(
+                            "managed downstream channel {} drifted; rerun sync with --force",
+                            channel.id
+                        )));
+                    }
+                    self.update_channel(channel.id, &desired).await?;
+                    result.updated += 1;
+                } else {
+                    result.reused += 1;
+                }
+                if channel.status != CHANNEL_STATUS_ENABLED {
+                    self.update_channel_status(channel.id, CHANNEL_STATUS_ENABLED)
+                        .await?;
+                }
+                channel.id
+            } else {
+                self.create_channel(&desired).await?;
+                let refreshed = self.channels().await?;
+                let created = refreshed
+                    .iter()
+                    .filter(|channel| channel.tag.as_deref() == Some(tag.as_str()))
+                    .collect::<Vec<_>>();
+                if created.len() != 1 {
+                    return Err(AppError::Target(format!(
+                        "could not uniquely read back channel {tag} after creation"
+                    )));
+                }
+                result.created += 1;
+                created[0].id
+            };
+            next.insert(
+                group.group_id.clone(),
+                ChannelState {
+                    group_id: group.group_id.clone(),
+                    group_name: group.group_name.clone(),
+                    token_id: binding.token_id,
+                    token_name: binding.token_name.clone(),
+                    channel_id,
+                    key_sha256: desired.key_sha256,
+                    config_sha256: desired.config_sha256,
+                    enabled: true,
+                },
+            );
+        }
+        Ok((result, next))
+    }
+
+    pub async fn disable_channel(&self, channel_id: i64) -> Result<()> {
+        self.update_channel_status(channel_id, CHANNEL_STATUS_MANUALLY_DISABLED)
+            .await
+    }
+
+    pub async fn disable_removed_channels(
+        &self,
+        previous: &BTreeMap<String, ChannelState>,
+        current: &mut BTreeMap<String, ChannelState>,
+    ) -> Result<usize> {
+        let mut disabled = 0;
+        for (group_id, state) in previous {
+            if current.contains_key(group_id) {
+                continue;
+            }
+            let mut retained = state.clone();
+            if state.enabled {
+                self.disable_channel(state.channel_id).await?;
+                retained.enabled = false;
+                disabled += 1;
+            }
+            current.insert(group_id.clone(), retained);
+        }
+        Ok(disabled)
+    }
+
+    async fn channels(&self) -> Result<Vec<RemoteChannel>> {
+        let mut all = Vec::new();
+        let mut page = 1;
+        loop {
+            let path = format!("/api/channel/?p={page}&size=100");
+            let current: Page<RemoteChannel> = self.request(Method::GET, &path, None, true).await?;
+            let count = current.items.len();
+            all.extend(current.items);
+            if all.len() >= current.total || count == 0 {
+                break;
+            }
+            if current.page != page || current.page_size == 0 {
+                return Err(AppError::Target(
+                    "downstream channel pagination returned invalid metadata".to_owned(),
+                ));
+            }
+            page += 1;
+        }
+        Ok(all)
+    }
+
+    async fn create_channel(&self, desired: &DesiredChannel) -> Result<()> {
+        self.request_no_data(
+            Method::POST,
+            "/api/channel/",
+            Some(json!({"mode": "single", "channel": desired.body()})),
+            true,
+        )
+        .await
+    }
+
+    async fn update_channel(&self, id: i64, desired: &DesiredChannel) -> Result<()> {
+        let mut body = desired.body();
+        body["id"] = json!(id);
+        self.request_no_data(Method::PUT, "/api/channel/", Some(body), true)
+            .await
+    }
+
+    async fn update_channel_status(&self, id: i64, status: i64) -> Result<()> {
+        let path = format!("/api/channel/{id}/status");
+        let _: Value = self
+            .request(Method::POST, &path, Some(json!({"status": status})), true)
+            .await?;
+        Ok(())
+    }
+
+    async fn options(&self) -> Result<BTreeMap<String, String>> {
+        let entries: Vec<OptionEntry> = self
+            .request(Method::GET, "/api/option/", None, true)
+            .await?;
+        let mut options = BTreeMap::new();
+        for entry in entries {
+            let value = match entry.value {
+                Value::String(value) => value,
+                value => value.to_string(),
+            };
+            options.insert(entry.key, value);
+        }
+        Ok(options)
+    }
+
+    async fn update_option(&self, key: &str, value: &str) -> Result<()> {
+        self.request_no_data(
+            Method::PUT,
+            "/api/option/",
+            Some(json!({"key": key, "value": value})),
+            true,
+        )
+        .await
+    }
+
+    async fn request<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+        authenticated: bool,
+    ) -> Result<T> {
+        let url = format!("{}{}", self.endpoint.base_url(), path);
+        let mut request = self.http.request(method, &url);
+        if authenticated {
+            let token = self.access_token.as_ref().ok_or_else(|| {
+                AppError::Target(
+                    "downstream request requires an authenticated admin session".to_owned(),
+                )
+            })?;
+            request = request.bearer_auth(token.expose_secret());
+        }
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| AppError::Target(format!("downstream request {path}: {error}")))?;
+        let status = response.status();
+        let envelope = response.json::<ApiEnvelope<T>>().await.map_err(|error| {
+            AppError::Target(format!(
+                "decode downstream response {path} (HTTP {status}): {error}"
+            ))
+        })?;
+        if !status.is_success() || !envelope.success {
+            return Err(AppError::Target(format!(
+                "downstream request {path} failed (HTTP {status}): {}",
+                envelope.message
+            )));
+        }
+        envelope
+            .data
+            .ok_or_else(|| AppError::Target(format!("downstream response {path} has no data")))
+    }
+
+    async fn request_no_data(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+        authenticated: bool,
+    ) -> Result<()> {
+        let url = format!("{}{}", self.endpoint.base_url(), path);
+        let mut request = self.http.request(method, &url);
+        if authenticated {
+            let token = self.access_token.as_ref().ok_or_else(|| {
+                AppError::Target(
+                    "downstream request requires an authenticated admin session".to_owned(),
+                )
+            })?;
+            request = request.bearer_auth(token.expose_secret());
+        }
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| AppError::Target(format!("downstream request {path}: {error}")))?;
+        let status = response.status();
+        let envelope = response
+            .json::<ApiEnvelope<Value>>()
+            .await
+            .map_err(|error| {
+                AppError::Target(format!(
+                    "decode downstream response {path} (HTTP {status}): {error}"
+                ))
+            })?;
+        if !status.is_success() || !envelope.success {
+            return Err(AppError::Target(format!(
+                "downstream request {path} failed (HTTP {status}): {}",
+                envelope.message
+            )));
+        }
+        Ok(())
+    }
+}
+
+struct DesiredChannel {
+    name: String,
+    base_url: String,
+    key: String,
+    key_sha256: String,
+    models: String,
+    group: String,
+    tag: String,
+    config_sha256: String,
+}
+
+impl DesiredChannel {
+    fn new(
+        config: &DeploymentConfig,
+        container_source_url: &str,
+        group: &crate::source::SourceGroup,
+        binding: &TokenBinding,
+        tag: String,
+    ) -> Result<Self> {
+        let models = group.models.join(",");
+        let key = binding.api_key().expose_secret().to_owned();
+        let name = format!("{} / {}", config.website_name, group.group_name);
+        let base_url = container_source_url.trim_end_matches('/').to_owned();
+        let key_sha256 = sha256_hex(key.as_bytes());
+        let fingerprint = json!({
+            "type": CHANNEL_TYPE_NEWAPI,
+            "name": name,
+            "base_url": base_url,
+            "models": models,
+            "group": group.group_name,
+            "tag": tag,
+            "key_sha256": key_sha256
+        });
+        let config_sha256 = sha256_hex(
+            serde_json::to_vec(&fingerprint)
+                .map_err(|error| {
+                    AppError::Target(format!("serialize channel fingerprint: {error}"))
+                })?
+                .as_slice(),
+        );
+        Ok(Self {
+            name,
+            base_url,
+            key,
+            key_sha256,
+            models,
+            group: group.group_name.clone(),
+            tag,
+            config_sha256,
+        })
+    }
+
+    fn body(&self) -> Value {
+        json!({
+            "type": CHANNEL_TYPE_NEWAPI,
+            "name": self.name,
+            "key": self.key,
+            "base_url": self.base_url,
+            "models": self.models,
+            "group": self.group,
+            "tag": self.tag,
+            "status": CHANNEL_STATUS_ENABLED,
+            "other": "",
+            "other_info": ""
+        })
+    }
+}
+
+fn channel_tag(deployment_id: &str, group_id: &str) -> String {
+    format!(
+        "meowai-deploy:{deployment_id}:{}",
+        &sha256_hex(group_id.as_bytes())[..16]
+    )
+}
+
+fn channel_needs_update(current: &RemoteChannel, desired: &DesiredChannel) -> bool {
+    current.channel_type != CHANNEL_TYPE_NEWAPI
+        || current.name != desired.name
+        || current
+            .base_url
+            .as_deref()
+            .unwrap_or_default()
+            .trim_end_matches('/')
+            != desired.base_url
+        || current.models != desired.models
+        || current.group != desired.group
+        || current.tag.as_deref() != Some(desired.tag.as_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn channel_tag_is_stable_and_does_not_include_the_raw_group_name() {
+        let first = channel_tag("deployment", "official/secret group");
+        assert_eq!(first, channel_tag("deployment", "official/secret group"));
+        assert!(!first.contains("secret group"));
+    }
+
+    #[test]
+    fn readback_comparison_normalizes_a_trailing_base_url_slash() {
+        let desired = DesiredChannel {
+            name: "site / default".to_owned(),
+            base_url: "https://source.example".to_owned(),
+            key: "sk-secret".to_owned(),
+            key_sha256: "hash".to_owned(),
+            models: "gpt-test".to_owned(),
+            group: "default".to_owned(),
+            tag: "tag".to_owned(),
+            config_sha256: "hash".to_owned(),
+        };
+        let current = RemoteChannel {
+            id: 1,
+            channel_type: CHANNEL_TYPE_NEWAPI,
+            name: desired.name.clone(),
+            status: CHANNEL_STATUS_ENABLED,
+            base_url: Some("https://source.example/".to_owned()),
+            models: desired.models.clone(),
+            group: desired.group.clone(),
+            tag: Some(desired.tag.clone()),
+        };
+        assert!(!channel_needs_update(&current, &desired));
+    }
+}

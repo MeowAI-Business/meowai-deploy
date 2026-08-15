@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    collections::BTreeSet,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use secrecy::{ExposeSecret, SecretString};
@@ -191,6 +194,24 @@ async fn groups_are_complete_sorted_and_hashed_deterministically() {
         .expect(2)
         .mount(&server)
         .await;
+    for (group, models) in [
+        ("auto", json!(["gpt-auto"])),
+        ("default", json!(["gpt-default", "shared"])),
+        ("vip", json!(["gpt-vip", "shared"])),
+    ] {
+        Mock::given(method("GET"))
+            .and(path("/api/user/models"))
+            .and(query_param("group", group))
+            .and(header("authorization", "Bearer access-one"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "message": "",
+                "data": models
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+    }
 
     let first = client.groups().await.expect("read groups");
     let second = client.groups().await.expect("read groups again");
@@ -203,6 +224,7 @@ async fn groups_are_complete_sorted_and_hashed_deterministically() {
     assert_eq!(names, ["auto", "default", "vip"]);
     assert_eq!(first.response_sha256, second.response_sha256);
     assert_eq!(first.groups, second.groups);
+    assert_eq!(first.groups[2].models, ["gpt-vip", "shared"]);
 }
 
 #[derive(Clone)]
@@ -306,6 +328,64 @@ async fn missing_group_token_is_created_once_and_reused_on_rerun() {
     assert_eq!((second.created, second.reused, second.updated), (0, 2, 0));
     assert_eq!(first.bindings[1].api_key().expose_secret(), "sk-vip-key");
     assert_eq!(list_calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn removed_group_tokens_are_disabled_and_managed_tokens_can_be_revoked() {
+    let server = MockServer::start().await;
+    let mut client = authenticated_client(&server).await;
+    let managed_default = token(10, "meowai-deploy/site_123/default", "default");
+    let managed_removed = token(11, "meowai-deploy/site_123/removed", "removed");
+    let unrelated = token(12, "manual-token", "removed");
+    Mock::given(method("GET"))
+        .and(path("/api/token/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "message": "",
+            "data": {
+                "items": [managed_default, managed_removed, unrelated],
+                "total": 3,
+                "page": 1,
+                "page_size": 100
+            }
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/api/token/"))
+        .and(query_param("status_only", "true"))
+        .and(body_json(json!({"id": 11, "status": 2})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "message": ""
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    for id in [10, 11] {
+        Mock::given(method("DELETE"))
+            .and(path(format!("/api/token/{id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "message": ""
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let disabled = client
+        .disable_removed_group_tokens("site_123", &BTreeSet::from(["default".to_owned()]))
+        .await
+        .expect("disable removed token");
+    let revoked = client
+        .revoke_deployment_tokens("site_123")
+        .await
+        .expect("revoke managed tokens");
+
+    assert_eq!(disabled, 1);
+    assert_eq!(revoked, 2);
 }
 
 #[tokio::test]
@@ -434,6 +514,18 @@ async fn expired_access_token_refreshes_before_group_read() {
             "message": "",
             "data": {"default": {"desc": "Default", "ratio": 1}}
         })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/user/models"))
+        .and(query_param("group", "default"))
+        .and(header("authorization", "Bearer fresh-access"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "message": "",
+            "data": ["gpt-test"]
+        })))
+        .expect(1)
         .mount(&server)
         .await;
     let mut client = SourceClient::new(&server.uri()).expect("create source client");
@@ -615,5 +707,6 @@ fn group(name: &str, ratio: impl Into<Value>) -> SourceGroup {
         group_name: name.to_owned(),
         description: name.to_owned(),
         ratio: ratio.into(),
+        models: vec![format!("{name}-model")],
     }
 }

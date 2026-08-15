@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
 };
 
@@ -19,6 +19,7 @@ pub struct SourceGroup {
     pub group_name: String,
     pub description: String,
     pub ratio: serde_json::Value,
+    pub models: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -137,21 +138,36 @@ impl SourceClient {
         if raw_groups.is_empty() {
             return Err(SourceError::EmptyGroups);
         }
-        let canonical =
-            serde_json::to_vec(&raw_groups).map_err(|error| SourceError::InvalidResponse {
-                endpoint: "/api/user/self/groups".to_owned(),
-                message: error.to_string(),
-            })?;
-        let response_sha256 = hex_digest(&canonical);
-        let groups = raw_groups
-            .into_iter()
-            .map(|(name, group)| SourceGroup {
+        let mut groups = Vec::with_capacity(raw_groups.len());
+        for (name, group) in raw_groups {
+            let query = url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("group", &name)
+                .finish();
+            let path = format!("/api/user/models?{query}");
+            let envelope = self
+                .authenticated_request::<Vec<String>>(Method::GET, &path, None)
+                .await?;
+            let mut models = require_data(envelope, &path)?;
+            models.retain(|model| !model.trim().is_empty());
+            models
+                .iter_mut()
+                .for_each(|model| *model = model.trim().to_owned());
+            models.sort();
+            models.dedup();
+            groups.push(SourceGroup {
                 group_id: name.clone(),
                 group_name: name,
                 description: group.desc,
                 ratio: group.ratio,
-            })
-            .collect();
+                models,
+            });
+        }
+        let canonical =
+            serde_json::to_vec(&groups).map_err(|error| SourceError::InvalidResponse {
+                endpoint: "/api/user/self/groups".to_owned(),
+                message: error.to_string(),
+            })?;
+        let response_sha256 = hex_digest(&canonical);
         Ok(GroupCatalog {
             groups,
             fetched_at: unix_timestamp(),
@@ -257,6 +273,42 @@ impl SourceClient {
         })
     }
 
+    pub async fn disable_removed_group_tokens(
+        &mut self,
+        deployment_id: &str,
+        active_group_ids: &BTreeSet<String>,
+    ) -> SourceResult<usize> {
+        let prefix = format!("meowai-deploy/{deployment_id}/");
+        let tokens = self.list_tokens().await?;
+        let mut disabled = 0;
+        for token in tokens {
+            if token.name.starts_with(&prefix)
+                && token
+                    .group
+                    .as_deref()
+                    .is_some_and(|group| !active_group_ids.contains(group))
+                && token.status != 2
+            {
+                self.update_token_status(token.id, 2).await?;
+                disabled += 1;
+            }
+        }
+        Ok(disabled)
+    }
+
+    pub async fn revoke_deployment_tokens(&mut self, deployment_id: &str) -> SourceResult<usize> {
+        let prefix = format!("meowai-deploy/{deployment_id}/");
+        let tokens = self.list_tokens().await?;
+        let mut revoked = 0;
+        for token in tokens {
+            if token.name.starts_with(&prefix) {
+                self.delete_token(token.id).await?;
+                revoked += 1;
+            }
+        }
+        Ok(revoked)
+    }
+
     async fn list_tokens(&mut self) -> SourceResult<Vec<SourceToken>> {
         let mut tokens = Vec::new();
         let mut page_number = 1;
@@ -327,6 +379,29 @@ impl SourceClient {
             Some(body),
         )
         .await?;
+        Ok(())
+    }
+
+    async fn update_token_status(&mut self, id: i64, status: i32) -> SourceResult<()> {
+        let body = serde_json::to_value(TokenStatus { id, status }).map_err(|error| {
+            SourceError::InvalidResponse {
+                endpoint: "/api/token/?status_only=true".to_owned(),
+                message: error.to_string(),
+            }
+        })?;
+        self.authenticated_request::<serde_json::Value>(
+            Method::PUT,
+            "/api/token/?status_only=true",
+            Some(body),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_token(&mut self, id: i64) -> SourceResult<()> {
+        let path = format!("/api/token/{id}");
+        self.authenticated_request::<serde_json::Value>(Method::DELETE, &path, None)
+            .await?;
         Ok(())
     }
 
@@ -474,6 +549,7 @@ mod unit_tests {
             group_name: "超长分组".repeat(12),
             description: String::new(),
             ratio: serde_json::json!(1),
+            models: vec!["gpt-test".to_owned()],
         }];
         let first = desired_token_names("deploy_123", &groups).expect("build token name");
         let second = desired_token_names("deploy_123", &groups).expect("repeat token name");

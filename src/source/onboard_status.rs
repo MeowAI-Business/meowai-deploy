@@ -1,6 +1,6 @@
 use reqwest::{Method, StatusCode};
 use secrecy::{ExposeSecret, SecretString};
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use super::{SourceClient, SourceError, SourceResult, require_data};
 
@@ -29,7 +29,7 @@ impl StatusKeyProvision {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct StatusMonitorManifest {
     pub id: String,
     pub name: String,
@@ -45,7 +45,7 @@ pub struct StatusMonitorManifest {
     pub display_enabled: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct StatusManifest {
     pub success: bool,
     pub schema_version: String,

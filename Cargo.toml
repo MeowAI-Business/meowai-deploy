@@ -18,12 +18,14 @@ secrecy = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
+shell-escape = "0.1"
+tempfile = "3.15"
 thiserror = "2.0"
 tokio = { version = "1.44", features = ["macros", "rt-multi-thread", "time"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = "2.5"
 
 [dev-dependencies]
-tempfile = "3.15"
 wiremock = "0.6"

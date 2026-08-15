@@ -3,7 +3,11 @@ mod commands;
 mod config;
 mod doctor;
 mod error;
+mod pricing;
+mod security;
 pub mod source;
+mod state;
+mod target;
 
 use clap::Parser;
 use cli::Cli;
