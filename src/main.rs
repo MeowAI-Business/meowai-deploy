@@ -1,3 +1,4 @@
+pub mod application;
 mod cli;
 mod commands;
 mod config;

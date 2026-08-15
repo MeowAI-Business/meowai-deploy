@@ -12,13 +12,20 @@ use crate::{
 
 pub const CONFIG_FILE: &str = "deployment.toml";
 pub const STATE_FILE: &str = "state.json";
+pub const OPERATION_FILE: &str = "operation.json";
 pub const CREDENTIALS_FILE: &str = "credentials.env";
 pub const SESSION_FILE: &str = "session.json";
 pub const SOURCE_STATUS_KEYS_FILE: &str = "source-status-keys.json";
 pub const UPDATE_CHECK_FILE: &str = "update-check.json";
 pub const LOG_FILE: &str = "meowai-deploy.log";
 
-const DEPLOYMENT_FILES: [&str; 4] = [CONFIG_FILE, STATE_FILE, CREDENTIALS_FILE, SESSION_FILE];
+const DEPLOYMENT_FILES: [&str; 5] = [
+    CONFIG_FILE,
+    STATE_FILE,
+    OPERATION_FILE,
+    CREDENTIALS_FILE,
+    SESSION_FILE,
+];
 
 pub fn directory() -> Result<PathBuf> {
     if let Some(path) = env::var_os("MEOWAI_DEPLOY_HOME") {

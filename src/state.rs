@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::application::operation::OperationCheckpoint;
+
 pub const DOWNSTREAM_CLEANUP_PHASE: &str = "downstream_cleanup";
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -65,6 +67,8 @@ pub struct DeploymentState {
     pub last_sync_at: i64,
     #[serde(default)]
     pub last_sync_success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<OperationCheckpoint>,
 }
 
 impl DeploymentState {
@@ -85,4 +89,46 @@ pub fn unix_timestamp() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::application::operation::{OperationCheckpoint, OperationKind, OperationStage};
+
+    fn legacy_state_json() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "deployment_id": "deployment-one",
+            "target_fingerprint": "target-one",
+            "container_name": "newapi",
+            "directory": "/opt/meowai-deploy/newapi",
+            "newapi_port": 3000,
+            "kuma_port": 3001,
+            "image": "registry.example/newapi",
+            "image_ref": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        })
+    }
+
+    #[test]
+    fn state_without_operation_checkpoint_remains_compatible() {
+        let state: DeploymentState =
+            serde_json::from_value(legacy_state_json()).expect("legacy state");
+        assert!(state.operation.is_none());
+    }
+
+    #[test]
+    fn operation_checkpoint_round_trips_with_deployment_state() {
+        let mut state: DeploymentState =
+            serde_json::from_value(legacy_state_json()).expect("legacy state");
+        let mut checkpoint = OperationCheckpoint::new("operation-one", OperationKind::Onboard);
+        checkpoint.start().expect("start operation");
+        checkpoint
+            .start_stage(OperationStage::TargetValidation)
+            .expect("start target validation");
+        state.operation = Some(checkpoint.clone());
+        let encoded = serde_json::to_vec(&state).expect("encode state");
+        let decoded: DeploymentState = serde_json::from_slice(&encoded).expect("decode state");
+        assert_eq!(decoded.operation, Some(checkpoint));
+    }
 }

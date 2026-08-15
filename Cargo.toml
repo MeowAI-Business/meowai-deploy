@@ -22,7 +22,7 @@ sha2 = "0.10"
 shell-escape = "0.1"
 tempfile = "3.15"
 thiserror = "2.0"
-tokio = { version = "1.44", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1.44", features = ["macros", "rt-multi-thread", "sync", "time"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

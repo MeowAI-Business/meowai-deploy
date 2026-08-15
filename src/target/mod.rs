@@ -193,7 +193,7 @@ exit 1"#,
             if excluded.contains(&candidate) {
                 continue;
             }
-            if self.port_available(candidate)? {
+            if self.is_port_available(candidate)? {
                 return Ok(candidate);
             }
         }
@@ -202,7 +202,7 @@ exit 1"#,
         )))
     }
 
-    fn port_available(&self, port: u16) -> Result<bool> {
+    pub fn is_port_available(&self, port: u16) -> Result<bool> {
         if matches!(self.target, Target::Local) {
             let loopback = SocketAddr::from(([127, 0, 0, 1], port));
             if TcpStream::connect_timeout(&loopback, Duration::from_millis(100)).is_ok() {
