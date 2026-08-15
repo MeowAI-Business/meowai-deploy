@@ -366,8 +366,8 @@ impl Respond for StatefulTokenList {
 async fn missing_group_token_is_created_once_and_reused_on_rerun() {
     let server = MockServer::start().await;
     let mut client = authenticated_client(&server).await;
-    let default_name = "meowai-deploy/site_123/default";
-    let vip_name = "meowai-deploy/site_123/vip";
+    let default_name = "meowai-deploy/default";
+    let vip_name = "meowai-deploy/vip";
     let list_calls = Arc::new(AtomicUsize::new(0));
 
     Mock::given(method("GET"))
@@ -427,11 +427,11 @@ async fn missing_group_token_is_created_once_and_reused_on_rerun() {
     };
 
     let first = client
-        .ensure_group_tokens("site_123", &catalog)
+        .ensure_group_tokens(&catalog)
         .await
         .expect("create missing token");
     let second = client
-        .ensure_group_tokens("site_123", &catalog)
+        .ensure_group_tokens(&catalog)
         .await
         .expect("reuse all tokens");
 
@@ -442,20 +442,94 @@ async fn missing_group_token_is_created_once_and_reused_on_rerun() {
 }
 
 #[tokio::test]
-async fn removed_group_tokens_are_disabled_and_managed_tokens_can_be_revoked() {
+async fn legacy_deployment_token_is_left_untouched_when_account_token_is_created() {
     let server = MockServer::start().await;
     let mut client = authenticated_client(&server).await;
-    let managed_default = token(10, "meowai-deploy/site_123/default", "default");
-    let managed_removed = token(11, "meowai-deploy/site_123/removed", "removed");
+    let legacy_name = "meowai-deploy/site_123/default";
+    let account_name = "meowai-deploy/default";
+    let list_calls = Arc::new(AtomicUsize::new(0));
+
+    Mock::given(method("GET"))
+        .and(path("/api/token/"))
+        .and(query_param("p", "1"))
+        .and(query_param("size", "100"))
+        .respond_with(StatefulTokenList {
+            calls: Arc::clone(&list_calls),
+            initial: json!([token(9, legacy_name, "default")]),
+            current: json!([
+                token(9, legacy_name, "default"),
+                token(10, account_name, "default")
+            ]),
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/token/"))
+        .and(body_json(json!({
+            "name": account_name,
+            "status": 1,
+            "remain_quota": 0,
+            "expired_time": -1,
+            "unlimited_quota": true,
+            "model_limits_enabled": false,
+            "model_limits": "",
+            "allow_ips": "",
+            "group": "default",
+            "auto_groups": [],
+            "cross_group_retry": false
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "message": ""
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/token/batch/keys"))
+        .and(body_json(json!({"ids": [10]})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "message": "",
+            "data": {"keys": {"10": "account-key"}}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let catalog = GroupCatalog {
+        groups: vec![group("default", 1)],
+        fetched_at: 1,
+        response_sha256: "hash".to_owned(),
+    };
+
+    let sync = client
+        .ensure_group_tokens(&catalog)
+        .await
+        .expect("create account token without touching legacy token");
+
+    assert_eq!((sync.created, sync.reused, sync.updated), (1, 0, 0));
+    assert_eq!(sync.bindings[0].token_name, account_name);
+    assert_eq!(sync.bindings[0].api_key().expose_secret(), "sk-account-key");
+    assert_eq!(list_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn account_group_tokens_are_disabled_and_revoked_without_touching_legacy_tokens() {
+    let server = MockServer::start().await;
+    let mut client = authenticated_client(&server).await;
+    let managed_default = token(10, "meowai-deploy/default", "default");
+    let managed_removed = token(11, "meowai-deploy/removed", "removed");
     let unrelated = token(12, "manual-token", "removed");
+    let legacy = token(13, "meowai-deploy/site_123/removed", "removed");
     Mock::given(method("GET"))
         .and(path("/api/token/"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "success": true,
             "message": "",
             "data": {
-                "items": [managed_default, managed_removed, unrelated],
-                "total": 3,
+                "items": [managed_default, managed_removed, unrelated, legacy],
+                "total": 4,
                 "page": 1,
                 "page_size": 100
             }
@@ -487,13 +561,13 @@ async fn removed_group_tokens_are_disabled_and_managed_tokens_can_be_revoked() {
     }
 
     let disabled = client
-        .disable_removed_group_tokens("site_123", &BTreeSet::from(["default".to_owned()]))
+        .disable_removed_group_tokens(&BTreeSet::from(["default".to_owned()]))
         .await
-        .expect("disable removed token");
+        .expect("disable removed account token");
     let revoked = client
-        .revoke_deployment_tokens("site_123")
+        .revoke_account_group_tokens()
         .await
-        .expect("revoke managed tokens");
+        .expect("revoke account tokens");
 
     assert_eq!(disabled, 1);
     assert_eq!(revoked, 2);
@@ -503,7 +577,7 @@ async fn removed_group_tokens_are_disabled_and_managed_tokens_can_be_revoked() {
 async fn owned_token_drift_is_reconciled_before_key_reuse() {
     let server = MockServer::start().await;
     let mut client = authenticated_client(&server).await;
-    let token_name = "meowai-deploy/site_123/default";
+    let token_name = "meowai-deploy/default";
     let mut drifted = token(20, token_name, "wrong-group");
     let object = drifted.as_object_mut().expect("token object");
     object.insert("status".to_owned(), json!(2));
@@ -576,7 +650,7 @@ async fn owned_token_drift_is_reconciled_before_key_reuse() {
     };
 
     let sync = client
-        .ensure_group_tokens("site_123", &catalog)
+        .ensure_group_tokens(&catalog)
         .await
         .expect("reconcile token");
 

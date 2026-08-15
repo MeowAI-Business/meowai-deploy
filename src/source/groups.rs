@@ -12,6 +12,7 @@ use super::{SourceClient, SourceError, SourceResult, require_data, unix_timestam
 
 const TOKEN_NAME_LIMIT: usize = 50;
 const PAGE_SIZE: usize = 100;
+const TOKEN_PREFIX: &str = "meowai-deploy/";
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct SourceGroup {
@@ -175,16 +176,12 @@ impl SourceClient {
         })
     }
 
-    pub async fn ensure_group_tokens(
-        &mut self,
-        deployment_id: &str,
-        catalog: &GroupCatalog,
-    ) -> SourceResult<TokenSync> {
+    pub async fn ensure_group_tokens(&mut self, catalog: &GroupCatalog) -> SourceResult<TokenSync> {
         if catalog.groups.is_empty() {
             return Err(SourceError::EmptyGroups);
         }
 
-        let desired = desired_token_names(deployment_id, &catalog.groups)?;
+        let desired = desired_token_names(&catalog.groups)?;
         let initial_tokens = self.list_tokens().await?;
         let mut created = 0;
         let mut initially_present = BTreeMap::new();
@@ -275,14 +272,12 @@ impl SourceClient {
 
     pub async fn disable_removed_group_tokens(
         &mut self,
-        deployment_id: &str,
         active_group_ids: &BTreeSet<String>,
     ) -> SourceResult<usize> {
-        let prefix = format!("meowai-deploy/{deployment_id}/");
         let tokens = self.list_tokens().await?;
         let mut disabled = 0;
         for token in tokens {
-            if token.name.starts_with(&prefix)
+            if is_account_group_token(&token)
                 && token
                     .group
                     .as_deref()
@@ -296,12 +291,11 @@ impl SourceClient {
         Ok(disabled)
     }
 
-    pub async fn revoke_deployment_tokens(&mut self, deployment_id: &str) -> SourceResult<usize> {
-        let prefix = format!("meowai-deploy/{deployment_id}/");
+    pub async fn revoke_account_group_tokens(&mut self) -> SourceResult<usize> {
         let tokens = self.list_tokens().await?;
         let mut revoked = 0;
         for token in tokens {
-            if token.name.starts_with(&prefix) {
+            if is_account_group_token(&token) {
                 self.delete_token(token.id).await?;
                 revoked += 1;
             }
@@ -468,46 +462,10 @@ fn token_needs_update(token: &SourceToken, group: &str) -> bool {
             .is_some_and(|value| !value.is_empty())
 }
 
-fn desired_token_names(deployment_id: &str, groups: &[SourceGroup]) -> SourceResult<Vec<String>> {
-    if deployment_id.is_empty()
-        || deployment_id.len() > 24
-        || !deployment_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
-    {
-        return Err(SourceError::InvalidDeployment(
-            "deployment id must use 1-24 ASCII letters, digits, '-' or '_'".to_owned(),
-        ));
-    }
+fn desired_token_names(groups: &[SourceGroup]) -> SourceResult<Vec<String>> {
     let mut names = Vec::with_capacity(groups.len());
     for group in groups {
-        if group.group_name.is_empty() {
-            return Err(SourceError::InvalidDeployment(
-                "group name cannot be empty".to_owned(),
-            ));
-        }
-        let prefix = format!("meowai-deploy/{deployment_id}/");
-        let full = format!("{prefix}{}", group.group_name);
-        let name = if full.len() <= TOKEN_NAME_LIMIT {
-            full
-        } else {
-            let digest = hex_digest(group.group_name.as_bytes());
-            let suffix = format!("-{}", &digest[..10]);
-            let available = TOKEN_NAME_LIMIT
-                .checked_sub(prefix.len() + suffix.len())
-                .ok_or_else(|| {
-                    SourceError::InvalidDeployment(
-                        "deployment id leaves no room for a token name".to_owned(),
-                    )
-                })?;
-            let truncated = truncate_utf8(&group.group_name, available);
-            if truncated.is_empty() {
-                return Err(SourceError::InvalidDeployment(
-                    "group name cannot fit in the source token name".to_owned(),
-                ));
-            }
-            format!("{prefix}{truncated}{suffix}")
-        };
+        let name = desired_token_name(&group.group_name)?;
         if names.contains(&name) {
             return Err(SourceError::InvalidDeployment(format!(
                 "token name collision for group {}",
@@ -517,6 +475,42 @@ fn desired_token_names(deployment_id: &str, groups: &[SourceGroup]) -> SourceRes
         names.push(name);
     }
     Ok(names)
+}
+
+fn desired_token_name(group_name: &str) -> SourceResult<String> {
+    if group_name.is_empty() {
+        return Err(SourceError::InvalidDeployment(
+            "group name cannot be empty".to_owned(),
+        ));
+    }
+    let full = format!("{TOKEN_PREFIX}{group_name}");
+    if full.len() <= TOKEN_NAME_LIMIT {
+        return Ok(full);
+    }
+    let digest = hex_digest(group_name.as_bytes());
+    let suffix = format!("-{}", &digest[..10]);
+    let available = TOKEN_NAME_LIMIT
+        .checked_sub(TOKEN_PREFIX.len() + suffix.len())
+        .ok_or_else(|| {
+            SourceError::InvalidDeployment(
+                "token prefix leaves no room for a group name".to_owned(),
+            )
+        })?;
+    let truncated = truncate_utf8(group_name, available);
+    if truncated.is_empty() {
+        return Err(SourceError::InvalidDeployment(
+            "group name cannot fit in the source token name".to_owned(),
+        ));
+    }
+    Ok(format!("{TOKEN_PREFIX}{truncated}{suffix}"))
+}
+
+fn is_account_group_token(token: &SourceToken) -> bool {
+    token
+        .group
+        .as_deref()
+        .and_then(|group| desired_token_name(group).ok())
+        .is_some_and(|name| token.name == name)
 }
 
 fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
@@ -551,11 +545,27 @@ mod unit_tests {
             ratio: serde_json::json!(1),
             models: vec!["gpt-test".to_owned()],
         }];
-        let first = desired_token_names("deploy_123", &groups).expect("build token name");
-        let second = desired_token_names("deploy_123", &groups).expect("repeat token name");
+        let first = desired_token_names(&groups).expect("build token name");
+        let second = desired_token_names(&groups).expect("repeat token name");
         assert_eq!(first, second);
         assert!(first[0].len() <= TOKEN_NAME_LIMIT);
-        assert!(first[0].starts_with("meowai-deploy/deploy_123/"));
+        assert!(first[0].starts_with(TOKEN_PREFIX));
+    }
+
+    #[test]
+    fn token_name_is_scoped_to_the_account_group_not_a_deployment() {
+        let groups = vec![SourceGroup {
+            group_id: "default".to_owned(),
+            group_name: "default".to_owned(),
+            description: String::new(),
+            ratio: serde_json::json!(1),
+            models: vec![],
+        }];
+
+        assert_eq!(
+            desired_token_names(&groups).expect("build token name"),
+            ["meowai-deploy/default"]
+        );
     }
 
     #[test]

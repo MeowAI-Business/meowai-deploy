@@ -129,9 +129,7 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
     print_done("源站价格、首页、Seedance 和市场配置已读取并校验");
 
     print_action("同步源站分组 Token");
-    let token_sync = source
-        .ensure_group_tokens(&config.deployment_id(), &catalog)
-        .await?;
+    let token_sync = source.ensure_group_tokens(&catalog).await?;
     print_done("源站分组 Token 已就绪");
 
     print_action("准备源站公共状态密钥");
@@ -145,7 +143,7 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
     print_message(
         "源站资源",
         &format!(
-            "账号：{}\n分组：{}\nToken：新建 {}，复用 {}，修正 {}\n公共状态密钥：{}\n分组响应哈希：{}",
+            "账号：{}\n分组：{}\n分组 Token：新建 {}，复用 {}，修正 {}\n公共状态密钥：{}\n分组响应哈希：{}",
             identity.username,
             catalog.groups.len(),
             token_sync.created,
@@ -335,11 +333,9 @@ async fn run_sync_inner(
         .map(|group| group.group_id.clone())
         .collect::<BTreeSet<_>>();
     let disabled_tokens = source
-        .disable_removed_group_tokens(&config.deployment_id(), &active_group_ids)
+        .disable_removed_group_tokens(&active_group_ids)
         .await?;
-    let token_sync = source
-        .ensure_group_tokens(&config.deployment_id(), &catalog)
-        .await?;
+    let token_sync = source.ensure_group_tokens(&catalog).await?;
     let status_key = source.ensure_onboard_status_key().await?;
     if let Some(key) = status_key.key() {
         deployment.secrets.public_status_source_key = key.clone();
@@ -535,10 +531,12 @@ async fn run_rollback(args: &RollbackArgs) -> Result<()> {
         }
     }
     if args.revoke_source && !args.yes {
-        let confirmed = confirm("同时撤销源站分组 Token 和公共状态密钥？")
-            .initial_value(false)
-            .interact()
-            .map_err(AppError::from_prompt)?;
+        let confirmed = confirm(
+            "同时撤销这个源站账号的全部分组 Token 和公共状态密钥？这会让当前下游停止回源。",
+        )
+        .initial_value(false)
+        .interact()
+        .map_err(AppError::from_prompt)?;
         if !confirmed {
             return Err(AppError::Cancelled);
         }
@@ -560,9 +558,7 @@ async fn run_rollback(args: &RollbackArgs) -> Result<()> {
                 "source account does not own this deployment".to_owned(),
             ));
         }
-        let revoked_tokens = source
-            .revoke_deployment_tokens(&deployment.state.deployment_id)
-            .await?;
+        let revoked_tokens = source.revoke_account_group_tokens().await?;
         source.revoke_onboard_status_key().await?;
         source_key_store::remove(&config.source_url, identity.user_id)?;
         print_success(&format!(

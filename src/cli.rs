@@ -72,7 +72,7 @@ pub struct RollbackArgs {
     #[arg(long)]
     pub yes: bool,
 
-    /// Also revoke this deployment's source Tokens and public status Key.
+    /// Also revoke this source account's group Tokens and public status Key.
     #[arg(long)]
     pub revoke_source: bool,
 }
