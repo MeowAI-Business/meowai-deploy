@@ -24,6 +24,8 @@ fn help_lists_supported_commands() {
     let doctor_help = String::from_utf8_lossy(&doctor_output.stdout);
     assert!(!doctor_help.contains("--newapi-port"));
     assert!(!doctor_help.contains("--kuma-port"));
+    assert!(!doctor_help.contains("--source-url"));
+    assert!(!doctor_help.contains("--skip-network"));
 }
 
 #[test]
@@ -44,7 +46,7 @@ fn sync_is_implemented_and_exposes_operational_flags() {
         .expect("run sync help");
     assert!(help.status.success());
     let stdout = String::from_utf8_lossy(&help.stdout);
-    for flag in ["--directory", "--pricing", "--force"] {
+    for flag in ["--pricing", "--force"] {
         assert!(
             stdout.contains(flag),
             "missing {flag} in sync help: {stdout}"
@@ -52,13 +54,37 @@ fn sync_is_implemented_and_exposes_operational_flags() {
     }
 
     let output = binary()
-        .args(["sync", "--directory", "/path/that/does/not/exist"])
+        .env(
+            "MEOWAI_DEPLOY_HOME",
+            tempfile::tempdir()
+                .expect("create temporary state directory")
+                .path(),
+        )
+        .arg("sync")
         .output()
         .expect("run sync against missing deployment");
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("deployment.toml"));
     assert!(!stderr.contains("not implemented"));
+}
+
+#[test]
+fn status_without_deployment_is_a_normal_state() {
+    let directory = tempfile::tempdir().expect("create temporary directory");
+    let output = binary()
+        .env("MEOWAI_DEPLOY_HOME", directory.path())
+        .arg("status")
+        .output()
+        .expect("run status");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("尚未 onboard") || stderr.contains("尚未 onboard"),
+        "unexpected output: {stdout}{stderr}"
+    );
+    assert!(!stderr.contains("deployment.toml"));
 }
 
 #[test]

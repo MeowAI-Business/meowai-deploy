@@ -2,8 +2,6 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
-use crate::config::DEFAULT_SOURCE_URL;
-
 #[derive(Debug, Parser)]
 #[command(
     name = "meowai-deploy",
@@ -33,17 +31,10 @@ pub enum Command {
 }
 
 #[derive(Debug, Args)]
-pub struct DeploymentArgs {
-    /// Deployment directory containing deployment.toml and state.json.
-    #[arg(long, default_value = "/opt/meowai-deploy/newapi")]
-    pub directory: PathBuf,
-}
+pub struct DeploymentArgs {}
 
 #[derive(Debug, Args)]
 pub struct SyncArgs {
-    #[command(flatten)]
-    pub deployment: DeploymentArgs,
-
     /// Re-import current source pricing. By default pricing is left untouched.
     #[arg(long)]
     pub pricing: bool,
@@ -55,9 +46,6 @@ pub struct SyncArgs {
 
 #[derive(Debug, Args)]
 pub struct RollbackArgs {
-    #[command(flatten)]
-    pub deployment: DeploymentArgs,
-
     /// Confirm deletion of the downstream Compose project and its bind-mounted data.
     #[arg(long)]
     pub yes: bool,
@@ -69,17 +57,9 @@ pub struct RollbackArgs {
 
 #[derive(Debug, Args)]
 pub struct DoctorArgs {
-    /// Source URL used for the connectivity check.
-    #[arg(long, default_value = DEFAULT_SOURCE_URL)]
-    pub source_url: String,
-
     /// Directory whose parent will receive the deployment data.
     #[arg(long, default_value = "/opt/meowai-deploy/newapi")]
     pub directory: PathBuf,
-
-    /// Do not make the source connectivity request.
-    #[arg(long)]
-    pub skip_network: bool,
 
     /// Print machine-readable JSON instead of a terminal table.
     #[arg(long)]

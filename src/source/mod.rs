@@ -10,9 +10,12 @@ pub use onboard_status::{
     StatusMonitorResponse, StatusMonitorSnapshot, StatusPage, StatusSnapshot,
 };
 
-use std::{net::IpAddr, time::Duration};
+use std::{fmt, net::IpAddr, sync::Arc, time::Duration};
 
-use reqwest::{Client, Method, StatusCode, Url};
+use reqwest::{
+    Client, Method, StatusCode, Url,
+    cookie::{CookieStore, Jar},
+};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -74,6 +77,7 @@ pub enum SourceError {
 
 pub struct SourceClient {
     http: Client,
+    cookies: Arc<Jar>,
     base_url: Url,
     session: Option<AuthSession>,
 }
@@ -83,6 +87,32 @@ struct AuthSession {
     access_expires_at: i64,
     session_id: String,
     identity: SourceIdentity,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct PersistedSourceSession {
+    version: u32,
+    source_url: String,
+    access_token: String,
+    access_expires_at: i64,
+    session_id: String,
+    identity: SourceIdentity,
+    refresh_cookie: String,
+}
+
+impl fmt::Debug for PersistedSourceSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PersistedSourceSession")
+            .field("version", &self.version)
+            .field("source_url", &self.source_url)
+            .field("access_token", &"<redacted>")
+            .field("access_expires_at", &self.access_expires_at)
+            .field("session_id", &"<redacted>")
+            .field("identity", &self.identity)
+            .field("refresh_cookie", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -124,8 +154,9 @@ impl SourceClient {
         }
         base_url.set_path("/");
 
+        let cookies = Arc::new(Jar::default());
         let http = Client::builder()
-            .cookie_store(true)
+            .cookie_provider(cookies.clone())
             .redirect(reqwest::redirect::Policy::none())
             .timeout(REQUEST_TIMEOUT)
             .user_agent(concat!("meowai-deploy/", env!("CARGO_PKG_VERSION")))
@@ -137,6 +168,7 @@ impl SourceClient {
 
         Ok(Self {
             http,
+            cookies,
             base_url,
             session: None,
         })
@@ -144,6 +176,80 @@ impl SourceClient {
 
     pub fn identity(&self) -> Option<&SourceIdentity> {
         self.session.as_ref().map(|session| &session.identity)
+    }
+
+    pub fn export_session(&self) -> SourceResult<PersistedSourceSession> {
+        let session = self
+            .session
+            .as_ref()
+            .ok_or(SourceError::AuthenticationRequired)?;
+        let refresh_endpoint = self.endpoint("api/user/auth/refresh")?;
+        let refresh_cookie = self
+            .cookies
+            .cookies(&refresh_endpoint)
+            .and_then(|value| value.to_str().ok().map(str::to_owned))
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| SourceError::InvalidResponse {
+                endpoint: "/api/user/login".to_owned(),
+                message: "missing refresh cookie".to_owned(),
+            })?;
+        Ok(PersistedSourceSession {
+            version: 1,
+            source_url: self.base_url.as_str().to_owned(),
+            access_token: session.access_token.expose_secret().to_owned(),
+            access_expires_at: session.access_expires_at,
+            session_id: session.session_id.clone(),
+            identity: session.identity.clone(),
+            refresh_cookie,
+        })
+    }
+
+    pub fn from_session(source_url: &str, persisted: PersistedSourceSession) -> SourceResult<Self> {
+        let mut client = Self::new(source_url)?;
+        if persisted.version != 1 {
+            return Err(SourceError::InvalidResponse {
+                endpoint: "session.json".to_owned(),
+                message: format!("unsupported session version {}", persisted.version),
+            });
+        }
+        if persisted.source_url != client.base_url.as_str() {
+            return Err(SourceError::InvalidResponse {
+                endpoint: "session.json".to_owned(),
+                message: "session belongs to a different source URL".to_owned(),
+            });
+        }
+        let refresh_endpoint = client.endpoint("api/user/auth/refresh")?;
+        client
+            .cookies
+            .add_cookie_str(&persisted.refresh_cookie, &refresh_endpoint);
+        client.session = Some(AuthSession {
+            access_token: SecretString::from(persisted.access_token),
+            access_expires_at: persisted.access_expires_at,
+            session_id: persisted.session_id,
+            identity: persisted.identity,
+        });
+        Ok(client)
+    }
+
+    /// Check that the configured source responds before collecting credentials.
+    pub async fn check_connectivity(&self) -> SourceResult<()> {
+        let endpoint = self.endpoint("api/status")?;
+        let response =
+            self.http
+                .get(endpoint)
+                .send()
+                .await
+                .map_err(|source| SourceError::Transport {
+                    endpoint: "/api/status".to_owned(),
+                    source,
+                })?;
+        if !response.status().is_success() {
+            return Err(SourceError::HttpStatus {
+                endpoint: "/api/status".to_owned(),
+                status: response.status(),
+            });
+        }
+        Ok(())
     }
 
     fn endpoint(&self, path: &str) -> SourceResult<Url> {

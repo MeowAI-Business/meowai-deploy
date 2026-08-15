@@ -9,13 +9,12 @@ use crate::{
     error::{AppError, Result},
     security::{random_secret, validate_env_value},
     state::DeploymentState,
+    storage::{self, CONFIG_FILE, CREDENTIALS_FILE, STATE_FILE},
     target::TargetExecutor,
 };
 
-const STATE_FILE: &str = "state.json";
-const SECRETS_FILE: &str = "secrets.env";
+const TARGET_SECRETS_FILE: &str = "secrets.env";
 const COMPOSE_FILE: &str = "docker-compose.yml";
-const CONFIG_FILE: &str = "deployment.toml";
 const KUMA_IMAGE: &str = "louislam/uptime-kuma:2.5.0";
 
 #[derive(Clone, Debug)]
@@ -134,9 +133,8 @@ impl DeploymentRuntime {
         let executor = TargetExecutor::new(config.target.clone(), config.directory.clone());
         executor.prepare()?;
         let target_fingerprint = executor.fingerprint()?;
-        let existing_state = load_state(&executor)?;
-        let existing_secrets = executor
-            .read_file(SECRETS_FILE)?
+        let existing_state = load_state()?;
+        let existing_secrets = storage::read(CREDENTIALS_FILE)?
             .map(|content| DeploymentSecrets::parse(&content))
             .transpose()?;
 
@@ -306,17 +304,17 @@ impl DeploymentRuntime {
     pub fn persist(&self, config: &DeploymentConfig) -> Result<()> {
         let config_toml = toml::to_string_pretty(config)
             .map_err(|error| AppError::State(format!("serialize deployment config: {error}")))?;
+        storage::write(CONFIG_FILE, config_toml.as_bytes())?;
+        storage::write(CREDENTIALS_FILE, self.secrets.render().as_bytes())?;
         self.executor
-            .write_file(CONFIG_FILE, config_toml.as_bytes(), false)?;
-        self.executor
-            .write_file(SECRETS_FILE, self.secrets.render().as_bytes(), true)?;
+            .write_file(TARGET_SECRETS_FILE, self.secrets.render().as_bytes(), true)?;
         self.persist_state()
     }
 
     pub fn persist_state(&self) -> Result<()> {
         let state = serde_json::to_vec_pretty(&self.state)
             .map_err(|error| AppError::State(format!("serialize state.json: {error}")))?;
-        self.executor.write_file(STATE_FILE, &state, false)
+        storage::write(STATE_FILE, &state)
     }
 
     fn wait_for_base_stack(&self, config: &DeploymentConfig) -> Result<()> {
@@ -468,9 +466,8 @@ fn container_source_url(source_url: &str) -> Result<String> {
     Ok(parsed.as_str().trim_end_matches('/').to_owned())
 }
 
-fn load_state(executor: &TargetExecutor) -> Result<Option<DeploymentState>> {
-    executor
-        .read_file(STATE_FILE)?
+fn load_state() -> Result<Option<DeploymentState>> {
+    storage::read(STATE_FILE)?
         .map(|content| {
             serde_json::from_slice(&content)
                 .map_err(|error| AppError::State(format!("parse state.json: {error}")))

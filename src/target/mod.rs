@@ -6,9 +6,10 @@ use std::{
     borrow::Cow,
     fs,
     io::Write,
-    net::TcpListener,
+    net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
+    time::Duration,
 };
 
 use shell_escape::escape;
@@ -132,29 +133,6 @@ impl TargetExecutor {
         }
     }
 
-    pub fn read_file(&self, relative: &str) -> Result<Option<Vec<u8>>> {
-        validate_relative_name(relative)?;
-        let path = self.directory.join(relative);
-        match &self.target {
-            Target::Local => match fs::read(&path) {
-                Ok(content) => Ok(Some(content)),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(source) => Err(AppError::ReadFile { path, source }),
-            },
-            Target::Ssh { .. } => {
-                let script = format!(
-                    "if [ -f {path} ]; then cat {path}; else exit 44; fi",
-                    path = quote_path(&path)
-                );
-                let output = self.run_script_raw(&script)?;
-                if output.status.code() == Some(44) {
-                    return Ok(None);
-                }
-                require_success("read remote file", output).map(|output| Some(output.stdout))
-            }
-        }
-    }
-
     pub fn allocate_port(&self, requested: u16, excluded: &[u16]) -> Result<u16> {
         for candidate in requested..=u16::MAX {
             if excluded.contains(&candidate) {
@@ -171,6 +149,10 @@ impl TargetExecutor {
 
     fn port_available(&self, port: u16) -> Result<bool> {
         if matches!(self.target, Target::Local) {
+            let loopback = SocketAddr::from(([127, 0, 0, 1], port));
+            if TcpStream::connect_timeout(&loopback, Duration::from_millis(100)).is_ok() {
+                return Ok(false);
+            }
             return Ok(TcpListener::bind(("0.0.0.0", port)).is_ok());
         }
         let script = format!(
@@ -342,4 +324,29 @@ fn target_output_error(operation: &str, output: &Output) -> AppError {
             format!(": {detail}")
         }
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn occupied_local_port_is_not_returned() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind occupied port");
+        let occupied = listener.local_addr().expect("read occupied port").port();
+        if occupied == u16::MAX {
+            return;
+        }
+        let executor = TargetExecutor::new(
+            Target::Local,
+            tempfile::tempdir()
+                .expect("create temporary directory")
+                .path()
+                .to_owned(),
+        );
+        let selected = executor
+            .allocate_port(occupied, &[])
+            .expect("find the next available port");
+        assert_ne!(selected, occupied);
+    }
 }

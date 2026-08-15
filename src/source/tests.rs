@@ -134,6 +134,36 @@ async fn register_then_login_uses_standard_account_endpoints() {
 }
 
 #[tokio::test]
+async fn connectivity_check_uses_configured_source_url() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = SourceClient::new(&server.uri()).expect("create source client");
+    client
+        .check_connectivity()
+        .await
+        .expect("configured source should be checked");
+}
+
+#[tokio::test]
+async fn authenticated_session_can_be_persisted_and_restored() {
+    let server = MockServer::start().await;
+    let client = authenticated_client(&server).await;
+    let persisted = client.export_session().expect("export session");
+    let debug = format!("{persisted:?}");
+    assert!(!debug.contains("access-one"));
+    assert!(!debug.contains("session-1.secret"));
+
+    let restored = SourceClient::from_session(&server.uri(), persisted).expect("restore session");
+    assert_eq!(restored.identity(), client.identity());
+}
+
+#[tokio::test]
 async fn two_factor_login_stops_without_exposing_the_password() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

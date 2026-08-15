@@ -2,12 +2,10 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    time::Duration,
 };
 
 use comfy_table::{Cell, Color, Table, presets::UTF8_FULL};
 use console::style;
-use reqwest::Client;
 use serde::Serialize;
 
 use crate::{
@@ -31,7 +29,6 @@ pub enum CheckStatus {
     Pass,
     Fail,
     Warn,
-    Skipped,
 }
 
 #[derive(Debug, Serialize)]
@@ -41,7 +38,7 @@ pub struct Report {
 }
 
 pub async fn run(args: &DoctorArgs) -> Result<()> {
-    let mut checks = vec![
+    let checks = vec![
         check_architecture(),
         check_command("docker", &["--version"], true, "Docker CLI"),
         check_compose(),
@@ -49,16 +46,6 @@ pub async fn run(args: &DoctorArgs) -> Result<()> {
         check_directory(&args.directory),
         check_disk(&args.directory),
     ];
-    if args.skip_network {
-        checks.push(Check {
-            name: "source connectivity".to_owned(),
-            status: CheckStatus::Skipped,
-            detail: "skipped by --skip-network".to_owned(),
-            blocking: false,
-        });
-    } else {
-        checks.push(check_network(&args.source_url).await);
-    }
 
     let blocking_failures = checks
         .iter()
@@ -224,39 +211,6 @@ fn check_disk(directory: &Path) -> Check {
     }
 }
 
-async fn check_network(source_url: &str) -> Check {
-    let client = match Client::builder().timeout(Duration::from_secs(5)).build() {
-        Ok(client) => client,
-        Err(error) => {
-            return Check {
-                name: "source connectivity".to_owned(),
-                status: CheckStatus::Fail,
-                detail: error.to_string(),
-                blocking: true,
-            };
-        }
-    };
-    match client
-        .get(source_url)
-        .header("User-Agent", "meowai-deploy/0.1")
-        .send()
-        .await
-    {
-        Ok(response) => Check {
-            name: "source connectivity".to_owned(),
-            status: CheckStatus::Pass,
-            detail: format!("HTTP {} from {source_url}", response.status()),
-            blocking: true,
-        },
-        Err(error) => Check {
-            name: "source connectivity".to_owned(),
-            status: CheckStatus::Fail,
-            detail: error.to_string(),
-            blocking: true,
-        },
-    }
-}
-
 fn print_table(report: &Report) {
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
@@ -266,7 +220,6 @@ fn print_table(report: &Report) {
             CheckStatus::Pass => Cell::new("PASS").fg(Color::Green),
             CheckStatus::Fail => Cell::new("FAIL").fg(Color::Red),
             CheckStatus::Warn => Cell::new("WARN").fg(Color::Yellow),
-            CheckStatus::Skipped => Cell::new("SKIP").fg(Color::DarkGrey),
         };
         table.add_row(vec![
             Cell::new(&check.name),

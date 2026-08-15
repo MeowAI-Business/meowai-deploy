@@ -55,7 +55,7 @@ impl fmt::Debug for SourceCredentials {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SourceIdentity {
     pub user_id: i64,
     pub username: String,

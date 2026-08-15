@@ -2,9 +2,11 @@ use std::{
     env, fmt, fs, io,
     net::IpAddr,
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 
-use cliclack::{input, intro, log, outro, password, select};
+use cliclack::{input, intro, outro, password, select};
+use console::{Term, style};
 use rand::{Rng, distributions::Alphanumeric};
 use reqwest::Url;
 use secrecy::SecretString;
@@ -14,13 +16,16 @@ use sha2::{Digest, Sha256};
 use crate::{
     cli::OnboardArgs,
     error::{AppError, Result},
-    source::{SourceAccountMode, SourceCredentials},
+    source::{SourceAccountMode, SourceClient, SourceCredentials, SourceIdentity},
+    target::TargetExecutor,
 };
 
 pub const DEFAULT_SOURCE_URL: &str = "https://enterprise.meowai.net";
 pub const DEFAULT_NEWAPI_PORT: u16 = 3000;
 pub const DEFAULT_KUMA_PORT: u16 = 3001;
 pub const DEFAULT_IMAGE_REF: &str = "cd920e55641a90bf64e97adc89705d09fd6581e8";
+
+static PROMPT_SECTION: Mutex<Option<String>> = Mutex::new(None);
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -289,26 +294,54 @@ impl fmt::Display for DeploymentConfig {
     }
 }
 
-pub async fn interactive_config(args: &OnboardArgs) -> Result<DeploymentConfig> {
-    let mut config = if let Some(path) = &args.config {
-        DeploymentConfig::from_file(path)?
-    } else {
-        prompt_config()?
-    };
-    config.apply_cli_target(args);
-    config.normalize();
-    config.validate()?;
-    Ok(config)
+pub async fn interactive_config(
+    args: &OnboardArgs,
+) -> Result<(DeploymentConfig, SourceClient, SourceIdentity)> {
+    if args.config.is_some() {
+        return Err(AppError::InvalidConfig(
+            "interactive_config cannot load a config file".to_owned(),
+        ));
+    }
+    prompt_config(args).await
 }
 
-fn prompt_config() -> Result<DeploymentConfig> {
-    prompt_io(intro("meowai-deploy  ·  onboard"))?;
-    prompt_io(log::step("源站账号"))?;
-    let source_url: String = prompt_io(
-        input("源站 URL")
-            .default_input(DEFAULT_SOURCE_URL)
-            .interact(),
-    )?;
+pub async fn authenticate_source(
+    config: &DeploymentConfig,
+) -> Result<(SourceClient, SourceIdentity)> {
+    let mut source = SourceClient::new(&config.source_url)?;
+    source.check_connectivity().await?;
+    let credentials = config.source_credentials()?;
+    let identity = source
+        .authenticate(config.source_account_mode, &credentials)
+        .await?;
+    Ok((source, identity))
+}
+
+async fn prompt_config(
+    args: &OnboardArgs,
+) -> Result<(DeploymentConfig, SourceClient, SourceIdentity)> {
+    let mut source_error = None;
+    let (source_url, mut source) = loop {
+        prompt_screen("源站账号")?;
+        let label = retry_label("源站 URL", source_error.as_deref(), 3)?;
+        let source_url: String =
+            prompt_io(input(label).default_input(DEFAULT_SOURCE_URL).interact())?;
+        match SourceClient::new(&source_url) {
+            Ok(candidate) => match candidate.check_connectivity().await {
+                Ok(()) => {
+                    redraw_success("源站 URL", &source_url, "可连通", 3)?;
+                    break (source_url, candidate);
+                }
+                Err(_) => {
+                    source_error = Some("无法连通，请检查地址和网络".to_owned());
+                }
+            },
+            Err(_) => {
+                source_error = Some("URL 格式无效".to_owned());
+            }
+        }
+    };
+    prompt_screen("源站账号")?;
     let source_account_mode: SourceAccountMode = prompt_io(
         select("账号操作")
             .item(
@@ -324,53 +357,100 @@ fn prompt_config() -> Result<DeploymentConfig> {
             .initial_value(SourceAccountMode::Login)
             .interact(),
     )?;
-    let source_username: String = prompt_io(input("源站用户名").interact())?;
-    let source_password = Some(prompt_io(password("源站密码").mask('•').interact())?);
-    prompt_io(log::step("项目身份"))?;
+    let mut account_error = None;
+    let (source_username, source_password, identity) = loop {
+        prompt_screen("源站账号")?;
+        let username_label = retry_label("源站用户名", account_error.as_deref(), 6)?;
+        let source_username: String = prompt_io(input(username_label).interact())?;
+        prompt_screen("源站账号")?;
+        let source_password = prompt_io(password("源站密码").mask('•').interact())?;
+        let credentials = match SourceCredentials::new(
+            source_username.clone(),
+            SecretString::from(source_password.clone()),
+        ) {
+            Ok(credentials) => credentials,
+            Err(_) => {
+                account_error = Some("账号长度或密码长度不符合要求".to_owned());
+                continue;
+            }
+        };
+        match source.authenticate(source_account_mode, &credentials).await {
+            Ok(identity) => {
+                let status = if source_account_mode == SourceAccountMode::Register {
+                    "注册成功"
+                } else {
+                    "登录成功"
+                };
+                redraw_success("源站账号", &source_username, status, 6)?;
+                break (source_username, Some(source_password), identity);
+            }
+            Err(_) => {
+                account_error = Some("登录/注册失败，请检查账号密码".to_owned());
+            }
+        }
+    };
+
+    prompt_screen("站点与网络")?;
     let website_name: String = prompt_io(
         input("网站名称")
             .placeholder("例如：Acme AI（回车使用容器名）")
             .required(false)
             .interact(),
     )?;
-    let container_name: String = prompt_io(input("容器名").default_input("newapi").interact())?;
+    let container_name = prompt_container_name()?;
     let default_directory = format!("/opt/meowai-deploy/{container_name}");
-    let directory_value: String = prompt_io(
-        input("部署目录")
-            .default_input(&default_directory)
-            .interact(),
-    )?;
-    let directory = PathBuf::from(directory_value);
-    prompt_io(log::step("网络与目标"))?;
-    let newapi_bind = prompt_bind("New API 监听地址")?;
-    let kuma_bind = prompt_bind("Uptime Kuma 监听地址")?;
-    let newapi_port = prompt_port("New API 端口", DEFAULT_NEWAPI_PORT)?;
-    let kuma_port = prompt_port("Uptime Kuma 端口", DEFAULT_KUMA_PORT)?;
-    let target: String = prompt_io(
-        select("部署方式")
-            .item("local".to_owned(), "本机", "直接在当前服务器运行")
-            .item("ssh".to_owned(), "SSH 远程", "连接 user@host 目标服务器")
-            .initial_value("local".to_owned())
-            .interact(),
-    )?;
+    let directory = prompt_directory(&default_directory)?;
+    let target: String = if args.ssh.is_some() {
+        "ssh".to_owned()
+    } else if args.local {
+        "local".to_owned()
+    } else {
+        prompt_screen("站点与网络")?;
+        prompt_io(
+            select("部署方式")
+                .item("local".to_owned(), "本机", "直接在当前服务器运行")
+                .item("ssh".to_owned(), "SSH 远程", "连接 user@host 目标服务器")
+                .initial_value("local".to_owned())
+                .interact(),
+        )?
+    };
     let target = if target == "ssh" {
-        let destination: String = prompt_io(input("SSH 目标（user@host）").interact())?;
+        let destination = if let Some(destination) = &args.ssh {
+            destination.clone()
+        } else {
+            prompt_screen("站点与网络")?;
+            prompt_io(input("SSH 目标（user@host）").interact())?
+        };
         Target::Ssh { destination }
     } else {
         Target::Local
     };
-    prompt_io(log::step("管理员凭证"))?;
-    let newapi_admin_username = prompt_username("New API 管理员用户名", "admin")?;
-    let newapi_admin_password = Some(prompt_secret("New API 管理员密码")?);
-    let kuma_admin_username = prompt_username("Uptime Kuma 管理员用户名", "admin")?;
-    let kuma_admin_password = Some(prompt_secret("Uptime Kuma 管理员密码")?);
-    prompt_io(log::step("镜像版本"))?;
-    let image_ref: String = prompt_io(
-        input("New API commit SHA/digest")
-            .default_input(DEFAULT_IMAGE_REF)
-            .interact(),
+    let executor = TargetExecutor::new(target.clone(), directory.clone());
+    let newapi_bind = prompt_bind("站点与网络", "New API 监听地址")?;
+    let kuma_bind = prompt_bind("站点与网络", "Uptime Kuma 监听地址")?;
+    let newapi_port = prompt_port(
+        "站点与网络",
+        "New API 端口",
+        DEFAULT_NEWAPI_PORT,
+        &executor,
+        &[],
     )?;
-    let config = DeploymentConfig {
+    let kuma_port = prompt_port(
+        "站点与网络",
+        "Uptime Kuma 端口",
+        DEFAULT_KUMA_PORT,
+        &executor,
+        &[newapi_port],
+    )?;
+
+    let newapi_admin_username =
+        prompt_username("管理员凭证", "New API 管理员用户名", "admin", Some(12))?;
+    let newapi_admin_password = Some(prompt_secret("管理员凭证", "New API 管理员密码")?);
+    let kuma_admin_username =
+        prompt_username("管理员凭证", "Uptime Kuma 管理员用户名", "admin", None)?;
+    let kuma_admin_password = Some(prompt_secret("管理员凭证", "Uptime Kuma 管理员密码")?);
+    let image_ref = prompt_image_ref("镜像版本")?;
+    let mut config = DeploymentConfig {
         source_url,
         source_account_mode,
         source_username,
@@ -390,15 +470,72 @@ fn prompt_config() -> Result<DeploymentConfig> {
         image_ref,
         ..DeploymentConfig::default()
     };
-    prompt_io(outro("配置输入完成"))?;
-    Ok(config)
+    config.normalize();
+    config.validate()?;
+    finish_prompt_flow()?;
+    Ok((config, source, identity))
 }
 
-fn prompt_username(label: &str, default: &str) -> Result<String> {
-    prompt_io(input(label).default_input(default).interact())
+fn prompt_container_name() -> Result<String> {
+    let mut error = None;
+    loop {
+        prompt_screen("站点与网络")?;
+        let label = retry_label("容器名", error.as_deref(), 3)?;
+        let value: String = prompt_io(input(label).default_input("newapi").interact())?;
+        match validate_identifier("container_name", &value) {
+            Ok(()) => {
+                redraw_success("容器名", &value, "格式有效", 3)?;
+                return Ok(value);
+            }
+            Err(_) => {
+                error = Some("只能使用字母、数字、-、_、.，最长 63 个字符".to_owned());
+            }
+        }
+    }
 }
 
-fn prompt_secret(label: &str) -> Result<String> {
+fn prompt_directory(default: &str) -> Result<PathBuf> {
+    let mut error = None;
+    loop {
+        prompt_screen("站点与网络")?;
+        let label = retry_label("部署目录", error.as_deref(), 3)?;
+        let value: String = prompt_io(input(label).default_input(default).interact())?;
+        let directory = PathBuf::from(value);
+        match validate_directory(&directory) {
+            Ok(()) => {
+                redraw_success("部署目录", &directory.display().to_string(), "路径有效", 3)?;
+                return Ok(directory);
+            }
+            Err(_) => {
+                error = Some("必须是安全的绝对路径".to_owned());
+            }
+        }
+    }
+}
+
+fn prompt_username(
+    section: &str,
+    label: &str,
+    default: &str,
+    max_length: Option<usize>,
+) -> Result<String> {
+    let mut error = None;
+    loop {
+        prompt_screen(section)?;
+        let prompt = retry_label(label, error.as_deref(), 3)?;
+        let value: String = prompt_io(input(prompt).default_input(default).interact())?;
+        if max_length.is_none_or(|limit| value.len() <= limit) {
+            if max_length.is_some() {
+                redraw_success(label, &value, "格式有效", 3)?;
+            }
+            return Ok(value);
+        }
+        error = Some(format!("不能超过 {} 个字符", max_length.unwrap_or(0)));
+    }
+}
+
+fn prompt_secret(section: &str, label: &str) -> Result<String> {
+    prompt_screen(section)?;
     let mode: String = prompt_io(
         select(format!("{label} · 密码来源"))
             .item("random".to_owned(), "随机生成", "推荐：安全随机值")
@@ -409,11 +546,13 @@ fn prompt_secret(label: &str) -> Result<String> {
     if mode == "random" {
         Ok(random_secret())
     } else {
+        prompt_screen(section)?;
         prompt_io(password(label).mask('•').interact())
     }
 }
 
-fn prompt_bind(label: &str) -> Result<String> {
+fn prompt_bind(section: &str, label: &str) -> Result<String> {
+    prompt_screen(section)?;
     prompt_io(
         select(label)
             .item("0.0.0.0".to_owned(), "0.0.0.0", "公网开放（默认）")
@@ -423,16 +562,111 @@ fn prompt_bind(label: &str) -> Result<String> {
     )
 }
 
-fn prompt_port(label: &str, default: u16) -> Result<u16> {
-    let default_value = default.to_string();
-    let value: String = prompt_io(input(label).default_input(&default_value).interact())?;
-    value.parse::<u16>().map_err(|_| {
-        AppError::InvalidConfig(format!("{label} must be a number between 1 and 65535"))
-    })
+fn prompt_port(
+    section: &str,
+    label: &str,
+    default: u16,
+    executor: &TargetExecutor,
+    excluded: &[u16],
+) -> Result<u16> {
+    let mut error = None;
+    loop {
+        prompt_screen(section)?;
+        let default_value = default.to_string();
+        let prompt = retry_label(label, error.as_deref(), 3)?;
+        let value: String = prompt_io(input(prompt).default_input(&default_value).interact())?;
+        let requested = match value.parse::<u16>() {
+            Ok(port) if port > 0 => port,
+            _ => {
+                error = Some("必须是 1-65535 的端口".to_owned());
+                continue;
+            }
+        };
+        match executor.allocate_port(requested, excluded) {
+            Ok(port) if port == requested => {
+                redraw_success(label, &value, "可用", 3)?;
+                return Ok(port);
+            }
+            Ok(port) => {
+                error = Some(format!("已被占用，可用 {port}"));
+            }
+            Err(error) => {
+                return Err(error);
+            }
+        }
+    }
+}
+
+fn prompt_image_ref(section: &str) -> Result<String> {
+    let mut error = None;
+    loop {
+        prompt_screen(section)?;
+        let label = retry_label("上游 commit SHA/digest", error.as_deref(), 3)?;
+        let image_ref: String =
+            prompt_io(input(label).default_input(DEFAULT_IMAGE_REF).interact())?;
+        if is_immutable_image_ref(&image_ref) {
+            redraw_success("上游 commit SHA/digest", &image_ref, "格式有效", 3)?;
+            return Ok(image_ref);
+        }
+        error = Some("必须是 7-64 位十六进制 SHA 或 sha256 digest".to_owned());
+    }
 }
 
 fn prompt_io<T>(result: io::Result<T>) -> Result<T> {
     result.map_err(AppError::from_prompt)
+}
+
+fn retry_label(label: &str, error: Option<&str>, lines_to_replace: usize) -> Result<String> {
+    if let Some(error) = error {
+        Term::stderr()
+            .clear_last_lines(lines_to_replace)
+            .map_err(AppError::from_prompt)?;
+        Ok(format!("{label} {}", style(format!("· {error}")).red()))
+    } else {
+        Ok(label.to_owned())
+    }
+}
+
+fn redraw_success(label: &str, value: &str, status: &str, lines_to_replace: usize) -> Result<()> {
+    let term = Term::stderr();
+    term.clear_last_lines(lines_to_replace)
+        .map_err(AppError::from_prompt)?;
+    term.write_line(&format!(
+        "{}  {label} {}",
+        style("◇").green(),
+        style(format!("· {status}")).green()
+    ))
+    .map_err(AppError::from_prompt)?;
+    term.write_line(&format!("{}  {}", style("│").dim(), style(value).dim()))
+        .map_err(AppError::from_prompt)?;
+    term.write_line(&style("│").dim().to_string())
+        .map_err(AppError::from_prompt)
+}
+
+fn prompt_screen(section: &str) -> Result<()> {
+    let mut current = PROMPT_SECTION
+        .lock()
+        .map_err(|_| AppError::Message("prompt section state is unavailable".to_owned()))?;
+    if current.as_deref() != Some(section) {
+        if let Some(previous) = current.as_deref() {
+            prompt_io(outro(format!("{previous}配置完成")))?;
+            println!();
+        }
+        prompt_io(intro(format!("meowai-deploy · {section}")))?;
+        *current = Some(section.to_owned());
+    }
+    Ok(())
+}
+
+fn finish_prompt_flow() -> Result<()> {
+    let mut current = PROMPT_SECTION
+        .lock()
+        .map_err(|_| AppError::Message("prompt section state is unavailable".to_owned()))?;
+    if current.take().is_some() {
+        prompt_io(outro("配置输入完成"))?;
+        println!();
+    }
+    Ok(())
 }
 
 fn validate_directory(directory: &Path) -> Result<()> {
