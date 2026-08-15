@@ -1,12 +1,11 @@
 use std::{
-    env,
-    fs::{self, OpenOptions},
-    os::unix::fs::PermissionsExt,
+    fs,
     path::{Path, PathBuf},
 };
 
 use crate::{
     error::{AppError, Result},
+    platform,
     security::write_private_file,
 };
 
@@ -28,22 +27,7 @@ const DEPLOYMENT_FILES: [&str; 5] = [
 ];
 
 pub fn directory() -> Result<PathBuf> {
-    if let Some(path) = env::var_os("MEOWAI_DEPLOY_HOME") {
-        let path = PathBuf::from(path);
-        if !path.is_absolute() {
-            return Err(AppError::State(
-                "MEOWAI_DEPLOY_HOME must be an absolute path".to_owned(),
-            ));
-        }
-        return Ok(path);
-    }
-    let home = env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            AppError::State("cannot resolve the current user's home directory".to_owned())
-        })?;
-    Ok(home.join(".meowai-deploy"))
+    platform::state_home()
 }
 
 pub fn exists(name: &str) -> Result<bool> {
@@ -70,17 +54,7 @@ pub fn write(name: &str, content: &[u8]) -> Result<()> {
 pub fn open_log_file() -> Result<fs::File> {
     let root = ensure_directory()?;
     let path = root.join(LOG_FILE);
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|source| AppError::WriteFile {
-            path: path.clone(),
-            source,
-        })?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-        .map_err(|source| AppError::WriteFile { path, source })?;
-    Ok(file)
+    platform::open_private_append(&path).map_err(|source| AppError::WriteFile { path, source })
 }
 
 pub fn remove(name: &str) -> Result<bool> {
@@ -102,16 +76,19 @@ pub fn clear_deployment() -> Result<()> {
 
 fn ensure_directory() -> Result<PathBuf> {
     let root = directory()?;
-    fs::create_dir_all(&root).map_err(|source| AppError::WriteFile {
+    platform::ensure_private_directory(&root).map_err(|source| AppError::WriteFile {
         path: root.clone(),
         source,
     })?;
-    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).map_err(|source| {
-        AppError::WriteFile {
-            path: root.clone(),
-            source,
-        }
-    })?;
+    if !platform::private_path_is_restricted(&root, true).map_err(|source| AppError::WriteFile {
+        path: root.clone(),
+        source,
+    })? {
+        return Err(AppError::State(format!(
+            "state directory permissions are too broad: {}",
+            root.display()
+        )));
+    }
     Ok(root)
 }
 

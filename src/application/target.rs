@@ -48,7 +48,7 @@ pub fn probe_ssh_target(
     cancellation: &CancellationToken,
 ) -> ApplicationResult<String> {
     input::validate_ssh_destination(destination).map_err(validation_error)?;
-    input::validate_directory(&directory).map_err(validation_error)?;
+    input::validate_remote_directory(&directory).map_err(validation_error)?;
     check_cancellation(cancellation)?;
     let executor = TargetExecutor::new(
         Target::Ssh {
@@ -74,7 +74,7 @@ pub fn check_remote_port(
     cancellation: &CancellationToken,
 ) -> ApplicationResult<bool> {
     input::validate_ssh_destination(&request.destination).map_err(validation_error)?;
-    input::validate_directory(&request.directory).map_err(validation_error)?;
+    input::validate_remote_directory(&request.directory).map_err(validation_error)?;
     if request.port == 0 {
         return Err(ApplicationError::new(
             ErrorCategory::Validation,
@@ -102,11 +102,14 @@ pub fn probe_deployment_target(
     request: DeploymentTargetProbeRequest,
     cancellation: &CancellationToken,
 ) -> ApplicationResult<DeploymentTargetProbe> {
-    input::validate_directory(&request.directory).map_err(validation_error)?;
     let target = match request.target {
-        DeploymentTargetInput::Local => Target::Local,
+        DeploymentTargetInput::Local => {
+            input::validate_directory(&request.directory).map_err(validation_error)?;
+            Target::Local
+        }
         DeploymentTargetInput::Ssh { destination } => {
             input::validate_ssh_destination(&destination).map_err(validation_error)?;
+            input::validate_remote_directory(&request.directory).map_err(validation_error)?;
             Target::Ssh { destination }
         }
     };

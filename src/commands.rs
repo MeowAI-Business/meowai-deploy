@@ -18,6 +18,7 @@ use crate::{
             OperationStatus,
         },
     },
+    bootstrap,
     cli::{CleanArgs, Cli, Command, DeploymentArgs, OnboardArgs, RollbackArgs, SyncArgs},
     config::{DeploymentConfig, authenticate_source, interactive_config, reauthenticate_source},
     doctor,
@@ -58,6 +59,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     }
     match cli.command {
         None => print_help(),
+        Some(Command::Bootstrap(args)) => bootstrap::run(&args),
         Some(Command::Doctor(args)) => doctor::run(&args).await,
         Some(Command::Onboard(args)) => run_onboard(&args).await,
         Some(Command::Sync(args)) => run_sync(&args).await,
@@ -78,6 +80,7 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
         );
         return Ok(());
     }
+    doctor::preflight_onboard(args)?;
     if args.non_interactive && args.config.is_none() {
         return Err(AppError::InvalidConfig(
             "--non-interactive requires --config FILE".to_owned(),

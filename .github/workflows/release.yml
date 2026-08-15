@@ -69,9 +69,52 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  build-windows:
+    name: Build windows-amd64
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Cache Rust build
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~\.cargo\registry
+            ~\.cargo\git
+            target
+          key: ${{ runner.os }}-windows-amd64-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-windows-amd64-cargo-
+
+      - name: Verify tag matches Cargo version
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          if ($env:GITHUB_REF_NAME -ne "v$version") { throw "Tag does not match Cargo version." }
+
+      - name: Build release archive
+        shell: pwsh
+        run: |
+          cargo +stable build --release --locked
+          New-Item -ItemType Directory -Path dist\package -Force | Out-Null
+          Copy-Item target\release\meowai-deploy.exe dist\package\meowai-deploy.exe
+          Compress-Archive -Path dist\package\meowai-deploy.exe -DestinationPath dist\meowai-deploy-windows-amd64.zip -CompressionLevel Optimal
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: meowai-deploy-windows-amd64
+          path: dist/meowai-deploy-windows-amd64.zip
+          if-no-files-found: error
+          retention-days: 1
+
   publish:
     name: Publish release assets
-    needs: build
+    needs: [build, build-windows]
     runs-on: ubuntu-latest
     steps:
       - name: Download build artifacts
@@ -86,7 +129,7 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          sha256sum meowai-deploy-*.tar.gz > checksums-sha256.txt
+          sha256sum meowai-deploy-*.tar.gz meowai-deploy-*.zip > checksums-sha256.txt
 
       - name: Create GitHub Release
         if: github.event_name == 'push'
@@ -96,6 +139,7 @@ jobs:
         run: >-
           gh release create "${GITHUB_REF_NAME}"
           dist/meowai-deploy-*.tar.gz
+          dist/meowai-deploy-*.zip
           dist/checksums-sha256.txt
           --verify-tag
           --generate-notes
@@ -109,5 +153,6 @@ jobs:
         run: >-
           gh release upload "${GITHUB_REF_NAME}"
           dist/meowai-deploy-*.tar.gz
+          dist/meowai-deploy-*.zip
           dist/checksums-sha256.txt
           --clobber

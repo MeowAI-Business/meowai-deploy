@@ -18,6 +18,7 @@ use crate::{
     },
     cli::OnboardArgs,
     error::{AppError, Result},
+    platform,
     registry::latest_image_digest,
     source::{SourceAccountMode, SourceClient, SourceIdentity},
     target::TargetExecutor,
@@ -169,6 +170,11 @@ image_ref = ""
     }
 
     pub fn validate(&self) -> Result<()> {
+        if matches!(self.target, Target::Local) && !platform::supports_local_target() {
+            return Err(AppError::InvalidConfig(
+                "Windows 控制端不支持本机部署；请使用 --ssh user@linux-host".to_owned(),
+            ));
+        }
         self.deployment_input().validate().map_err(invalid_config)
     }
 
@@ -441,7 +447,7 @@ async fn prompt_config(
     let container_name = prompt_container_name()?;
     let default_directory = format!("/opt/meowai-deploy/{container_name}");
     let directory = prompt_directory(&default_directory)?;
-    let target: String = if args.ssh.is_some() {
+    let target: String = if cfg!(windows) || args.ssh.is_some() {
         "ssh".to_owned()
     } else if args.local {
         "local".to_owned()
@@ -470,7 +476,7 @@ async fn prompt_config(
     if matches!(target, Target::Ssh { .. }) {
         let progress = spinner();
         progress.start("正在验证 SSH 连接和部署权限");
-        match executor.validate_access() {
+        match executor.validate_access_interactive() {
             Ok(()) => progress.stop("SSH 连接和部署权限可用"),
             Err(error) => {
                 progress.error("SSH 连接或部署权限不可用");
@@ -553,7 +559,12 @@ fn prompt_directory(default: &str) -> Result<PathBuf> {
         let label = retry_label("部署目录", error.as_deref(), 3)?;
         let value: String = prompt_io(input(label).default_input(default).interact())?;
         let directory = PathBuf::from(value);
-        match validate_directory(&directory) {
+        let validation = if cfg!(windows) {
+            input::validate_remote_directory(&directory).map_err(invalid_config)
+        } else {
+            validate_directory(&directory)
+        };
+        match validation {
             Ok(()) => {
                 redraw_success("部署目录", &directory.display().to_string(), "路径有效", 3)?;
                 return Ok(directory);

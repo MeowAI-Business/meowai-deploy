@@ -3,6 +3,8 @@ use std::{fmt, net::IpAddr, path::PathBuf};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 
+use crate::target::remote_path::RemotePath;
+
 pub const DEFAULT_SOURCE_URL: &str = "https://enterprise.meowai.net";
 pub const DEFAULT_WEBSITE_NAME: &str = "Meow AI Downstream";
 pub const DEFAULT_CONTAINER_NAME: &str = "newapi";
@@ -77,7 +79,10 @@ impl DeploymentInput {
             ));
         }
         validate_identifier(InputField::ContainerName, &self.container_name)?;
-        validate_directory(&self.directory)?;
+        match &self.target {
+            DeploymentTargetInput::Local => validate_directory(&self.directory)?,
+            DeploymentTargetInput::Ssh { .. } => validate_remote_directory(&self.directory)?,
+        }
         validate_bind(InputField::NewApiBind, &self.newapi_bind)?;
         validate_bind(InputField::KumaBind, &self.kuma_bind)?;
         if self.newapi_port == 0 || self.kuma_port == 0 {
@@ -306,6 +311,17 @@ pub fn validate_directory(directory: &std::path::Path) -> ValidationResult<()> {
     Ok(())
 }
 
+pub fn validate_remote_directory(directory: &std::path::Path) -> ValidationResult<()> {
+    RemotePath::parse(&directory.to_string_lossy()).map_err(|error| {
+        ValidationError::new(
+            ValidationCode::InvalidDirectory,
+            InputField::Directory,
+            error.to_string(),
+        )
+    })?;
+    Ok(())
+}
+
 pub fn validate_bind(field: InputField, value: &str) -> ValidationResult<()> {
     let field_name = match field {
         InputField::KumaBind => "kuma_bind",
@@ -345,15 +361,23 @@ pub fn is_immutable_image_ref(value: &str) -> bool {
 }
 
 pub fn validate_ssh_destination(value: &str) -> ValidationResult<()> {
-    if value.trim().is_empty()
-        || value
-            .bytes()
-            .any(|byte| matches!(byte, b'\0' | b'\r' | b'\n'))
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed != value
+        || value.starts_with('-')
+        || value.len() > 255
+        || value.bytes().any(|byte| {
+            byte.is_ascii_whitespace()
+                || matches!(
+                    byte,
+                    b'\0' | b'\r' | b'\n' | b';' | b'|' | b'&' | b'<' | b'>' | b'$' | b'`'
+                )
+        })
     {
         return Err(ValidationError::new(
             ValidationCode::InvalidSshDestination,
             InputField::Target,
-            "SSH destination cannot be empty or contain control characters",
+            "SSH destination must be a single host name or user@host without options, whitespace, or control characters",
         ));
     }
     Ok(())
@@ -402,5 +426,21 @@ mod tests {
         assert!(validate_source_url("http://127.0.0.1:8080").is_ok());
         let error = validate_source_url("http://example.com").expect_err("HTTPS is required");
         assert_eq!(error.code, ValidationCode::InvalidSourceUrl);
+    }
+
+    #[test]
+    fn ssh_destination_rejects_option_injection_and_whitespace() {
+        for value in [
+            "-oProxyCommand=sh",
+            "user@example.test other",
+            " user@example.test",
+        ] {
+            assert!(
+                validate_ssh_destination(value).is_err(),
+                "accepted {value:?}"
+            );
+        }
+        assert!(validate_ssh_destination("deploy@example.test").is_ok());
+        assert!(validate_ssh_destination("[::1]:2222").is_ok());
     }
 }

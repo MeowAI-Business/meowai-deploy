@@ -15,6 +15,18 @@ cargo run -- onboard --dry-run
 
 Running `meowai-deploy` or `cargo run` without a subcommand only prints help. It never starts the wizard implicitly.
 
+On Windows 10/11, the executable is a control client for a Linux host over OpenSSH. It does not
+run Docker locally and `onboard --local` is rejected before source credentials are requested:
+
+```powershell
+meowai-deploy bootstrap
+meowai-deploy doctor --ssh user@linux-host
+meowai-deploy onboard --ssh user@linux-host
+```
+
+The same commands work from `cmd.exe`, PowerShell 5.1, and PowerShell 7. Use `--json` for
+non-interactive diagnostics; the report has a versioned schema and never includes credentials.
+
 ## Image version
 
 At the image step, `onboard` resolves the manifest currently published as `latest` in `ghcr.io/moorcorpa/new-api-outgap` and stores its immutable `sha256:` digest. A source commit that fails to build or push cannot become this default. Leave `image_ref` empty in a non-interactive configuration to use the same resolution; provide a commit SHA or digest only when intentionally pinning another build.
@@ -40,6 +52,10 @@ meowai-deploy doctor --json
 
 The command checks the supported architecture, Docker, Docker Compose, curl, target-directory permissions, and disk space. It does not contact or validate any source URL; source connectivity and account authentication are checked during `onboard` immediately after those values are entered. A failed blocking check exits non-zero. Port selection and conflict handling belong to `onboard`.
 
+On Windows, `doctor` checks the local state directory and OpenSSH Client only. Pass `--ssh
+user@linux-host` to run the Docker, Compose, curl, architecture, directory, and disk checks on the
+Linux target. A saved SSH configuration is not contacted unless `--ssh` is supplied explicitly.
+
 ## Installer
 
 ```bash
@@ -49,6 +65,25 @@ meowai-deploy onboard
 ```
 
 The script supports Linux and macOS on amd64 and arm64. It downloads the matching release archive and checksum list, verifies the selected archive, and installs it to `~/.local/bin` by default. If that directory is not already in `PATH`, the installer adds it to the current user's shell profile. Open a new terminal, or run the one-line `export PATH=...` command printed by the installer, before invoking `meowai-deploy` directly. Set `MEOWAI_DEPLOY_RELEASE_BASE_URL` or `MEOWAI_DEPLOY_INSTALL_DIR` to override those locations.
+
+For Windows, download and run the native PowerShell 5.1/7 installer as the current user:
+
+```powershell
+$installer = Join-Path $env:TEMP 'meowai-deploy-install.ps1'
+Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/MeowAI-Business/meowai-deploy/main/install.ps1 -OutFile $installer
+& $installer
+```
+
+From `cmd.exe`, invoke the same user-scoped installer with:
+
+```bat
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%TEMP%\meowai-deploy-install.ps1"
+```
+
+It verifies `meowai-deploy-windows-amd64.zip`, installs to
+`%LOCALAPPDATA%\Programs\meowai-deploy`, and updates the user-level `PATH` without requiring
+administrator rights. Set `MEOWAI_DEPLOY_RELEASE_BASE_URL` or `MEOWAI_DEPLOY_INSTALL_DIR` before
+running it to use a mirror or another user-owned directory.
 
 ## Version updates
 
@@ -61,4 +96,4 @@ meowai-deploy update --yes
 
 Installed release builds check GitHub Releases at most once every 24 hours in an interactive terminal. A failed check never blocks `doctor`, `onboard`, `sync`, or `status`. The check timestamp is stored in `~/.meowai-deploy/update-check.json`; set `MEOWAI_DEPLOY_DISABLE_UPDATE_CHECK=1` to disable periodic checks.
 
-Release tags use `v<version>` and must match the version in `Cargo.toml`. Pushing such a tag creates a GitHub Release with Linux and macOS archives for amd64 and arm64 plus a combined SHA256 checksum file. Publishing a Release manually runs the same build and uploads or replaces those assets.
+Release tags use `v<version>` and must match the version in `Cargo.toml`. Pushing such a tag creates a GitHub Release with Linux and macOS archives for amd64 and arm64, a Windows amd64 ZIP containing `meowai-deploy.exe`, and a combined SHA256 checksum file. Publishing a Release manually runs the same build and uploads or replaces those assets. Windows self-update selects the `windows-amd64` asset and handles the `.exe` archive path.
