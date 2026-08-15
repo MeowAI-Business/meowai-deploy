@@ -483,6 +483,17 @@ async fn prompt_config(
         Target::Local
     };
     let executor = TargetExecutor::new(target.clone(), directory.clone());
+    if matches!(target, Target::Ssh { .. }) {
+        let progress = spinner();
+        progress.start("正在验证 SSH 连接和部署权限");
+        match executor.validate_access() {
+            Ok(()) => progress.stop("SSH 连接和部署权限可用"),
+            Err(error) => {
+                progress.error("SSH 连接或部署权限不可用");
+                return Err(error);
+            }
+        }
+    }
     let newapi_bind = prompt_bind("站点与网络", "New API 监听地址")?;
     let kuma_bind = prompt_bind("站点与网络", "Uptime Kuma 监听地址")?;
     let newapi_port = prompt_port(

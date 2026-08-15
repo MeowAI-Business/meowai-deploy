@@ -21,6 +21,14 @@ use crate::{
     security::{sha256_hex, write_private_file},
 };
 
+const REMOTE_SCRIPT_RUNNER: &str = r#"if [ "$(id -u)" -eq 0 ]; then
+    exec sh -s
+elif command -v sudo >/dev/null 2>&1 && sudo -n sh -c true >/dev/null 2>&1; then
+    exec sudo -n sh -s
+else
+    exec sh -s
+fi"#;
+
 #[derive(Clone, Debug)]
 pub struct TargetExecutor {
     target: Target,
@@ -53,21 +61,44 @@ impl TargetExecutor {
     }
 
     pub fn prepare(&self) -> Result<()> {
-        if let Target::Ssh { destination } = &self.target {
-            let status = Command::new("ssh")
-                .args(["-o", "ConnectTimeout=10", destination, "true"])
-                .status()
-                .map_err(|error| AppError::Target(format!("failed to start ssh: {error}")))?;
-            if !status.success() {
-                return Err(AppError::Target(format!(
-                    "SSH connection to {destination} failed"
-                )));
-            }
-        }
+        self.validate_access()?;
         self.run_script(&format!(
             "umask 077\nmkdir -p {root}/data/newapi {root}/data/postgres {root}/data/redis {root}/data/uptime-kuma\nchmod 700 {root} {root}/data {root}/data/newapi {root}/data/postgres {root}/data/redis {root}/data/uptime-kuma",
             root = quote_path(&self.directory)
         ))?;
+        Ok(())
+    }
+
+    pub fn validate_access(&self) -> Result<()> {
+        let Target::Ssh { destination } = &self.target else {
+            return Ok(());
+        };
+        let directory = quote_path(&self.directory);
+        let script = format!(
+            r#"set -eu
+if [ "$(id -u)" -eq 0 ]; then
+    exit 0
+fi
+if command -v sudo >/dev/null 2>&1 && sudo -n sh -c true >/dev/null 2>&1; then
+    exit 0
+fi
+path={directory}
+while [ ! -e "$path" ] && [ "$path" != / ]; do
+    path=$(dirname "$path")
+done
+if [ -d "$path" ] && [ -w "$path" ] && docker info >/dev/null 2>&1; then
+    exit 0
+fi
+printf '%s\n' 'SSH 用户不是 root、没有免密 sudo，且无法以当前用户写入部署目录并使用 Docker' >&2
+exit 1"#,
+        );
+        let output = Command::new("ssh")
+            .args(["-o", "ConnectTimeout=10"])
+            .arg(destination)
+            .arg(script)
+            .output()
+            .map_err(|error| AppError::Target(format!("failed to start ssh: {error}")))?;
+        require_success("验证 SSH 连接和部署权限", output)?;
         Ok(())
     }
 
@@ -110,11 +141,7 @@ impl TargetExecutor {
                     .map_err(|error| AppError::Target(format!("create upload file: {error}")))?;
                 fs::write(temporary.path(), content)
                     .map_err(|error| AppError::Target(format!("write upload file: {error}")))?;
-                let remote_temporary = format!(
-                    "{}.tmp-{}",
-                    destination.to_string_lossy(),
-                    std::process::id()
-                );
+                let remote_temporary = remote_upload_path(relative, temporary.path());
                 let remote_spec = format!("{host}:{remote_temporary}");
                 let output = Command::new("scp")
                     .args(["-q", "-p"])
@@ -125,7 +152,7 @@ impl TargetExecutor {
                 require_success("scp upload", output)?;
                 let mode = if private { "600" } else { "644" };
                 self.run_script(&format!(
-                    "chmod {mode} {temporary}\nmv {temporary} {destination}",
+                    "temporary={temporary}\ntrap 'rm -f \"$temporary\"' EXIT HUP INT TERM\nchmod {mode} \"$temporary\"\nmv \"$temporary\" {destination}",
                     temporary = quote(&remote_temporary),
                     destination = quote_path(&destination)
                 ))?;
@@ -280,7 +307,7 @@ docker --config "$registry_config" pull --platform linux/amd64 {image}"#,
             Target::Ssh { destination } => {
                 let mut child = Command::new("ssh")
                     .arg(destination)
-                    .args(["sh", "-s"])
+                    .arg(REMOTE_SCRIPT_RUNNER)
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
@@ -330,6 +357,19 @@ fn quote(value: &str) -> String {
     escape(Cow::Borrowed(value)).into_owned()
 }
 
+fn remote_upload_path(relative: &str, local_temporary: &Path) -> String {
+    let identity = format!(
+        "{}:{relative}:{}",
+        std::process::id(),
+        local_temporary.display()
+    );
+    format!(
+        "/tmp/meowai-deploy-upload-{}-{}",
+        std::process::id(),
+        &sha256_hex(identity.as_bytes())[..16]
+    )
+}
+
 fn require_success(operation: &str, output: Output) -> Result<Output> {
     if output.status.success() {
         Ok(output)
@@ -374,5 +414,32 @@ mod tests {
             .allocate_port(occupied, &[])
             .expect("find the next available port");
         assert_ne!(selected, occupied);
+    }
+
+    #[test]
+    fn remote_scripts_support_root_passwordless_sudo_and_unprivileged_users() {
+        assert!(REMOTE_SCRIPT_RUNNER.contains("id -u"));
+        assert!(REMOTE_SCRIPT_RUNNER.contains("sudo -n sh -c true"));
+        assert!(REMOTE_SCRIPT_RUNNER.contains("sudo -n sh -s"));
+        assert!(REMOTE_SCRIPT_RUNNER.contains("exec sh -s"));
+    }
+
+    #[test]
+    fn remote_uploads_use_a_temporary_directory_writable_by_the_ssh_user() {
+        let path = remote_upload_path("docker-compose.yml", Path::new("/tmp/local-a"));
+        assert!(path.starts_with("/tmp/meowai-deploy-upload-"));
+        assert!(!path.contains("docker-compose.yml"));
+        assert_eq!(
+            path,
+            remote_upload_path("docker-compose.yml", Path::new("/tmp/local-a"))
+        );
+        assert_ne!(
+            path,
+            remote_upload_path("secrets.env", Path::new("/tmp/local-a"))
+        );
+        assert_ne!(
+            path,
+            remote_upload_path("docker-compose.yml", Path::new("/tmp/local-b"))
+        );
     }
 }
