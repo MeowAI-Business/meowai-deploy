@@ -34,6 +34,17 @@ jobs:
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal
 
+      - name: Cache Rust build
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
+
       - name: Verify tag matches Cargo version
         shell: bash
         run: |
@@ -80,6 +91,7 @@ jobs:
       - name: Create GitHub Release
         if: github.event_name == 'push'
         env:
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
         run: >-
           gh release create "${GITHUB_REF_NAME}"
@@ -92,6 +104,7 @@ jobs:
       - name: Upload assets to published Release
         if: github.event_name == 'release'
         env:
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
         run: >-
           gh release upload "${GITHUB_REF_NAME}"
