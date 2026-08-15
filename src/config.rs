@@ -22,6 +22,7 @@ use crate::{
 };
 
 pub const DEFAULT_SOURCE_URL: &str = "https://enterprise.meowai.net";
+pub const DEFAULT_WEBSITE_NAME: &str = "Meow AI Downstream";
 pub const DEFAULT_NEWAPI_PORT: u16 = 3000;
 pub const DEFAULT_KUMA_PORT: u16 = 3001;
 pub const DEFAULT_IMAGE: &str = "ghcr.io/moorcorpa/new-api-outgap";
@@ -68,7 +69,7 @@ impl Default for DeploymentConfig {
             source_account_mode: SourceAccountMode::Login,
             source_username: String::new(),
             source_password: None,
-            website_name: String::new(),
+            website_name: DEFAULT_WEBSITE_NAME.to_owned(),
             container_name: "newapi".to_owned(),
             directory: PathBuf::from("/opt/meowai-deploy/newapi"),
             newapi_bind: "0.0.0.0".to_owned(),
@@ -100,7 +101,7 @@ impl DeploymentConfig {
 source_url = "https://enterprise.meowai.net"
 source_account_mode = "login"
 source_username = ""
-website_name = ""
+website_name = "Meow AI Downstream"
 container_name = "newapi"
 directory = "/opt/meowai-deploy/newapi"
 newapi_bind = "0.0.0.0"
@@ -136,7 +137,7 @@ image_ref = ""
 
     pub fn normalize(&mut self) {
         if self.website_name.trim().is_empty() {
-            self.website_name = self.container_name.clone();
+            self.website_name = DEFAULT_WEBSITE_NAME.to_owned();
         }
         if self.directory.as_os_str().is_empty() {
             self.directory = PathBuf::from(format!("/opt/meowai-deploy/{}", self.container_name));
@@ -450,8 +451,7 @@ async fn prompt_config(
     prompt_screen("站点与网络")?;
     let website_name: String = prompt_io(
         input("网站名称")
-            .placeholder("例如：Acme AI（回车使用容器名）")
-            .required(false)
+            .default_input(DEFAULT_WEBSITE_NAME)
             .interact(),
     )?;
     let container_name = prompt_container_name()?;
@@ -832,11 +832,13 @@ mod tests {
     #[test]
     fn defaults_are_deploy_defaults() {
         let mut config = DeploymentConfig::default();
+        assert_eq!(config.website_name, DEFAULT_WEBSITE_NAME);
+        config.website_name.clear();
         config.normalize();
         config.image_ref =
             "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned();
         assert_eq!(config.container_name, "newapi");
-        assert_eq!(config.website_name, "newapi");
+        assert_eq!(config.website_name, DEFAULT_WEBSITE_NAME);
         assert_eq!(config.newapi_port, DEFAULT_NEWAPI_PORT);
         assert_eq!(config.kuma_port, DEFAULT_KUMA_PORT);
         assert!(config.validate().is_ok());
