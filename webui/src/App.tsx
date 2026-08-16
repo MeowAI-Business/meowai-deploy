@@ -689,6 +689,7 @@ export default function App() {
       setOperationFailure(null);
       setOperationProgress(0);
       setCurrentStage(null);
+      setOperationResult(null);
       try {
         const result = await request<{ operation_id: string }>("/api/operations", {
           method: "POST",

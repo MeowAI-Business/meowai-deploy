@@ -1768,6 +1768,17 @@ fn get_operation(state: &WebState, operation_id: &str) -> ApiResult<Arc<WebOpera
         .ok_or_else(|| ApiError::bad_request("OPERATION_NOT_FOUND", "找不到本机操作"))
 }
 
+fn deployment_access_url(config: &DeploymentConfig, port: u16) -> String {
+    let host = match &config.target {
+        crate::config::Target::Local => "localhost".to_owned(),
+        crate::config::Target::Ssh { destination } => destination
+            .rsplit_once('@')
+            .map(|(_, host)| host.to_owned())
+            .unwrap_or_else(|| destination.clone()),
+    };
+    format!("http://{host}:{port}")
+}
+
 fn operation_view(operation: &WebOperation, reveal_credentials: bool) -> ApiResult<OperationView> {
     let checkpoint = operation
         .checkpoint
@@ -1906,6 +1917,8 @@ async fn run_onboard_operation(
                 )
             })?
             .clone();
+        let newapi_url = deployment_access_url(&config, config.newapi_port);
+        let kuma_url = deployment_access_url(&config, config.kuma_port);
         let mut backend =
             ProductionOnboardBackend::new(config, source, identity).with_ssh_password(ssh_password);
         if rotate_status_key {
@@ -2004,6 +2017,8 @@ async fn run_onboard_operation(
         })? = Some(serde_json::json!({
             "kind": "onboard",
             "operation_id": outcome.operation_id,
+            "newapi_url": newapi_url,
+            "kuma_url": kuma_url,
         }));
         Ok::<(), ApplicationError>(())
     }

@@ -186,6 +186,10 @@ button:focus-visible, input:focus-visible { outline: 3px solid color-mix(in srgb
 .credential-row { min-height: 44px; border-top: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; gap: 18px; font-size: 12px; }
 .credential-row span { color: var(--text-secondary); }
 .credential-row code { color: var(--text); overflow-wrap: anywhere; text-align: right; }
+.service-links { margin-top: 30px; padding-top: 22px; border-top: 1px solid var(--border); }
+.service-links > strong { display: block; margin-bottom: 13px; font-size: 14px; }
+.service-link-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.service-link-actions a { text-decoration: none; }
 
 .inline-error { width: fit-content; max-width: 690px; margin-top: 28px; padding: 10px 11px 10px 13px; border-radius: 7px; background: var(--danger-soft); color: var(--danger); display: flex; align-items: center; gap: 9px; font-size: 12px; line-height: 1.45; }
 .inline-error > svg { flex: 0 0 auto; }
@@ -263,6 +267,7 @@ button:focus-visible, input:focus-visible { outline: 3px solid color-mix(in srgb
   .dialog-actions > button { width: 100%; }
   .credential-row { align-items: flex-start; flex-direction: column; gap: 5px; padding: 10px 0; }
   .credential-row code { text-align: left; }
+  .service-link-actions { flex-direction: column; align-items: stretch; }
   .operation-failure > div { flex-direction: column; gap: 6px; }
   .operation-resume-auth.has-ssh { grid-template-columns: 1fr; }
   .log-entry { grid-template-columns: 56px minmax(0, 1fr); gap: 7px 10px; }

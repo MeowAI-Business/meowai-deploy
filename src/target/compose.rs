@@ -184,7 +184,6 @@ impl DeploymentRuntime {
             .map(|content| DeploymentSecrets::parse(&content))
             .transpose()?;
 
-        let was_existing = existing_state.is_some();
         let mut state = match existing_state {
             Some(state) => {
                 validate_existing_state(config, &target_fingerprint, &state)?;
@@ -269,11 +268,11 @@ impl DeploymentRuntime {
             }
         };
         let container_source_url = container_source_url(&config.source_url)?;
-        let credentials_should_display = !was_existing
-            || state
-                .phases
-                .get("base_stack")
-                .is_none_or(|phase| phase.status != "DONE");
+        // Onboard completion must always return the credentials once. This also
+        // covers a deployment that failed mid-flight and was later resumed.
+        // The WebUI consumes them one time and never persists them in the
+        // browser.
+        let credentials_should_display = true;
         let runtime = Self {
             executor,
             state,
