@@ -2,7 +2,8 @@ use std::env;
 
 use reqwest::{Client, Response, StatusCode, header};
 use secrecy::{ExposeSecret, SecretString};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use url::Url;
 
@@ -17,6 +18,16 @@ const MANIFEST_ACCEPT: &str = concat!(
 
 pub async fn latest_image_digest(image: &str) -> Result<String> {
     RegistryClient::new(image)?.latest_digest().await
+}
+
+pub async fn latest_image_metadata(image: &str) -> Result<ImageMetadata> {
+    RegistryClient::new(image)?.latest_metadata().await
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ImageMetadata {
+    pub digest: String,
+    pub updated_at: Option<String>,
 }
 
 #[derive(Clone)]
@@ -120,6 +131,27 @@ impl RegistryClient {
     }
 
     async fn latest_digest(&self) -> Result<String> {
+        let (response, _) = self.latest_manifest().await?;
+        Ok(manifest_document(response).await?.0)
+    }
+
+    async fn latest_metadata(&self) -> Result<ImageMetadata> {
+        let (response, token) = self.latest_manifest().await?;
+        let (digest, document) = manifest_document(response).await?;
+        let updated_at = match document {
+            Some(document) => self
+                .resolve_created_time(&document, token.as_deref())
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::debug!(%error, "image creation time is unavailable");
+                    None
+                }),
+            None => None,
+        };
+        Ok(ImageMetadata { digest, updated_at })
+    }
+
+    async fn latest_manifest(&self) -> Result<(Response, Option<String>)> {
         let manifest_url = self
             .base_url
             .join(&format!("/v2/{}/manifests/latest", self.repository))
@@ -127,24 +159,25 @@ impl RegistryClient {
         tracing::debug!(registry = %self.registry, repository = %self.repository, "requesting latest image manifest");
         let response = self.manifest_request(manifest_url.clone(), None).await?;
         tracing::debug!(status = %response.status(), "latest image manifest response received");
-        if response.status() != StatusCode::UNAUTHORIZED {
-            return manifest_digest(response).await;
-        }
-
-        let challenge = response
-            .headers()
-            .get(header::WWW_AUTHENTICATE)
-            .and_then(|value| value.to_str().ok())
-            .ok_or_else(|| {
-                AppError::Message(
-                    "registry requires authentication without a Bearer challenge".to_owned(),
-                )
-            })
-            .and_then(parse_bearer_challenge)?;
-        let token = self.fetch_token(challenge).await?;
-        let response = self.manifest_request(manifest_url, Some(&token)).await?;
-        tracing::debug!(status = %response.status(), "authenticated image manifest response received");
-        manifest_digest(response).await
+        let (response, token) = if response.status() == StatusCode::UNAUTHORIZED {
+            let challenge = response
+                .headers()
+                .get(header::WWW_AUTHENTICATE)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| {
+                    AppError::Message(
+                        "registry requires authentication without a Bearer challenge".to_owned(),
+                    )
+                })
+                .and_then(parse_bearer_challenge)?;
+            let token = self.fetch_token(challenge).await?;
+            let response = self.manifest_request(manifest_url, Some(&token)).await?;
+            tracing::debug!(status = %response.status(), "authenticated image manifest response received");
+            (response, Some(token))
+        } else {
+            (response, None)
+        };
+        Ok((response, token))
     }
 
     async fn manifest_request(&self, url: Url, token: Option<&str>) -> Result<Response> {
@@ -156,6 +189,60 @@ impl RegistryClient {
             .send()
             .await
             .map_err(|error| AppError::Message(format!("request image manifest: {error}")))
+    }
+
+    async fn resolve_created_time(
+        &self,
+        document: &Value,
+        token: Option<&str>,
+    ) -> Result<Option<String>> {
+        if let Some(created) = image_created_annotation(document) {
+            return Ok(Some(created));
+        }
+        let manifest = if let Some(digest) = linux_amd64_manifest_digest(document) {
+            let url = self
+                .base_url
+                .join(&format!("/v2/{}/manifests/{digest}", self.repository))
+                .map_err(|error| {
+                    AppError::Message(format!("build platform manifest URL: {error}"))
+                })?;
+            let response = self.manifest_request(url, token).await?;
+            let (_, document) = manifest_document(response).await?;
+            document
+        } else {
+            Some(document.clone())
+        };
+        let Some(config_digest) = manifest
+            .as_ref()
+            .and_then(|manifest| manifest.pointer("/config/digest"))
+            .and_then(Value::as_str)
+        else {
+            return Ok(None);
+        };
+        validate_digest(config_digest)?;
+        let url = self
+            .base_url
+            .join(&format!("/v2/{}/blobs/{config_digest}", self.repository))
+            .map_err(|error| AppError::Message(format!("build image config URL: {error}")))?;
+        let mut request = self.client.get(url);
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| AppError::Message(format!("request image config: {error}")))?;
+        if !response.status().is_success() {
+            return Ok(None);
+        }
+        let config: Value = response
+            .json()
+            .await
+            .map_err(|error| AppError::Message(format!("decode image config: {error}")))?;
+        Ok(config
+            .get("created")
+            .and_then(Value::as_str)
+            .map(str::to_owned))
     }
 
     async fn fetch_token(&self, challenge: BearerChallenge) -> Result<String> {
@@ -225,7 +312,7 @@ fn parse_bearer_challenge(value: &str) -> Result<BearerChallenge> {
     })
 }
 
-async fn manifest_digest(response: Response) -> Result<String> {
+async fn manifest_document(response: Response) -> Result<(String, Option<Value>)> {
     if !response.status().is_success() {
         return Err(AppError::Message(format!(
             "latest image manifest request failed with HTTP {}",
@@ -243,7 +330,29 @@ async fn manifest_digest(response: Response) -> Result<String> {
         .map_err(|error| AppError::Message(format!("read image manifest: {error}")))?;
     let digest = header_digest.unwrap_or_else(|| format!("sha256:{:x}", Sha256::digest(&body)));
     validate_digest(&digest)?;
-    Ok(digest)
+    let document = serde_json::from_slice(&body).ok();
+    Ok((digest, document))
+}
+
+fn image_created_annotation(document: &Value) -> Option<String> {
+    document
+        .pointer("/annotations/org.opencontainers.image.created")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+fn linux_amd64_manifest_digest(document: &Value) -> Option<&str> {
+    document
+        .get("manifests")?
+        .as_array()?
+        .iter()
+        .find_map(|manifest| {
+            let platform = manifest.get("platform")?;
+            (platform.get("os")?.as_str()? == "linux"
+                && platform.get("architecture")?.as_str()? == "amd64")
+                .then(|| manifest.get("digest")?.as_str())
+                .flatten()
+        })
 }
 
 fn validate_digest(value: &str) -> Result<()> {
@@ -267,6 +376,10 @@ mod tests {
     };
 
     const DIGEST: &str = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const CONFIG_DIGEST: &str =
+        "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    const MANIFEST_DIGEST: &str =
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 
     #[tokio::test]
     async fn resolves_digest_after_registry_bearer_authentication() {
@@ -325,7 +438,100 @@ mod tests {
             }),
         )
         .expect("registry client");
-        assert_eq!(client.latest_digest().await.expect("latest digest"), DIGEST);
+        let metadata = client.latest_metadata().await.expect("latest metadata");
+        assert_eq!(metadata.digest, DIGEST);
+        assert_eq!(metadata.updated_at, None);
+    }
+
+    #[tokio::test]
+    async fn reads_image_creation_time_from_the_config_blob() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/moorcorpa/new-api-outgap/manifests/latest"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("docker-content-digest", DIGEST)
+                    .set_body_json(serde_json::json!({
+                        "schemaVersion": 2,
+                        "config": {"digest": CONFIG_DIGEST}
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/v2/moorcorpa/new-api-outgap/blobs/{CONFIG_DIGEST}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "created": "2026-08-16T10:00:00Z"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = RegistryClient::with_base(
+            "ghcr.io/moorcorpa/new-api-outgap",
+            Url::parse(&server.uri()).expect("mock URL"),
+        )
+        .expect("registry client");
+
+        let metadata = client.latest_metadata().await.expect("latest metadata");
+
+        assert_eq!(metadata.digest, DIGEST);
+        assert_eq!(metadata.updated_at.as_deref(), Some("2026-08-16T10:00:00Z"));
+    }
+
+    #[tokio::test]
+    async fn reads_linux_amd64_creation_time_from_an_image_index() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/moorcorpa/new-api-outgap/manifests/latest"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("docker-content-digest", DIGEST)
+                    .set_body_json(serde_json::json!({
+                        "schemaVersion": 2,
+                        "manifests": [{
+                            "digest": MANIFEST_DIGEST,
+                            "platform": {"os": "linux", "architecture": "amd64"}
+                        }]
+                    })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/v2/moorcorpa/new-api-outgap/manifests/{MANIFEST_DIGEST}"
+            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("docker-content-digest", MANIFEST_DIGEST)
+                    .set_body_json(serde_json::json!({
+                        "schemaVersion": 2,
+                        "config": {"digest": CONFIG_DIGEST}
+                    })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/v2/moorcorpa/new-api-outgap/blobs/{CONFIG_DIGEST}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "created": "2026-08-16T11:00:00Z"
+            })))
+            .mount(&server)
+            .await;
+        let client = RegistryClient::with_base(
+            "ghcr.io/moorcorpa/new-api-outgap",
+            Url::parse(&server.uri()).expect("mock URL"),
+        )
+        .expect("registry client");
+
+        let metadata = client.latest_metadata().await.expect("latest metadata");
+
+        assert_eq!(metadata.digest, DIGEST);
+        assert_eq!(metadata.updated_at.as_deref(), Some("2026-08-16T11:00:00Z"));
     }
 
     #[tokio::test]
@@ -341,6 +547,6 @@ mod tests {
             Url::parse(&server.uri()).expect("mock URL"),
         )
         .expect("registry client");
-        assert!(client.latest_digest().await.is_err());
+        assert!(client.latest_metadata().await.is_err());
     }
 }

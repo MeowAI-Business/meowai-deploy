@@ -2,36 +2,43 @@
 
 ## Mode
 
-Operate. The first screen is the deployment workbench, not a marketing surface.
+Operate. The first screen is the deployment workflow, not a dashboard or marketing surface.
 
 ## Visual World
 
-The interface is a deployment calibration bench: a pale work surface, graphite text,
-signal orange for the current action, teal for verified state, and yellow for attention.
-The left route spine shows the real five-step deployment sequence. The center surface is
-the only place where the current task is completed. The right check rail keeps safety and
-next-action context visible without becoming a dashboard.
+The WebUI follows the familiar NewAPI product language: compact system sans typography, restrained
+neutral surfaces, blue primary actions, green completion states, thin dividers, and small-radius
+controls. It automatically follows the operating system's light or dark color preference.
+
+## Layout
+
+- The page heading carries the close action; there is no separate application header.
+- A conventional horizontal five-step indicator shows workflow position.
+- One centered workflow panel contains the active form, validation, and navigation actions.
+- The onboarding surface contains only the deployment workflow; daily management actions do not share this form.
+- Narrow layouts keep all five steps visible and collapse multi-column fields to one column.
+
+## Interaction
+
+- Deployment location is a segmented choice between local and SSH deployment.
+- Linux and macOS default to local deployment; unsupported platforms select SSH and disable local.
+- SSH-specific fields appear only when SSH is selected.
+- Entering site settings resolves the latest immutable image digest automatically and shows its relative image creation time when registry metadata provides one.
+- Progress, failure recovery, and generated credentials remain in the same central workflow.
+- Closing the WebUI stops the local server process; terminal interrupt signals do the same.
 
 ## Tokens
 
-- Ground: `#eef0eb`
-- Paper: `#f7f8f4`
-- Ink: `#1d2730`
-- Signal orange: `#ed6a4b`
-- Safety teal: `#1d9d95`
-- Attention yellow: `#e0b73a`
-- UI mono: system monospace stack
-- Body: Avenir Next, Segoe UI, system sans-serif
-
-## Signature
-
-The route spine and check rail frame one calm current work surface. Progress is shown as a
-physical route with stable nodes and a single moving fill, so the user always knows where
-the deployment is and what can be done next.
+- Light background / surface: `#f7f7f8` / `#ffffff`
+- Dark background / surface: `#191919` / `#242424`
+- Primary: `#2563eb` light, `#3b82f6` dark
+- Success: `#059669` light, `#34d399` dark
+- UI font: Public Sans with native system and CJK fallbacks
+- Radius: 6-8px for controls and framed surfaces
 
 ## Quality Bar
 
 - Use both `impeccable` and `frontend-design` for future WebUI edits.
 - Keep keyboard focus visible and motion reduced when requested.
-- Verify desktop and narrow mobile layouts in the browser.
-- Keep secrets out of persistent browser storage and visible URL state.
+- Keep copy user-facing; do not expose implementation, security, or test-stage commentary in the UI.
+- Keep secrets out of persistent browser storage and visible URL state after bootstrap exchange.

@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 
 use super::{
     error::{ApplicationError, ApplicationResult, ErrorCategory, app_error, source_error},
-    operation::CancellationToken,
+    operation::{CancellationToken, OperationStage},
     source::persist_source_session,
 };
 use crate::{
@@ -90,6 +91,21 @@ pub async fn sync_deployment(
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error),
     }
+}
+
+pub async fn sync_deployment_with_progress(
+    config: &DeploymentConfig,
+    source: &mut SourceClient,
+    request: SyncDeploymentRequest,
+    cancellation: &CancellationToken,
+    progress: &mut (dyn FnMut(OperationStage, &str) + Send),
+) -> ApplicationResult<SyncDeploymentOutcome> {
+    progress(OperationStage::BaseServices, "正在同步部署服务");
+    let result = sync_deployment(config, source, request, cancellation).await;
+    if result.is_ok() {
+        progress(OperationStage::FinalVerification, "同步部署已完成");
+    }
+    result
 }
 
 async fn sync_deployment_inner(
@@ -334,8 +350,19 @@ pub async fn rollback_deployment(
     revoke_source: bool,
     cancellation: &CancellationToken,
 ) -> ApplicationResult<RollbackDeploymentOutcome> {
+    rollback_deployment_with_ssh_password(config, source, revoke_source, cancellation, None).await
+}
+
+pub async fn rollback_deployment_with_ssh_password(
+    config: &DeploymentConfig,
+    source: Option<&mut SourceClient>,
+    revoke_source: bool,
+    cancellation: &CancellationToken,
+    ssh_password: Option<SecretString>,
+) -> ApplicationResult<RollbackDeploymentOutcome> {
     check_cancellation(cancellation)?;
-    let executor = TargetExecutor::new(config.target.clone(), config.directory.clone());
+    let executor = TargetExecutor::new(config.target.clone(), config.directory.clone())
+        .with_ssh_password(ssh_password);
     executor.validate_access().map_err(app_error)?;
     let state = load_saved_deployment_state()?;
     if let Some(state) = &state {
@@ -439,7 +466,7 @@ fn string_field(value: &serde_json::Value, name: &str, default: &str) -> String 
 
 fn clean_downstream(config: &DeploymentConfig, executor: &TargetExecutor) -> ApplicationResult<()> {
     executor
-        .compose(&config.container_name, &["down", "--remove-orphans"])
+        .remove_compose_project(&config.container_name)
         .map_err(app_error)?;
     executor
         .run_in_directory("rm -f secrets.env docker-compose.yml kuma-helper.js\nrm -rf data")

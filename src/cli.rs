@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{net::IpAddr, path::PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 
@@ -51,7 +51,15 @@ pub struct BootstrapArgs {
 
 #[derive(Debug, Args)]
 pub struct WebArgs {
-    /// Print the loopback URL without opening a browser.
+    /// Address to listen on.
+    #[arg(long, default_value = "0.0.0.0")]
+    pub host: IpAddr,
+
+    /// Port to listen on; 0 selects an available port automatically.
+    #[arg(long, default_value_t = 0)]
+    pub port: u16,
+
+    /// Print the WebUI URL without opening a browser.
     #[arg(long)]
     pub no_open: bool,
 }

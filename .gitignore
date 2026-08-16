@@ -9,3 +9,5 @@ deployment.toml
 
 webui/node_modules/
 webui/dist/
+webui/test-results/
+webui/playwright-report/

@@ -65,6 +65,9 @@ impl Theme for MeowAiTheme {
 
 #[tokio::main]
 async fn main() {
+    if let Some(exit_code) = target::ssh_askpass_exit_code() {
+        std::process::exit(exit_code);
+    }
     if let Err(error) = run().await {
         if !matches!(error, AppError::Cancelled) {
             eprintln!("error: {error}");

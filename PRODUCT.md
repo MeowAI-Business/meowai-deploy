@@ -31,21 +31,24 @@ not a hosted dashboard and never exposes the control server beyond the local mac
 
 ## Operating Context
 
-The browser talks only to a random-port loopback server started by `meowai-deploy web` or a double
-click. A short-lived bootstrap token in the URL fragment is exchanged for an HttpOnly session
-cookie. The server then calls the shared application layer and the system OpenSSH client to reach
-a customer-provided Linux host. Production source URLs are excluded from tests.
+The browser talks to an HTTP server started by `meowai-deploy web` or a double click. It listens on
+`0.0.0.0` and a random available port by default, with explicit host and port overrides for local
+or LAN access. A short-lived bootstrap token in the URL fragment is exchanged for an HttpOnly
+session cookie. The server then calls the shared application layer and either deploys locally on a
+supported host or uses the system OpenSSH client to reach another server. Production source URLs
+are excluded from tests.
 
 ## Capabilities and Constraints
 
-- Loopback-only binding, single-instance behavior, one-time bootstrap exchange, CSRF and Origin/Host
+- Configurable binding, single-instance behavior, one-time bootstrap exchange, CSRF and Origin/Host
   checks, strict security headers, no-cache responses, SSE operation events, and graceful timeout.
-- The browser must not receive source passwords, SSH credentials, access tokens, admin passwords, or
-  signing keys through URLs, persistent browser storage, telemetry, or static assets.
+- Source and optional SSH passwords may exist only in the current form state and request body. No
+  credential may enter URLs, persistent browser storage, telemetry, logs, or static assets.
 - The UI covers onboarding, preview, deployment progress, cancellation/recovery, status, sync,
   clean, rollback, and clear failure recovery.
-- Windows is an SSH control client only; local deployment is rejected before source credentials are
-  read. Real Windows double-click, UAC, browser, and Windows-to-Linux acceptance remain manual.
+- Linux and macOS can deploy locally or over SSH. Windows is an SSH control client only; local
+  deployment is rejected before source credentials are read. Real Windows double-click, UAC,
+  browser, and Windows-to-Linux acceptance remain manual.
 
 ## Brand Commitments
 

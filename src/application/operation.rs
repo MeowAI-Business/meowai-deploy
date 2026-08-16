@@ -169,6 +169,8 @@ pub struct OperationFailure {
     pub code: String,
     pub message: String,
     pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -244,6 +246,17 @@ impl OperationCheckpoint {
         message: impl Into<String>,
         retryable: bool,
     ) -> Result<(), OperationTransitionError> {
+        self.fail_with_diagnostic(stage, code, message, retryable, None)
+    }
+
+    pub fn fail_with_diagnostic(
+        &mut self,
+        stage: OperationStage,
+        code: impl Into<String>,
+        message: impl Into<String>,
+        retryable: bool,
+        diagnostic: Option<String>,
+    ) -> Result<(), OperationTransitionError> {
         self.require_status(OperationStatus::Running)?;
         self.status = OperationStatus::Failed;
         self.current_stage = Some(stage);
@@ -252,6 +265,7 @@ impl OperationCheckpoint {
             code: code.into(),
             message: message.into(),
             retryable,
+            diagnostic,
         });
         self.updated_at = unix_timestamp();
         Ok(())
@@ -398,6 +412,16 @@ impl<S: EventSink> OperationTracker<S> {
         );
     }
 
+    pub fn message(&mut self, stage: OperationStage, message: impl Into<String>) {
+        self.emit(
+            Some(stage),
+            EventSeverity::Info,
+            OperationEventKind::Message,
+            message,
+            None,
+        );
+    }
+
     pub fn credential_generated(&mut self, stage: OperationStage, credential_kind: String) {
         self.emit(
             Some(stage),
@@ -461,11 +485,12 @@ impl<S: EventSink> OperationTracker<S> {
             .checkpoint
             .current_stage
             .ok_or(OperationTransitionError::NoCurrentStage)?;
-        self.checkpoint.fail(
+        self.checkpoint.fail_with_diagnostic(
             stage,
             error.code.clone(),
             error.message.clone(),
             error.retryable,
+            error.diagnostic.clone(),
         )?;
         self.emit(
             Some(stage),
@@ -641,5 +666,39 @@ mod tests {
         assert_eq!(events[0].sequence, 1);
         assert_eq!(events[3].sequence, 4);
         assert_eq!(tracker.checkpoint().status, OperationStatus::Completed);
+    }
+
+    #[test]
+    fn failure_diagnostic_is_available_in_checkpoint_and_event_history() {
+        let sink = CollectedEventSink::default();
+        let mut tracker =
+            OperationTracker::new("operation-failure", OperationKind::Onboard, sink.clone());
+        tracker.start("start").expect("start operation");
+        tracker
+            .start_stage(OperationStage::TargetValidation, "validate target")
+            .expect("start stage");
+        let error = ApplicationError::new(
+            super::super::error::ErrorCategory::Target,
+            "SSH_FAILED",
+            "SSH 连接失败",
+            true,
+        )
+        .with_diagnostic("ssh exited with status 255");
+        tracker.fail_current_error(&error).expect("record failure");
+
+        assert_eq!(
+            tracker
+                .checkpoint()
+                .failure
+                .as_ref()
+                .and_then(|failure| failure.diagnostic.as_deref()),
+            Some("ssh exited with status 255")
+        );
+        assert_eq!(
+            sink.events()
+                .last()
+                .and_then(|event| event.diagnostic.as_deref()),
+            Some("ssh exited with status 255")
+        );
     }
 }

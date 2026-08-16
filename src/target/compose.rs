@@ -131,7 +131,26 @@ impl DeploymentRuntime {
         status_key_id: i64,
         issued_status_key: Option<&SecretString>,
     ) -> Result<Self> {
-        let executor = TargetExecutor::new(config.target.clone(), config.directory.clone());
+        Self::prepare_with_ssh_password(
+            config,
+            source_user_id,
+            source_group_sha256,
+            status_key_id,
+            issued_status_key,
+            None,
+        )
+    }
+
+    pub fn prepare_with_ssh_password(
+        config: &DeploymentConfig,
+        source_user_id: i64,
+        source_group_sha256: &str,
+        status_key_id: i64,
+        issued_status_key: Option<&SecretString>,
+        ssh_password: Option<SecretString>,
+    ) -> Result<Self> {
+        let executor = TargetExecutor::new(config.target.clone(), config.directory.clone())
+            .with_ssh_password(ssh_password);
         executor.prepare()?;
         let target_fingerprint = executor.fingerprint()?;
         let existing_state = load_state()?;
@@ -146,16 +165,26 @@ impl DeploymentRuntime {
                 state
             }
             None => {
-                let newapi_port = executor.allocate_port(config.newapi_port, &[])?;
-                let kuma_port = executor.allocate_port(config.kuma_port, &[newapi_port])?;
+                if !executor.is_port_available(config.newapi_port)? {
+                    return Err(AppError::Target(format!(
+                        "New API 端口 {} 已被占用，请返回站点设置选择其他端口",
+                        config.newapi_port
+                    )));
+                }
+                if !executor.is_port_available(config.kuma_port)? {
+                    return Err(AppError::Target(format!(
+                        "Uptime Kuma 端口 {} 已被占用，请返回站点设置选择其他端口",
+                        config.kuma_port
+                    )));
+                }
                 DeploymentState {
                     schema_version: 1,
                     deployment_id: config.deployment_id(),
                     target_fingerprint: target_fingerprint.clone(),
                     container_name: config.container_name.clone(),
                     directory: config.directory.to_string_lossy().into_owned(),
-                    newapi_port,
-                    kuma_port,
+                    newapi_port: config.newapi_port,
+                    kuma_port: config.kuma_port,
                     image: config.image.clone(),
                     image_ref: config.image_ref.clone(),
                     image_digest: String::new(),
