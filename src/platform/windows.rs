@@ -15,7 +15,7 @@ use windows_sys::{
     Win32::{
         Foundation::{
             CloseHandle, ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, ERROR_SUCCESS, GetLastError,
-            LocalFree,
+            INVALID_HANDLE_VALUE, LocalFree,
         },
         Security::{
             ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
@@ -35,8 +35,12 @@ use windows_sys::{
         },
         System::{
             Com::CoTaskMemFree,
+            Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+                TH32CS_SNAPPROCESS,
+            },
             SystemServices::ACCESS_ALLOWED_ACE_TYPE,
-            Threading::{GetCurrentProcess, OpenProcessToken},
+            Threading::{GetCurrentProcess, GetCurrentProcessId, OpenProcessToken},
         },
         UI::Shell::{FOLDERID_Profile, KF_FLAG_DEFAULT, SHGetKnownFolderPath},
     },
@@ -48,6 +52,60 @@ pub fn user_profile_directory() -> Option<PathBuf> {
         return Some(PathBuf::from(path));
     }
     known_profile_directory().ok()
+}
+
+pub fn launched_from_desktop_shell() -> bool {
+    parent_process_name()
+        .as_deref()
+        .is_some_and(|name| name.eq_ignore_ascii_case("explorer.exe"))
+}
+
+fn parent_process_name() -> Option<String> {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let current_pid = unsafe { GetCurrentProcessId() };
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut parent_pid = None;
+    let mut process_name = None;
+    let mut has_entry = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while has_entry {
+        if entry.th32ProcessID == current_pid {
+            parent_pid = Some(entry.th32ParentProcessID);
+        }
+        if parent_pid == Some(entry.th32ProcessID) {
+            process_name = wide_process_name(&entry.szExeFile);
+        }
+        if parent_pid.is_some() && process_name.is_some() {
+            break;
+        }
+        has_entry = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    if process_name.is_none() {
+        let Some(parent_pid) = parent_pid else {
+            unsafe { CloseHandle(snapshot) };
+            return None;
+        };
+        entry = unsafe { std::mem::zeroed() };
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut has_entry = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+        while has_entry {
+            if entry.th32ProcessID == parent_pid {
+                process_name = wide_process_name(&entry.szExeFile);
+                break;
+            }
+            has_entry = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+        }
+    }
+    unsafe { CloseHandle(snapshot) };
+    process_name
+}
+
+fn wide_process_name(value: &[u16]) -> Option<String> {
+    let length = value.iter().position(|character| *character == 0)?;
+    Some(String::from_utf16_lossy(&value[..length]))
 }
 
 pub fn ensure_private_directory(path: &Path) -> io::Result<()> {

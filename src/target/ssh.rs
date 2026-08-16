@@ -5,14 +5,18 @@ use std::{
     process::{Child, Command, Output, Stdio},
 };
 
+use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 
 const CONNECT_TIMEOUT_SECONDS: &str = "10";
+const SSH_ASKPASS_MARKER: &str = "MEOWAI_DEPLOY_INTERNAL_SSH_ASKPASS";
+const SSH_ASKPASS_SECRET: &str = "MEOWAI_DEPLOY_INTERNAL_SSH_SECRET";
 
 #[derive(Clone, Debug)]
 pub struct SshClient {
     ssh: PathBuf,
     scp: PathBuf,
+    password: Option<SecretString>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -53,12 +57,25 @@ impl SshClient {
                 "未找到可用的 OpenSSH scp 客户端；请先运行 meowai-deploy bootstrap",
             )
         })?;
-        Ok(Self { ssh, scp })
+        Ok(Self {
+            ssh,
+            scp,
+            password: None,
+        })
     }
 
     #[cfg(test)]
     pub fn from_programs(ssh: PathBuf, scp: PathBuf) -> Self {
-        Self { ssh, scp }
+        Self {
+            ssh,
+            scp,
+            password: None,
+        }
+    }
+
+    pub fn with_password(mut self, password: Option<SecretString>) -> Self {
+        self.password = password.filter(|value| !value.expose_secret().is_empty());
+        self
     }
 
     pub fn probe(&self, destination: &str) -> Result<(), SshError> {
@@ -147,7 +164,7 @@ impl SshClient {
     ) -> Result<Output, SshError> {
         let remote_spec = format!("{destination}:{remote}");
         self.scp_command()
-            .args(["-q", "-p", "-o", "BatchMode=yes", "-o"])
+            .args(["-q", "-p", "-o"])
             .arg(format!("ConnectTimeout={CONNECT_TIMEOUT_SECONDS}"))
             .args(["-o", "StrictHostKeyChecking=yes"])
             .arg(local)
@@ -181,7 +198,7 @@ impl SshClient {
 
     fn ssh_command(&self) -> Command {
         let mut command = self.ssh_command_without_batch_mode();
-        command.args(["-o", "BatchMode=yes"]);
+        self.configure_authentication(&mut command);
         command
     }
 
@@ -196,8 +213,45 @@ impl SshClient {
     fn scp_command(&self) -> Command {
         let mut command = Command::new(&self.scp);
         command.env("LC_ALL", "C");
+        self.configure_authentication(&mut command);
         command
     }
+
+    fn configure_authentication(&self, command: &mut Command) {
+        command.args(["-o", "NumberOfPasswordPrompts=1"]);
+        if let Some(password) = &self.password
+            && let Ok(executable) = env::current_exe()
+        {
+            command
+                .args([
+                    "-o",
+                    "BatchMode=no",
+                    "-o",
+                    "PasswordAuthentication=yes",
+                    "-o",
+                    "KbdInteractiveAuthentication=yes",
+                ])
+                .env("SSH_ASKPASS", executable)
+                .env("SSH_ASKPASS_REQUIRE", "force")
+                .env(SSH_ASKPASS_MARKER, "1")
+                .env(SSH_ASKPASS_SECRET, password.expose_secret());
+            return;
+        }
+        command.args(["-o", "BatchMode=yes"]);
+    }
+}
+
+pub fn ssh_askpass_exit_code() -> Option<i32> {
+    if env::var_os(SSH_ASKPASS_MARKER).as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return None;
+    }
+    let prompt = env::args().nth(1).unwrap_or_default().to_ascii_lowercase();
+    if !prompt.contains("password") && !prompt.contains("passphrase") {
+        return Some(1);
+    }
+    let secret = env::var_os(SSH_ASKPASS_SECRET)?;
+    println!("{}", secret.to_string_lossy());
+    Some(0)
 }
 
 pub fn discover_openssh() -> SshDiscovery {
@@ -429,6 +483,46 @@ fn classify_diagnostic(diagnostic: &str) -> SshErrorKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn password_authentication_uses_askpass_without_exposing_secret_in_arguments() {
+        let password = SecretString::from(format!("credential-{}", std::process::id()));
+        let client = SshClient::from_programs(PathBuf::from("ssh"), PathBuf::from("scp"))
+            .with_password(Some(password.clone()));
+        let command = client.ssh_command();
+        let arguments = command
+            .get_args()
+            .map(|value| value.to_string_lossy())
+            .collect::<Vec<_>>();
+        assert!(
+            arguments
+                .iter()
+                .all(|value| !value.contains(password.expose_secret()))
+        );
+        assert!(arguments.iter().any(|value| value == "BatchMode=no"));
+        assert!(command.get_envs().any(|(name, value)| {
+            name == SSH_ASKPASS_SECRET
+                && value
+                    .map(|value| value == password.expose_secret())
+                    .unwrap_or(false)
+        }));
+    }
+
+    #[test]
+    fn authentication_without_password_is_non_interactive() {
+        let client = SshClient::from_programs(PathBuf::from("ssh"), PathBuf::from("scp"));
+        let command = client.ssh_command();
+        assert!(
+            command
+                .get_args()
+                .any(|value| value == std::ffi::OsStr::new("BatchMode=yes"))
+        );
+        assert!(
+            !command
+                .get_envs()
+                .any(|(name, _)| name == SSH_ASKPASS_SECRET)
+        );
+    }
 
     #[test]
     fn output_errors_have_stable_host_key_and_authentication_codes() {

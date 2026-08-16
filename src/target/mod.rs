@@ -15,10 +15,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use secrecy::{ExposeSecret, SecretString};
 use shell_escape::escape;
 
 use self::remote_path::RemotePath;
 use self::ssh::SshClient;
+pub use self::ssh::ssh_askpass_exit_code;
 
 use crate::{
     config::Target,
@@ -40,6 +42,7 @@ pub struct TargetExecutor {
     target: Target,
     directory: PathBuf,
     ssh_client: Option<SshClient>,
+    ssh_password: Option<SecretString>,
 }
 
 pub struct TargetEndpoint {
@@ -68,7 +71,13 @@ impl TargetExecutor {
             target,
             directory,
             ssh_client: None,
+            ssh_password: None,
         }
+    }
+
+    pub fn with_ssh_password(mut self, password: Option<SecretString>) -> Self {
+        self.ssh_password = password.filter(|value| !value.expose_secret().is_empty());
+        self
     }
 
     pub fn prepare(&self) -> Result<()> {
@@ -84,20 +93,19 @@ impl TargetExecutor {
         let directory = self.quoted_directory()?;
         let script = format!(
             r#"set -eu
-if [ "$(id -u)" -eq 0 ]; then
-    exit 0
-fi
-if command -v sudo >/dev/null 2>&1 && sudo -n sh -c true >/dev/null 2>&1; then
-    exit 0
-fi
 path={directory}
 while [ ! -e "$path" ] && [ "$path" != / ]; do
     path=$(dirname "$path")
 done
-if [ -d "$path" ] && [ -w "$path" ] && docker info >/dev/null 2>&1; then
-    exit 0
+if [ "$(id -u)" -eq 0 ]; then
+    [ -d "$path" ] && [ -r "$path" ] && [ -w "$path" ] && [ -x "$path" ] && docker info >/dev/null 2>&1 && exit 0
 fi
-printf '%s\n' '当前用户不是 root、没有可用的 sudo，且无法写入部署目录并使用 Docker' >&2
+if command -v sudo >/dev/null 2>&1 && sudo -n sh -c true >/dev/null 2>&1; then
+    sudo -n sh -c '[ -d "$1" ] && [ -r "$1" ] && [ -w "$1" ] && [ -x "$1" ] && docker info >/dev/null 2>&1' sh "$path" && exit 0
+else
+    [ -d "$path" ] && [ -r "$path" ] && [ -w "$path" ] && [ -x "$path" ] && docker info >/dev/null 2>&1 && exit 0
+fi
+printf '%s\n' '部署目录或最近的父目录必须可读、可写、可进入，并且 Docker 必须可用' >&2
 exit 1"#,
         );
         let output = match &self.target {
@@ -112,19 +120,19 @@ exit 1"#,
                 if direct.status.success() {
                     return Ok(());
                 }
-                Command::new("sudo")
-                    .arg("-v")
-                    .status()
+                let status = Command::new("sudo").arg("-v").status().map_err(|error| {
+                    AppError::Target(format!("本机部署目录需要提权，但无法启动 sudo: {error}"))
+                })?;
+                if !status.success() {
+                    return Err(AppError::Target(format!("sudo 身份验证失败（{status}）")));
+                }
+                let elevated = Command::new("sudo")
+                    .args(["-n", "sh", "-c", &script])
+                    .output()
                     .map_err(|error| {
-                        AppError::Target(format!("本机部署目录需要提权，但无法启动 sudo: {error}"))
-                    })
-                    .and_then(|status| {
-                        if status.success() {
-                            Ok(())
-                        } else {
-                            Err(AppError::Target(format!("sudo 身份验证失败（{status}）")))
-                        }
+                        AppError::Target(format!("无法执行提权后的目标检查: {error}"))
                     })?;
+                require_success("验证本机部署权限和 Docker", elevated)?;
                 return Ok(());
             }
             Target::Ssh { destination } => {
@@ -270,6 +278,29 @@ exit 0"#,
             .join(" ");
         self.run_script(&format!(
             "cd {directory}\ndocker compose --env-file secrets.env -p {project} {arguments}",
+            directory = self.quoted_directory()?,
+            project = quote(project),
+        ))
+    }
+
+    pub fn remove_compose_project(&self, project: &str) -> Result<Output> {
+        self.run_script(&format!(
+            r#"cd {directory}
+project={project}
+if [ -f secrets.env ]; then
+  docker compose --env-file secrets.env -p "$project" down --remove-orphans
+elif docker compose -p "$project" down --remove-orphans; then
+  :
+else
+  containers=$(docker ps -aq --filter "label=com.docker.compose.project=$project")
+  if [ -n "$containers" ]; then
+    docker rm -f $containers
+  fi
+  networks=$(docker network ls -q --filter "label=com.docker.compose.project=$project")
+  if [ -n "$networks" ]; then
+    docker network rm $networks
+  fi
+fi"#,
             directory = self.quoted_directory()?,
             project = quote(project),
         ))
@@ -482,9 +513,11 @@ docker --config "$registry_config" pull --platform linux/amd64 {image}"#,
 
     fn ssh_client(&self) -> Result<SshClient> {
         if let Some(client) = &self.ssh_client {
-            return Ok(client.clone());
+            return Ok(client.clone().with_password(self.ssh_password.clone()));
         }
-        SshClient::discover().map_err(ssh_error)
+        SshClient::discover()
+            .map(|client| client.with_password(self.ssh_password.clone()))
+            .map_err(ssh_error)
     }
 }
 

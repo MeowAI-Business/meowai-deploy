@@ -63,6 +63,7 @@ pub trait OnboardBackend: Send {
         stage: OperationStage,
         input: &'a DeploymentInput,
         cancellation: &'a CancellationToken,
+        progress: &'a mut (dyn FnMut(&str) + Send),
     ) -> BoxFuture<'a, ApplicationResult<StageOutput>>;
 
     fn finish<'a>(&'a mut self) -> BoxFuture<'a, ApplicationResult<Vec<AdministratorCredential>>>;
@@ -252,10 +253,16 @@ where
         store_tracker(store, tracker)?;
 
         let cancellation = tracker.cancellation_token();
+        let mut report_progress = |message: &str| tracker.message(planned.stage, message);
         let result = match planned.cancellation {
             CancellationPolicy::Immediate => {
                 tokio::select! {
-                    result = backend.run_stage(planned.stage, input, &cancellation) => result,
+                    result = backend.run_stage(
+                        planned.stage,
+                        input,
+                        &cancellation,
+                        &mut report_progress,
+                    ) => result,
                     _ = cancellation.cancelled() => Err(ApplicationError::new(
                         ErrorCategory::Cancelled,
                         "OPERATION_CANCELLED",
@@ -265,7 +272,9 @@ where
                 }
             }
             CancellationPolicy::SafePoint | CancellationPolicy::NotInterruptible => {
-                backend.run_stage(planned.stage, input, &cancellation).await
+                backend
+                    .run_stage(planned.stage, input, &cancellation, &mut report_progress)
+                    .await
             }
         };
         match result {
@@ -410,6 +419,7 @@ pub struct ProductionOnboardBackend {
     downstream: Option<NewApiClient>,
     credentials: Vec<AdministratorCredential>,
     allow_status_key_rotation: bool,
+    ssh_password: Option<SecretString>,
 }
 
 impl ProductionOnboardBackend {
@@ -427,7 +437,13 @@ impl ProductionOnboardBackend {
             downstream: None,
             credentials: Vec::new(),
             allow_status_key_rotation: false,
+            ssh_password: None,
         }
+    }
+
+    pub fn with_ssh_password(mut self, password: Option<SecretString>) -> Self {
+        self.ssh_password = password;
+        self
     }
 
     pub fn allow_status_key_rotation(&mut self) {
@@ -539,12 +555,13 @@ impl ProductionOnboardBackend {
             ));
         }
 
-        let deployment = DeploymentRuntime::prepare(
+        let deployment = DeploymentRuntime::prepare_with_ssh_password(
             &self.config,
             self.identity.user_id,
             &catalog.response_sha256,
             status_key.metadata.id,
             shared_status_key.as_ref(),
+            self.ssh_password.clone(),
         )
         .map_err(app_error)?;
         source_key_store::save(
@@ -683,10 +700,14 @@ impl ProductionOnboardBackend {
         })
     }
 
-    async fn synchronize_kuma(&mut self) -> ApplicationResult<StageOutput> {
+    async fn synchronize_kuma(
+        &mut self,
+        progress: &mut (dyn FnMut(&str) + Send),
+    ) -> ApplicationResult<StageOutput> {
         let config = self.config.clone();
         self.deployment_mut()?
             .deploy_kuma(&config, |message| {
+                progress(message);
                 tracing::info!(stage = "kuma_synchronization", %message, "deployment progress");
             })
             .map_err(app_error)?;
@@ -775,6 +796,7 @@ impl OnboardBackend for ProductionOnboardBackend {
         stage: OperationStage,
         input: &'a DeploymentInput,
         cancellation: &'a CancellationToken,
+        progress: &'a mut (dyn FnMut(&str) + Send),
     ) -> BoxFuture<'a, ApplicationResult<StageOutput>> {
         Box::pin(async move {
             match stage {
@@ -815,6 +837,7 @@ impl OnboardBackend for ProductionOnboardBackend {
                             directory: input.directory.clone(),
                             newapi_port: input.newapi_port,
                             kuma_port: input.kuma_port,
+                            ssh_password: self.ssh_password.clone(),
                         },
                         cancellation,
                     )?;
@@ -830,6 +853,7 @@ impl OnboardBackend for ProductionOnboardBackend {
                     let config = self.config.clone();
                     self.deployment_mut()?
                         .deploy_base_stack(&config, |message| {
+                            progress(message);
                             tracing::info!(stage = "base_services", %message, "deployment progress");
                         })
                         .map_err(app_error)?;
@@ -838,7 +862,7 @@ impl OnboardBackend for ProductionOnboardBackend {
                 OperationStage::DownstreamInitialization => self.initialize_downstream().await,
                 OperationStage::PricingImport => self.import_pricing().await,
                 OperationStage::ChannelSynchronization => self.synchronize_channels().await,
-                OperationStage::KumaSynchronization => self.synchronize_kuma().await,
+                OperationStage::KumaSynchronization => self.synchronize_kuma(progress).await,
                 OperationStage::FinalVerification => self.complete_deployment(),
                 OperationStage::Cleanup | OperationStage::Rollback => Err(ApplicationError::new(
                     ErrorCategory::Conflict,
@@ -916,6 +940,7 @@ mod tests {
             stage: OperationStage,
             _input: &'a DeploymentInput,
             _cancellation: &'a CancellationToken,
+            _progress: &'a mut (dyn FnMut(&str) + Send),
         ) -> BoxFuture<'a, ApplicationResult<StageOutput>> {
             Box::pin(async move {
                 if stage == OperationStage::InputValidation {
@@ -938,9 +963,13 @@ mod tests {
             stage: OperationStage,
             _input: &'a DeploymentInput,
             _cancellation: &'a CancellationToken,
+            progress: &'a mut (dyn FnMut(&str) + Send),
         ) -> BoxFuture<'a, ApplicationResult<StageOutput>> {
             Box::pin(async move {
                 self.calls.push(stage);
+                if stage == OperationStage::BaseServices {
+                    progress("正在等待容器健康检查");
+                }
                 let mut failures = self.failures.lock().expect("failure counter");
                 if stage == OperationStage::TargetValidation && *failures > 0 {
                     *failures -= 1;
@@ -1017,6 +1046,11 @@ mod tests {
                 .iter()
                 .any(|event| event.message.contains("generated-only"))
         );
+        assert!(events.iter().any(|event| {
+            event.stage == Some(OperationStage::BaseServices)
+                && event.kind == super::super::operation::OperationEventKind::Message
+                && event.message == "正在等待容器健康检查"
+        }));
         assert!(!format!("{:?}", outcome.credentials[0]).contains("generated-only-in-result"));
     }
 

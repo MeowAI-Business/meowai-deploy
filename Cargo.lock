@@ -1250,6 +1250,7 @@ dependencies = [
  "comfy-table",
  "console 0.16.4",
  "fs2",
+ "futures-util",
  "http-body-util",
  "include_dir",
  "rand 0.8.7",

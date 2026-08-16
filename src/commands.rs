@@ -23,6 +23,7 @@ use crate::{
     config::{DeploymentConfig, authenticate_source, interactive_config, reauthenticate_source},
     doctor,
     error::{AppError, Result},
+    platform,
     source::{SourceClient, SourceError},
     state::{DOWNSTREAM_CLEANUP_PHASE, DeploymentState, unix_timestamp},
     storage::{self, CONFIG_FILE, CREDENTIALS_FILE, OPERATION_FILE, SESSION_FILE, STATE_FILE},
@@ -58,6 +59,14 @@ pub async fn run(cli: Cli) -> Result<()> {
         updater::check_periodically().await;
     }
     match cli.command {
+        None if platform::should_launch_webui_without_args() => {
+            web::run(&crate::cli::WebArgs {
+                host: "0.0.0.0".parse().expect("valid default WebUI host"),
+                port: 0,
+                no_open: false,
+            })
+            .await
+        }
         None => print_help(),
         Some(Command::Bootstrap(args)) => bootstrap::run(&args),
         Some(Command::Web(args)) => web::run(&args).await,

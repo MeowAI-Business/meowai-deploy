@@ -1,4 +1,8 @@
-use std::{fmt, net::IpAddr, path::PathBuf};
+use std::{
+    fmt,
+    net::IpAddr,
+    path::{Component, PathBuf},
+};
 
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -85,24 +89,7 @@ impl DeploymentInput {
         }
         validate_bind(InputField::NewApiBind, &self.newapi_bind)?;
         validate_bind(InputField::KumaBind, &self.kuma_bind)?;
-        if self.newapi_port == 0 || self.kuma_port == 0 {
-            return Err(ValidationError::new(
-                ValidationCode::InvalidPort,
-                if self.newapi_port == 0 {
-                    InputField::NewApiPort
-                } else {
-                    InputField::KumaPort
-                },
-                "ports must be between 1 and 65535",
-            ));
-        }
-        if self.newapi_port == self.kuma_port {
-            return Err(ValidationError::new(
-                ValidationCode::DuplicatePort,
-                InputField::KumaPort,
-                "New API and Kuma ports must be different",
-            ));
-        }
+        validate_ports(self.newapi_port, self.kuma_port)?;
         if self.newapi_admin_username.trim().is_empty()
             || self.kuma_admin_username.trim().is_empty()
         {
@@ -297,6 +284,17 @@ pub fn validate_directory(directory: &std::path::Path) -> ValidationResult<()> {
             "directory must be an absolute path",
         ));
     }
+    if directory == std::path::Path::new("/")
+        || directory
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+    {
+        return Err(ValidationError::new(
+            ValidationCode::InvalidDirectory,
+            InputField::Directory,
+            "directory must be an absolute deployment subdirectory and cannot contain '.' or '..'",
+        ));
+    }
     let value = directory.to_string_lossy();
     if !value
         .bytes()
@@ -337,6 +335,28 @@ pub fn validate_bind(field: InputField, value: &str) -> ValidationResult<()> {
     Ok(())
 }
 
+pub fn validate_ports(newapi_port: u16, kuma_port: u16) -> ValidationResult<()> {
+    if newapi_port == 0 || kuma_port == 0 {
+        return Err(ValidationError::new(
+            ValidationCode::InvalidPort,
+            if newapi_port == 0 {
+                InputField::NewApiPort
+            } else {
+                InputField::KumaPort
+            },
+            "ports must be between 1 and 65535",
+        ));
+    }
+    if newapi_port == kuma_port {
+        return Err(ValidationError::new(
+            ValidationCode::DuplicatePort,
+            InputField::KumaPort,
+            "New API and Kuma ports must be different",
+        ));
+    }
+    Ok(())
+}
+
 pub fn validate_image_ref(value: &str) -> ValidationResult<()> {
     if value.trim().is_empty() {
         return Err(ValidationError::new(
@@ -361,24 +381,44 @@ pub fn is_immutable_image_ref(value: &str) -> bool {
 }
 
 pub fn validate_ssh_destination(value: &str) -> ValidationResult<()> {
-    let trimmed = value.trim();
-    if trimmed.is_empty()
-        || trimmed != value
-        || value.starts_with('-')
-        || value.len() > 255
-        || value.bytes().any(|byte| {
-            byte.is_ascii_whitespace()
-                || matches!(
-                    byte,
-                    b'\0' | b'\r' | b'\n' | b';' | b'|' | b'&' | b'<' | b'>' | b'$' | b'`'
-                )
-        })
-    {
-        return Err(ValidationError::new(
+    let invalid = || {
+        ValidationError::new(
             ValidationCode::InvalidSshDestination,
             InputField::Target,
-            "SSH destination must be a single host name or user@host without options, whitespace, or control characters",
-        ));
+            "SSH destination must use the format user@host",
+        )
+    };
+    if value.trim() != value
+        || value.len() > 255
+        || value.bytes().any(|byte| byte.is_ascii_whitespace())
+    {
+        return Err(invalid());
+    }
+    let (user, host) = value.split_once('@').ok_or_else(invalid)?;
+    if user.is_empty()
+        || host.is_empty()
+        || host.contains('@')
+        || !user
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(invalid());
+    }
+    let host_is_valid = if let Some(ipv6) = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+    {
+        ipv6.parse::<IpAddr>()
+            .is_ok_and(|address| address.is_ipv6())
+    } else {
+        !host.starts_with('-')
+            && !host.ends_with('-')
+            && host
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    };
+    if !host_is_valid {
+        return Err(invalid());
     }
     Ok(())
 }
@@ -429,11 +469,13 @@ mod tests {
     }
 
     #[test]
-    fn ssh_destination_rejects_option_injection_and_whitespace() {
+    fn ssh_destination_requires_user_and_valid_host() {
         for value in [
-            "-oProxyCommand=sh",
-            "user@example.test other",
-            " user@example.test",
+            "random",
+            "@example.com",
+            "user@",
+            "user name@example.com",
+            "user@example.com;id",
         ] {
             assert!(
                 validate_ssh_destination(value).is_err(),
@@ -441,6 +483,6 @@ mod tests {
             );
         }
         assert!(validate_ssh_destination("deploy@example.test").is_ok());
-        assert!(validate_ssh_destination("[::1]:2222").is_ok());
+        assert!(validate_ssh_destination("deploy@[2001:db8::1]").is_ok());
     }
 }

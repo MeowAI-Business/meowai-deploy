@@ -70,17 +70,30 @@ pub fn app_error(error: crate::error::AppError) -> ApplicationError {
     if let crate::error::AppError::Source(source) = error {
         return source_error(source);
     }
+    if let crate::error::AppError::Target(message) = &error {
+        if message.starts_with("SSH 认证失败") {
+            return ApplicationError::new(
+                ErrorCategory::Authentication,
+                "SSH_AUTHENTICATION_FAILED",
+                "SSH 认证失败，请检查密码、密钥或 ssh-agent。",
+                true,
+            )
+            .with_diagnostic(error.to_string());
+        }
+        let summary = message.lines().next().unwrap_or("下游目标操作失败");
+        return ApplicationError::new(
+            ErrorCategory::Target,
+            "TARGET_OPERATION_FAILED",
+            format!("下游目标操作失败：{}", sanitize_diagnostic(summary)),
+            true,
+        )
+        .with_diagnostic(error.to_string());
+    }
     let (category, code, message, retryable) = match &error {
         crate::error::AppError::InvalidConfig(_) | crate::error::AppError::InvalidToml(_) => (
             ErrorCategory::Validation,
             "DEPLOYMENT_INPUT_INVALID",
             "部署配置无效",
-            true,
-        ),
-        crate::error::AppError::Target(_) => (
-            ErrorCategory::Target,
-            "TARGET_OPERATION_FAILED",
-            "下游目标操作失败",
             true,
         ),
         crate::error::AppError::State(_) => (
@@ -154,16 +167,94 @@ pub fn source_error(error: crate::source::SourceError) -> ApplicationError {
 pub fn sanitize_diagnostic(value: &str) -> String {
     let mut sanitized = value.replace(['\n', '\r', '\t'], " ");
     for marker in ["password", "token", "secret", "api_key", "access_token"] {
-        let lower = sanitized.to_ascii_lowercase();
-        if lower.contains(marker) {
-            sanitized = format!("诊断信息包含敏感字段 {marker}，已隐藏");
-            break;
-        }
+        sanitized = redact_assignment(&sanitized, marker);
     }
+    sanitized = redact_bearer_token(&sanitized);
     if sanitized.len() > 512 {
         sanitized.truncate(512);
     }
     sanitized
+}
+
+fn redact_assignment(value: &str, marker: &str) -> String {
+    let mut result = value.to_owned();
+    let mut search_from = 0;
+    loop {
+        let lower = result.to_ascii_lowercase();
+        let Some(relative) = lower[search_from..].find(marker) else {
+            break;
+        };
+        let marker_start = search_from + relative;
+        let marker_end = marker_start + marker.len();
+        let bytes = result.as_bytes();
+        if marker_start > 0
+            && matches!(bytes[marker_start - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_')
+        {
+            search_from = marker_end;
+            continue;
+        }
+        let mut separator = marker_end;
+        if bytes
+            .get(separator)
+            .is_some_and(|byte| matches!(byte, b'\'' | b'"'))
+        {
+            separator += 1;
+        }
+        while bytes.get(separator).is_some_and(u8::is_ascii_whitespace) {
+            separator += 1;
+        }
+        if !bytes
+            .get(separator)
+            .is_some_and(|byte| matches!(byte, b'=' | b':'))
+        {
+            search_from = marker_end;
+            continue;
+        }
+        let mut value_start = separator + 1;
+        while bytes.get(value_start).is_some_and(u8::is_ascii_whitespace) {
+            value_start += 1;
+        }
+        let quote = bytes
+            .get(value_start)
+            .copied()
+            .filter(|byte| matches!(byte, b'\'' | b'"'));
+        if quote.is_some() {
+            value_start += 1;
+        }
+        let mut value_end = value_start;
+        while let Some(byte) = bytes.get(value_end) {
+            if quote.is_some_and(|quote| *byte == quote)
+                || (quote.is_none()
+                    && (byte.is_ascii_whitespace()
+                        || matches!(byte, b',' | b';' | b'&' | b'}' | b']')))
+            {
+                break;
+            }
+            value_end += 1;
+        }
+        result.replace_range(value_start..value_end, "[REDACTED]");
+        search_from = value_start + "[REDACTED]".len();
+    }
+    result
+}
+
+fn redact_bearer_token(value: &str) -> String {
+    let mut result = value.to_owned();
+    let mut search_from = 0;
+    loop {
+        let lower = result.to_ascii_lowercase();
+        let Some(relative) = lower[search_from..].find("bearer ") else {
+            break;
+        };
+        let value_start = search_from + relative + "bearer ".len();
+        let value_end = result[value_start..]
+            .find(|character: char| character.is_whitespace() || matches!(character, ',' | ';'))
+            .map(|offset| value_start + offset)
+            .unwrap_or(result.len());
+        result.replace_range(value_start..value_end, "[REDACTED]");
+        search_from = value_start + "[REDACTED]".len();
+    }
+    result
 }
 
 #[cfg(test)]
@@ -171,13 +262,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn diagnostics_are_bounded_and_redact_secret_markers() {
-        let error =
-            ApplicationError::new(ErrorCategory::Target, "TARGET_FAILED", "目标检查失败", true)
-                .with_diagnostic("token=private-value\nmore details");
+    fn diagnostics_redact_values_without_hiding_actionable_context() {
+        let error = ApplicationError::new(
+            ErrorCategory::Target,
+            "TARGET_FAILED",
+            "目标检查失败",
+            true,
+        )
+        .with_diagnostic(
+            "docker compose --env-file secrets.env failed: token=private-value\nmore details",
+        );
         assert_eq!(
             error.diagnostic.as_deref(),
-            Some("诊断信息包含敏感字段 token，已隐藏")
+            Some("docker compose --env-file secrets.env failed: token=[REDACTED] more details")
+        );
+    }
+
+    #[test]
+    fn diagnostics_redact_json_and_bearer_credentials() {
+        assert_eq!(
+            sanitize_diagnostic("{\"password\":\"private\"} Authorization: Bearer abc.def"),
+            "{\"password\":\"[REDACTED]\"} Authorization: Bearer [REDACTED]"
+        );
+    }
+
+    #[test]
+    fn target_errors_keep_the_actionable_command_failure() {
+        let error = app_error(crate::error::AppError::Target(
+            "docker compose --env-file secrets.env exited with status 1\nservice failed".to_owned(),
+        ));
+        assert_eq!(
+            error.message,
+            "下游目标操作失败：docker compose --env-file secrets.env exited with status 1"
+        );
+        assert_eq!(
+            error.diagnostic.as_deref(),
+            Some(
+                "target operation failed: docker compose --env-file secrets.env exited with status 1 service failed"
+            )
         );
     }
 }

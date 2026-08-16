@@ -17,6 +17,8 @@ pub const SESSION_FILE: &str = "session.json";
 pub const SOURCE_STATUS_KEYS_FILE: &str = "source-status-keys.json";
 pub const UPDATE_CHECK_FILE: &str = "update-check.json";
 pub const LOG_FILE: &str = "meowai-deploy.log";
+pub const WEB_DRAFT_FILE: &str = "webui-draft.json";
+pub const WEB_INSTANCE_FILE: &str = "webui-instance.json";
 
 const DEPLOYMENT_FILES: [&str; 5] = [
     CONFIG_FILE,

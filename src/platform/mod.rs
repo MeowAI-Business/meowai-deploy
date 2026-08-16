@@ -1,4 +1,8 @@
-use std::{env, path::PathBuf};
+use std::{
+    env,
+    io::{IsTerminal, stdin, stdout},
+    path::PathBuf,
+};
 
 use crate::error::{AppError, Result};
 
@@ -38,6 +42,24 @@ pub const fn supports_local_target() -> bool {
     cfg!(unix)
 }
 
+pub fn should_launch_webui_without_args() -> bool {
+    should_launch_webui_in_context(
+        env::var_os("MEOWAI_DEPLOY_DISABLE_GUI").is_some(),
+        stdin().is_terminal(),
+        stdout().is_terminal(),
+        implementation::launched_from_desktop_shell(),
+    )
+}
+
+fn should_launch_webui_in_context(
+    disabled: bool,
+    stdin_is_terminal: bool,
+    stdout_is_terminal: bool,
+    launched_from_desktop_shell: bool,
+) -> bool {
+    !disabled && stdin_is_terminal && stdout_is_terminal && launched_from_desktop_shell
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -45,5 +67,20 @@ mod tests {
     #[test]
     fn local_target_capability_matches_the_control_platform() {
         assert_eq!(supports_local_target(), cfg!(unix));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_no_args_never_launches_webui_on_unix() {
+        assert!(!implementation::launched_from_desktop_shell());
+    }
+
+    #[test]
+    fn desktop_launch_requires_both_terminals_and_no_disable_override() {
+        assert!(should_launch_webui_in_context(false, true, true, true));
+        assert!(!should_launch_webui_in_context(true, true, true, true));
+        assert!(!should_launch_webui_in_context(false, false, true, true));
+        assert!(!should_launch_webui_in_context(false, true, false, true));
+        assert!(!should_launch_webui_in_context(false, true, true, false));
     }
 }

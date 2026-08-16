@@ -14,6 +14,10 @@ pub fn user_profile_directory() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+pub const fn launched_from_desktop_shell() -> bool {
+    false
+}
+
 pub fn ensure_private_directory(path: &Path) -> io::Result<()> {
     fs::create_dir_all(path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
