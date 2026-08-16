@@ -193,7 +193,7 @@ pub fn prepare_credentials(executor: &TargetExecutor) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::{
         fs,
