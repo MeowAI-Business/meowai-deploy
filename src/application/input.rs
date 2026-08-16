@@ -436,11 +436,17 @@ mod tests {
     use super::*;
 
     fn valid_input() -> DeploymentInput {
-        DeploymentInput {
+        let mut input = DeploymentInput {
             image_ref: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                 .to_owned(),
             ..DeploymentInput::default()
+        };
+        if cfg!(windows) {
+            input.target = DeploymentTargetInput::Ssh {
+                destination: "deploy@example.test".to_owned(),
+            };
         }
+        input
     }
 
     #[test]

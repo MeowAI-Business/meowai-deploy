@@ -682,7 +682,7 @@ mod tests {
             .output()
             .expect("run failing command");
         let error = target_output_error("probe", &output).to_string();
-        assert!(error.contains("probe exited with exit status: 1"));
+        assert!(error.contains(&format!("probe exited with {}", output.status)));
         assert!(error.contains("\n  first\n  second"));
     }
 }

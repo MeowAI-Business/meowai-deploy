@@ -129,11 +129,16 @@ mod tests {
 
     #[test]
     fn onboard_plan_is_structured_and_resumable() {
-        let input = DeploymentInput {
+        let mut input = DeploymentInput {
             image_ref: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                 .to_owned(),
             ..DeploymentInput::default()
         };
+        if cfg!(windows) {
+            input.target = super::super::input::DeploymentTargetInput::Ssh {
+                destination: "deploy@example.test".to_owned(),
+            };
+        }
         let plan = build_onboard_plan(&input, "deployment-1").expect("build plan");
         assert!(plan.resumable);
         assert_eq!(plan.kind, OperationKind::Onboard);

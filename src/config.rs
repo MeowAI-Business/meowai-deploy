@@ -813,6 +813,11 @@ mod tests {
         assert_eq!(config.website_name, DEFAULT_WEBSITE_NAME);
         assert_eq!(config.newapi_port, DEFAULT_NEWAPI_PORT);
         assert_eq!(config.kuma_port, DEFAULT_KUMA_PORT);
+        if cfg!(windows) {
+            config.target = Target::Ssh {
+                destination: "deploy@example.test".to_owned(),
+            };
+        }
         assert!(config.validate().is_ok());
     }
 

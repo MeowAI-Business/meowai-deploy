@@ -1137,13 +1137,23 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn mock_backend_completes_without_terminal_or_remote_services() {
-        let input = DeploymentInput {
+    fn valid_input() -> DeploymentInput {
+        let mut input = DeploymentInput {
             image_ref: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                 .to_owned(),
             ..DeploymentInput::default()
         };
+        if cfg!(windows) {
+            input.target = super::super::input::DeploymentTargetInput::Ssh {
+                destination: "deploy@example.test".to_owned(),
+            };
+        }
+        input
+    }
+
+    #[tokio::test]
+    async fn mock_backend_completes_without_terminal_or_remote_services() {
+        let input = valid_input();
         let sink = CollectedEventSink::default();
         let mut store = MemoryStore::default();
         let mut backend = MockBackend {
@@ -1188,11 +1198,7 @@ mod tests {
 
     #[tokio::test]
     async fn retry_resumes_from_failed_stage_and_preserves_checkpoint() {
-        let input = DeploymentInput {
-            image_ref: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                .to_owned(),
-            ..DeploymentInput::default()
-        };
+        let input = valid_input();
         let sink = CollectedEventSink::default();
         let mut store = MemoryStore::default();
         let failures = Arc::new(Mutex::new(1));
@@ -1244,11 +1250,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_stops_at_the_next_safe_point_and_is_persisted() {
-        let input = DeploymentInput {
-            image_ref: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                .to_owned(),
-            ..DeploymentInput::default()
-        };
+        let input = valid_input();
         let control = OperationControl::default();
         let mut backend = CancellingBackend {
             control: control.clone(),

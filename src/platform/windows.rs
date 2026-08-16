@@ -134,6 +134,7 @@ pub fn write_private_file(path: &Path, content: &[u8]) -> io::Result<()> {
             .open(&temporary)?;
         file.write_all(content)?;
         file.sync_all()?;
+        drop(file);
         set_private_acl(&temporary)?;
         verify_private_acl(&temporary)?;
         replace_file(&temporary, path)?;
