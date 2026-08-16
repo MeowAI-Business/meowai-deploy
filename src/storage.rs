@@ -146,6 +146,23 @@ pub fn clear_deployment() -> Result<()> {
     Ok(())
 }
 
+pub fn clear_deployment_snapshots() -> Result<()> {
+    for name in [
+        SOURCE_LAST_SEEN_SNAPSHOT,
+        DOWNSTREAM_LAST_SEEN_SNAPSHOT,
+        LAST_APPLIED_SNAPSHOT,
+        PRE_APPLY_SNAPSHOT,
+    ] {
+        let path = snapshot_path(name)?;
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(AppError::WriteFile { path, source }),
+        }
+    }
+    Ok(())
+}
+
 fn ensure_directory() -> Result<PathBuf> {
     let root = directory()?;
     platform::ensure_private_directory(&root).map_err(|source| AppError::WriteFile {

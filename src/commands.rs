@@ -1309,6 +1309,9 @@ async fn clear_current_deployment_before_onboard() -> Result<()> {
     if has_state && has_credentials {
         if downstream_was_cleaned()? {
             storage::clear_deployment()?;
+            storage::clear_deployment_snapshots()?;
+            crate::application::deployment_control::remove_registration()
+                .map_err(application_error)?;
             print_success("已清除保留的 onboard 配置，可以重新填写");
             return Ok(());
         }
@@ -1331,6 +1334,8 @@ async fn clear_current_deployment_before_onboard() -> Result<()> {
         return Err(AppError::Cancelled);
     }
     storage::clear_deployment()?;
+    storage::clear_deployment_snapshots()?;
+    crate::application::deployment_control::remove_registration().map_err(application_error)?;
     print_success("已清理未完成的 onboard 配置");
     Ok(())
 }

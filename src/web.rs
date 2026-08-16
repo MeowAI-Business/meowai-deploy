@@ -1594,6 +1594,18 @@ async fn resume_operation_handler(
         }
         *lock = Some(operation_id.clone());
     }
+    // Publish the retry state before spawning the worker so polling cannot briefly
+    // observe the old failed checkpoint and make the UI oscillate.
+    {
+        let mut checkpoint_lock = operation
+            .checkpoint
+            .lock()
+            .map_err(|_| ApiError::internal())?;
+        checkpoint_lock.resume().map_err(|_| {
+            ApiError::conflict("OPERATION_NOT_RETRYABLE", "当前操作没有可恢复的失败检查点")
+        })?;
+        save_web_checkpoint(&checkpoint_lock).map_err(|_| ApiError::internal())?;
+    }
     *operation.control.lock().map_err(|_| ApiError::internal())? = OperationControl::default();
     let task_state = state.clone();
     let task_operation = operation.clone();
@@ -1772,7 +1784,10 @@ async fn run_onboard_operation(
         config
             .validate()
             .map_err(crate::application::error::app_error)?;
-        if replace_existing {
+        // Replacement cleanup belongs to the initial operation only. A retry
+        // must resume from its checkpoint instead of deleting the target a
+        // second time (especially when the configured directory is temporary).
+        if replace_existing && resume.is_none() {
             preparation_stage = OperationStage::Cleanup;
             emit_web_event(
                 &state,

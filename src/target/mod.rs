@@ -287,7 +287,7 @@ exit 0"#,
     pub fn remove_compose_project(&self, project: &str) -> Result<Output> {
         self.run_script(&format!(
             r#"project={project}
-if [ -d {directory} ]; then
+if [ -f {directory}/docker-compose.yml ]; then
   cd {directory}
   files='-f docker-compose.yml'
   if [ -f docker-compose.updater.yml ]; then files="$files -f docker-compose.updater.yml"; fi
@@ -299,6 +299,9 @@ if [ -d {directory} ]; then
     docker compose -p "$project" $files down --remove-orphans || true
   fi
 else
+  # The directory may survive while the compose file was removed (for example
+  # a temporary deployment directory cleaned by the OS). In that case there is
+  # no compose project to invoke; remove any labeled leftovers directly.
   containers=$(docker ps -aq --filter "label=com.docker.compose.project=$project")
   if [ -n "$containers" ]; then
     docker rm -f $containers
@@ -651,6 +654,17 @@ mod tests {
             path,
             remote_upload_path("docker-compose.yml", Path::new("/tmp/local-b"))
         );
+    }
+
+    #[test]
+    fn cleanup_is_idempotent_when_directory_exists_without_compose_file() {
+        let directory = tempfile::tempdir().expect("create empty deployment directory");
+        let executor = TargetExecutor::new(Target::Local, directory.path().to_owned());
+        let project = format!("meowai-deploy-missing-compose-{}", std::process::id());
+
+        executor
+            .remove_compose_project(&project)
+            .expect("missing compose file must be treated as an already-clean target");
     }
 
     #[test]

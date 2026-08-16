@@ -336,6 +336,9 @@ describe("deployment workbench", () => {
     expect(await screen.findByText("STATUS_KEY_CONTENT_UNAVAILABLE")).toBeInTheDocument();
     expect(document.querySelector(".operation-resume-auth.has-ssh")).not.toBeInTheDocument();
     expect(screen.queryByPlaceholderText("服务器登录密码")).not.toBeInTheDocument();
+    const resumeSourcePassword = screen.getByPlaceholderText("源站登录密码");
+    fireEvent.change(resumeSourcePassword, { target: { value: "s" } });
+    expect(screen.getByPlaceholderText("源站登录密码")).toHaveValue("s");
     fireEvent.change(screen.getByPlaceholderText("源站登录密码"), { target: { value: "source-password" } });
     fireEvent.click(screen.getByRole("button", { name: "重新生成密钥并继续" }));
 

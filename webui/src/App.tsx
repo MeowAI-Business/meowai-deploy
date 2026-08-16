@@ -228,9 +228,11 @@ export default function App() {
   const [operationEvents, setOperationEvents] = useState<OperationEvent[]>([]);
   const [operationFailure, setOperationFailure] = useState<OperationFailure | null>(null);
   const [operationProgress, setOperationProgress] = useState(0);
+  const [operationPollGeneration, setOperationPollGeneration] = useState(0);
   const [currentStage, setCurrentStage] = useState<string | null>(null);
   const [credentials, setCredentials] = useState<OperationSnapshot["credentials"]>(undefined);
   const [resumingOperation, setResumingOperation] = useState(false);
+  const [resumeSourcePasswordRequired, setResumeSourcePasswordRequired] = useState(false);
   const [checkingStep, setCheckingStep] = useState<PreflightStep | null>(null);
   const [validatedSteps, setValidatedSteps] = useState<Record<PreflightStep, boolean>>({
     target: false,
@@ -395,6 +397,9 @@ export default function App() {
             retryable: payload.kind.type === "recoverable_failure",
             diagnostic: payload.diagnostic,
           });
+          setResumeSourcePasswordRequired(
+            failureNeedsSourcePassword(payload.kind.code) && !credentialMemory.current.sourcePassword,
+          );
         }
         if (payload.kind.type === "operation_completed") {
           setOperationStatus("completed");
@@ -428,6 +433,7 @@ export default function App() {
         if (status === "running" || status === "cancelling" || status === "draft") {
           setOperationStatus("running");
           setOperationFailure(null);
+          setResumeSourcePasswordRequired(false);
         } else if (status === "completed") {
           setOperationStatus("completed");
           setOperationProgress(100);
@@ -436,6 +442,10 @@ export default function App() {
         } else if (status === "failed" || status === "cancelled") {
           setOperationStatus("failed");
           setOperationFailure(snapshot.checkpoint.failure ?? null);
+          setResumeSourcePasswordRequired(
+            failureNeedsSourcePassword(snapshot.checkpoint.failure?.code)
+              && !credentialMemory.current.sourcePassword,
+          );
           setLastEvent(snapshot.checkpoint.failure?.message ?? (status === "cancelled" ? "操作已取消" : "部署失败"));
         }
       } catch (cause) {
@@ -449,7 +459,7 @@ export default function App() {
       cancelled = true;
       if (timer) window.clearTimeout(timer);
     };
-  }, [operationId, session]);
+  }, [operationId, operationPollGeneration, session]);
 
   useEffect(() => {
     if (activeStep !== "site" || !session || !draft.image.trim()) return;
@@ -742,6 +752,8 @@ export default function App() {
       }, session);
       setOperationStatus("running");
       setOperationFailure(null);
+      setResumeSourcePasswordRequired(false);
+      setOperationPollGeneration((current) => current + 1);
       setLastEvent(rotateStatusKey ? "正在重新生成公共状态密钥" : "正在继续部署");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "无法继续部署");
@@ -855,6 +867,9 @@ export default function App() {
     setCurrentStage(operation.currentStage);
     setOperationEvents([]);
     setOperationFailure(null);
+    // Source passwords are never persisted. A restored operation must keep the
+    // credential field mounted until this browser session supplies it again.
+    setResumeSourcePasswordRequired(!credentialMemory.current.sourcePassword);
     setOperationProgress(0);
     setCredentials(undefined);
     setLastEvent("正在读取上次部署状态");
@@ -957,7 +972,7 @@ export default function App() {
                 showSshPassword={requiresSshPassword(operationFailure, draft.target)}
                 sshPassword={draft.sshPassword}
                 onSshPasswordChange={(value) => update("sshPassword", value)}
-                showSourcePassword={requiresSourcePassword(operationFailure, draft.sourcePassword)}
+                showSourcePassword={resumeSourcePasswordRequired}
                 sourcePassword={draft.sourcePassword}
                 onSourcePasswordChange={(value) => update("sourcePassword", value)}
               />
@@ -982,7 +997,7 @@ export default function App() {
                 {operationStatus === "failed" && operationFailure?.retryable && (
                   <button
                     className={`primary-action ${resumingOperation ? "is-loading" : ""}`}
-                    disabled={resumingOperation || (requiresSourcePassword(operationFailure, draft.sourcePassword) && !draft.sourcePassword)}
+                    disabled={resumingOperation || (resumeSourcePasswordRequired && !draft.sourcePassword)}
                     onClick={() => operationFailure?.code === "STATUS_KEY_CONTENT_UNAVAILABLE"
                       ? setDialog("rotate-status-key")
                       : void resumeOperation()}
@@ -1504,10 +1519,12 @@ function validateStep(step: StepKey, draft: Draft): string | null {
   return null;
 }
 
-function requiresSourcePassword(failure: OperationFailure | null, sourcePassword: string): boolean {
-  if (failure?.retryable !== true) return false;
-  if (["SOURCE_PASSWORD_REQUIRED", "SOURCE_AUTHENTICATION_FAILED"].includes(failure.code)) return true;
-  return failure.code === "STATUS_KEY_CONTENT_UNAVAILABLE" && !sourcePassword;
+function failureNeedsSourcePassword(code: string | undefined): boolean {
+  return code !== undefined && [
+    "SOURCE_PASSWORD_REQUIRED",
+    "SOURCE_AUTHENTICATION_FAILED",
+    "STATUS_KEY_CONTENT_UNAVAILABLE",
+  ].includes(code);
 }
 
 function requiresSshPassword(failure: OperationFailure | null, target: DeploymentTarget): boolean {

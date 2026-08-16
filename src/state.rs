@@ -155,6 +155,13 @@ impl DeploymentState {
     }
 
     pub fn downstream_is_initialized(&self) -> bool {
+        if self
+            .phases
+            .get(DOWNSTREAM_CLEANUP_PHASE)
+            .is_some_and(|phase| phase.status == "DONE")
+        {
+            return false;
+        }
         self.snapshot_schema_version > 0
             || ["newapi", "pricing", "channels", "kuma", "onboard"]
                 .into_iter()
@@ -262,5 +269,7 @@ mod tests {
         assert!(!state.downstream_is_initialized());
         state.mark_phase("newapi", "DONE", "initialized");
         assert!(state.downstream_is_initialized());
+        state.mark_phase(DOWNSTREAM_CLEANUP_PHASE, "DONE", "removed");
+        assert!(!state.downstream_is_initialized());
     }
 }

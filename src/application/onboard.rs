@@ -466,6 +466,25 @@ impl ProductionOnboardBackend {
         self.allow_status_key_rotation = true;
     }
 
+    async fn prepare_registration(&mut self) -> ApplicationResult<()> {
+        let registration =
+            match deployment_control::load_registration_for(&self.config, self.identity.user_id)? {
+                Some(registration) => registration,
+                None => self
+                    .source
+                    .register_deployment(&format!("reg_{}", self.config.deployment_id()))
+                    .await
+                    .map_err(source_error)?,
+            };
+        deployment_control::persist_registration_locally(
+            &self.config,
+            self.identity.user_id,
+            &registration,
+        )?;
+        self.registration = Some(registration);
+        Ok(())
+    }
+
     pub async fn report_failure(&self, error: &ApplicationError) {
         if let Some(registration) = &self.registration {
             let reason = format!("{}: {}", error.code, error.message);
@@ -593,14 +612,10 @@ impl ProductionOnboardBackend {
             self.ssh_password.clone(),
         )
         .map_err(app_error)?;
-        let registration = match deployment_control::load_registration()? {
-            Some(registration) => registration,
-            None => self
-                .source
-                .register_deployment(&format!("reg_{}", self.config.deployment_id()))
-                .await
-                .map_err(source_error)?,
-        };
+        let registration = self
+            .registration
+            .clone()
+            .ok_or_else(|| missing_stage("控制面 registration"))?;
         deployment_control::apply_registration(&mut deployment.state, &registration)?;
         deployment_control::persist_registration(
             &self.config,
@@ -902,9 +917,21 @@ impl OnboardBackend for ProductionOnboardBackend {
         completed_stages: &'a BTreeSet<OperationStage>,
     ) -> BoxFuture<'a, ApplicationResult<()>> {
         Box::pin(async move {
+            if completed_stages.contains(&OperationStage::SourceApproval) {
+                self.prepare_registration().await?;
+            }
             if completed_stages.contains(&OperationStage::SourceResources) {
                 self.prepare_source_resources(&CancellationToken::default())
                     .await?;
+            }
+            // The configured target directory may be temporary (or have been
+            // removed while the WebUI was closed). Re-materialize the base
+            // compose stack before resuming later stages that depend on it.
+            if completed_stages.contains(&OperationStage::BaseServices) {
+                let config = self.config.clone();
+                self.deployment_mut()?
+                    .deploy_base_stack(&config, |_| {})
+                    .map_err(app_error)?;
             }
             if completed_stages.contains(&OperationStage::DownstreamInitialization) {
                 self.initialize_downstream().await?;
@@ -950,7 +977,10 @@ impl OnboardBackend for ProductionOnboardBackend {
                         .check_onboard_access()
                         .await
                         .map_err(source_error)?;
-                    Ok(completed("源站账号已获部署批准"))
+                    self.prepare_registration().await?;
+                    Ok(completed(
+                        "源站账号已获部署批准，控制面 registration 已保存",
+                    ))
                 }
                 OperationStage::TargetValidation => {
                     let probe = probe_deployment_target(

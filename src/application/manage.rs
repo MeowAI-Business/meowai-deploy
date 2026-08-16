@@ -111,6 +111,7 @@ pub async fn clean_deployment_with_ssh_password(
         .await?;
     }
     clean_downstream(config, &executor)?;
+    storage::clear_deployment_snapshots().map_err(app_error)?;
     check_cancellation(cancellation)?;
     if let Some(state) = &mut state {
         state.mark_phase(
@@ -129,6 +130,7 @@ pub async fn clean_deployment_with_ssh_password(
         )
         .await?;
     }
+    deployment_control::remove_registration()?;
     Ok(CleanDeploymentOutcome {
         state_preserved: state.is_some(),
     })
@@ -226,6 +228,7 @@ pub async fn rollback_deployment_with_ssh_password(
     check_cancellation(cancellation)?;
     clean_downstream(config, &executor)?;
     storage::clear_deployment().map_err(app_error)?;
+    storage::clear_deployment_snapshots().map_err(app_error)?;
     if let Some(registration) = &registration {
         let _ = deployment_control::queue_lifecycle(
             registration,
