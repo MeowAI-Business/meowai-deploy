@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{net::IpAddr, path::PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 
@@ -16,6 +16,10 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Ensure that a supported OpenSSH client is installed.
+    Bootstrap(BootstrapArgs),
+    /// Start the local browser deployment workbench.
+    Web(WebArgs),
     /// Check local or target-host prerequisites.
     Doctor(DoctorArgs),
     /// Start the interactive onboard workflow.
@@ -32,6 +36,32 @@ pub enum Command {
     Logout(DeploymentArgs),
     /// Check for or install a newer meowai-deploy release.
     Update(UpdateArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct BootstrapArgs {
+    /// Check OpenSSH without installing or changing the system.
+    #[arg(long)]
+    pub check: bool,
+
+    /// Print a machine-readable check without installing or ANSI output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct WebArgs {
+    /// Address to listen on.
+    #[arg(long, default_value = "0.0.0.0")]
+    pub host: IpAddr,
+
+    /// Port to listen on; 0 selects an available port automatically.
+    #[arg(long, default_value_t = 0)]
+    pub port: u16,
+
+    /// Print the WebUI URL without opening a browser.
+    #[arg(long)]
+    pub no_open: bool,
 }
 
 #[derive(Debug, Args)]
@@ -76,6 +106,10 @@ pub struct SyncArgs {
     /// Allow confirmed modules to overwrite conflicting downstream fields.
     #[arg(long)]
     pub force: bool,
+
+    /// Fingerprint returned by the read-only sync plan.
+    #[arg(long, hide = true)]
+    pub plan_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -94,6 +128,10 @@ pub struct DoctorArgs {
     /// Directory whose parent will receive the deployment data.
     #[arg(long, default_value = "/opt/meowai-deploy/newapi")]
     pub directory: PathBuf,
+
+    /// Inspect an SSH Linux target instead of the local control machine.
+    #[arg(long)]
+    pub ssh: Option<String>,
 
     /// Print machine-readable JSON instead of a terminal table.
     #[arg(long)]

@@ -145,11 +145,12 @@ fn update_builder(show_output: bool) -> Result<Box<dyn ReleaseUpdate>> {
 
 fn configure_builder(builder: &mut github::UpdateBuilder) -> Result<()> {
     let target = release_target(env::consts::OS, env::consts::ARCH)?;
+    let archive_binary = archive_binary_name();
     builder
         .repo_owner(REPOSITORY_OWNER)
         .repo_name(REPOSITORY_NAME)
-        .bin_name("meowai-deploy")
-        .bin_path_in_archive("meowai-deploy")
+        .bin_name(archive_binary)
+        .bin_path_in_archive(archive_binary)
         .target(target)
         .current_version(env!("CARGO_PKG_VERSION"));
     if let Ok(url) = env::var("MEOWAI_DEPLOY_GITHUB_API_URL") {
@@ -167,9 +168,18 @@ fn release_target(operating_system: &str, architecture: &str) -> Result<&'static
         ("linux", "aarch64") => Ok("linux-arm64"),
         ("macos", "x86_64") => Ok("macos-amd64"),
         ("macos", "aarch64") => Ok("macos-arm64"),
+        ("windows", "x86_64") => Ok("windows-amd64"),
         _ => Err(AppError::Message(format!(
             "automatic updates do not support {operating_system}/{architecture}"
         ))),
+    }
+}
+
+fn archive_binary_name() -> &'static str {
+    if cfg!(windows) {
+        "meowai-deploy.exe"
+    } else {
+        "meowai-deploy"
     }
 }
 
@@ -230,6 +240,15 @@ mod tests {
         assert_eq!(release_target("linux", "aarch64").unwrap(), "linux-arm64");
         assert_eq!(release_target("macos", "x86_64").unwrap(), "macos-amd64");
         assert_eq!(release_target("macos", "aarch64").unwrap(), "macos-arm64");
-        assert!(release_target("windows", "x86_64").is_err());
+        assert_eq!(
+            release_target("windows", "x86_64").unwrap(),
+            "windows-amd64"
+        );
+    }
+
+    #[test]
+    fn unsupported_release_targets_are_rejected() {
+        assert!(release_target("windows", "aarch64").is_err());
+        assert!(release_target("freebsd", "x86_64").is_err());
     }
 }

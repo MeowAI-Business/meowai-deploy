@@ -5,6 +5,8 @@ use serde_json::Value;
 
 use crate::{error::Result, storage};
 
+use crate::application::operation::OperationCheckpoint;
+
 pub const DOWNSTREAM_CLEANUP_PHASE: &str = "downstream_cleanup";
 pub const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 
@@ -97,6 +99,12 @@ pub struct KumaMonitorState {
 pub struct DeploymentState {
     pub schema_version: u32,
     pub deployment_id: String,
+    #[serde(default)]
+    pub upstream_deployment_id: String,
+    #[serde(default)]
+    pub installation_generation: u32,
+    #[serde(default)]
+    pub control_plane_url: String,
     pub target_fingerprint: String,
     pub container_name: String,
     pub directory: String,
@@ -126,6 +134,8 @@ pub struct DeploymentState {
     pub last_sync_at: i64,
     #[serde(default)]
     pub last_sync_success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<OperationCheckpoint>,
     #[serde(default)]
     pub snapshot_schema_version: u32,
     #[serde(default)]
@@ -166,11 +176,48 @@ pub fn unix_timestamp() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::operation::{OperationCheckpoint, OperationKind, OperationStage};
     use serde_json::json;
+
+    fn legacy_state_json() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "deployment_id": "deployment-one",
+            "target_fingerprint": "target-one",
+            "container_name": "newapi",
+            "directory": "/opt/meowai-deploy/newapi",
+            "newapi_port": 3000,
+            "kuma_port": 3001,
+            "image": "registry.example/newapi",
+            "image_ref": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        })
+    }
+
+    #[test]
+    fn state_without_operation_checkpoint_remains_compatible() {
+        let state: DeploymentState =
+            serde_json::from_value(legacy_state_json()).expect("legacy state");
+        assert!(state.operation.is_none());
+    }
+
+    #[test]
+    fn operation_checkpoint_round_trips_with_deployment_state() {
+        let mut state: DeploymentState =
+            serde_json::from_value(legacy_state_json()).expect("legacy state");
+        let mut checkpoint = OperationCheckpoint::new("operation-one", OperationKind::Onboard);
+        checkpoint.start().expect("start operation");
+        checkpoint
+            .start_stage(OperationStage::TargetValidation)
+            .expect("start target validation");
+        state.operation = Some(checkpoint.clone());
+        let encoded = serde_json::to_vec(&state).expect("encode state");
+        let decoded: DeploymentState = serde_json::from_slice(&encoded).expect("decode state");
+        assert_eq!(decoded.operation, Some(checkpoint));
+    }
 
     #[test]
     fn legacy_state_deserializes_with_snapshot_defaults() {
-        let legacy = json!({
+        let legacy = serde_json::json!({
             "schema_version": 1,
             "deployment_id": "legacy",
             "target_fingerprint": "host",

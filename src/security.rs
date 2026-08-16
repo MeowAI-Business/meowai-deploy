@@ -1,14 +1,12 @@
-use std::{
-    fs::{self, OpenOptions},
-    io::Write,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
-    path::Path,
-};
+use std::path::Path;
 
 use rand::{Rng, distributions::Alphanumeric};
 use sha2::{Digest, Sha256};
 
-use crate::error::{AppError, Result};
+use crate::{
+    error::{AppError, Result},
+    platform,
+};
 
 pub fn random_secret(length: usize) -> String {
     rand::thread_rng()
@@ -24,43 +22,7 @@ pub fn sha256_hex(value: &[u8]) -> String {
 }
 
 pub fn write_private_file(path: &Path, content: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| AppError::State(format!("{} has no parent directory", path.display())))?;
-    fs::create_dir_all(parent).map_err(|source| AppError::WriteFile {
-        path: parent.to_owned(),
-        source,
-    })?;
-    let temporary = parent.join(format!(
-        ".{}.tmp-{}",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("secret"),
-        std::process::id()
-    ));
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(&temporary)
-        .map_err(|source| AppError::WriteFile {
-            path: temporary.clone(),
-            source,
-        })?;
-    file.write_all(content)
-        .and_then(|_| file.sync_all())
-        .map_err(|source| AppError::WriteFile {
-            path: temporary.clone(),
-            source,
-        })?;
-    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600)).map_err(|source| {
-        AppError::WriteFile {
-            path: temporary.clone(),
-            source,
-        }
-    })?;
-    fs::rename(&temporary, path).map_err(|source| AppError::WriteFile {
+    platform::write_private_file(path, content).map_err(|source| AppError::WriteFile {
         path: path.to_owned(),
         source,
     })
@@ -77,10 +39,14 @@ pub fn validate_env_value(name: &str, value: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn private_file_is_written_with_owner_only_permissions() {
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -88,6 +54,15 @@ mod tests {
         write_private_file(&path, b"SECRET=value\n").expect("write secret");
         let metadata = fs::metadata(path).expect("secret metadata");
         assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn private_file_is_replaced_atomically() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("session.json");
+        write_private_file(&path, b"old").expect("initial secret");
+        write_private_file(&path, b"new").expect("replacement secret");
+        assert_eq!(fs::read(path).expect("secret content"), b"new");
     }
 
     #[test]

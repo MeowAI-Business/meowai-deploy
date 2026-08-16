@@ -76,3 +76,23 @@ impl From<std::io::Error> for AppError {
         Self::Message(source.to_string())
     }
 }
+
+impl From<crate::application::error::ApplicationError> for AppError {
+    fn from(error: crate::application::error::ApplicationError) -> Self {
+        use crate::application::error::ErrorCategory;
+
+        match error.category {
+            ErrorCategory::Cancelled => Self::Cancelled,
+            ErrorCategory::Validation => {
+                Self::InvalidConfig(format!("{} ({})", error.message, error.code))
+            }
+            ErrorCategory::Target => Self::Target(format!("{} ({})", error.message, error.code)),
+            ErrorCategory::Source
+            | ErrorCategory::Authentication
+            | ErrorCategory::Authorization => {
+                Self::Message(format!("{} ({})", error.message, error.code))
+            }
+            _ => Self::State(format!("{} ({})", error.message, error.code)),
+        }
+    }
+}

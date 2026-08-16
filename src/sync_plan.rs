@@ -20,6 +20,7 @@ use crate::{
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
 pub enum SyncModule {
     Groups,
     Channels,
@@ -197,6 +198,15 @@ impl SyncPlan {
             })
         })
     }
+
+    pub fn fingerprint(&self) -> String {
+        let value = serde_json::json!({
+            "source": self.source,
+            "downstream": self.downstream,
+            "last_applied": self.last_applied,
+        });
+        fingerprint(&value)
+    }
 }
 
 pub fn snapshot_from_modules(modules: BTreeMap<SyncModule, Value>) -> SyncSnapshot {
@@ -246,7 +256,7 @@ pub fn build_source_modules(
 
     for option in input.pricing.options()? {
         let value = serde_json::from_str(&option.canonical_json)
-            .unwrap_or_else(|_| Value::String(option.canonical_json));
+            .unwrap_or(Value::String(option.canonical_json));
         modules
             .get_mut(&module_for_pricing_key(option.key))
             .expect("all sync modules initialized")
@@ -547,6 +557,7 @@ pub fn module_for_pricing_key(key: &str) -> SyncModule {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum SnapshotClassification {
     Unchanged,
     SourceChanged,
@@ -557,6 +568,7 @@ pub enum SnapshotClassification {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum RiskLevel {
     Low,
     Medium,

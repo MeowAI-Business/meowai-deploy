@@ -1,6 +1,5 @@
 use std::{
     env, fmt, fs, io,
-    net::IpAddr,
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -8,24 +7,26 @@ use std::{
 use cliclack::{input, intro, outro, password, select, spinner};
 use console::{Term, style};
 use rand::{Rng, distributions::Alphanumeric};
-use reqwest::Url;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
+    application::{
+        input::{self, DeploymentInput, DeploymentTargetInput, InputField, ValidationError},
+        source::{self as application_source, SourceAccountRequest},
+    },
     cli::OnboardArgs,
     error::{AppError, Result},
+    platform,
     registry::latest_image_digest,
-    source::{SourceAccountMode, SourceClient, SourceCredentials, SourceIdentity},
+    source::{SourceAccountMode, SourceClient, SourceIdentity},
     target::TargetExecutor,
 };
 
-pub const DEFAULT_SOURCE_URL: &str = "https://enterprise.meowai.net";
-pub const DEFAULT_WEBSITE_NAME: &str = "Meow AI Downstream";
-pub const DEFAULT_NEWAPI_PORT: u16 = 3000;
-pub const DEFAULT_KUMA_PORT: u16 = 3001;
-pub const DEFAULT_IMAGE: &str = "ghcr.io/moorcorpa/new-api-outgap";
+pub use input::{
+    DEFAULT_IMAGE, DEFAULT_KUMA_PORT, DEFAULT_NEWAPI_PORT, DEFAULT_SOURCE_URL, DEFAULT_WEBSITE_NAME,
+};
 
 static PROMPT_SECTION: Mutex<Option<String>> = Mutex::new(None);
 
@@ -70,16 +71,16 @@ impl Default for DeploymentConfig {
             source_username: String::new(),
             source_password: None,
             website_name: DEFAULT_WEBSITE_NAME.to_owned(),
-            container_name: "newapi".to_owned(),
-            directory: PathBuf::from("/opt/meowai-deploy/newapi"),
-            newapi_bind: "0.0.0.0".to_owned(),
-            kuma_bind: "0.0.0.0".to_owned(),
+            container_name: input::DEFAULT_CONTAINER_NAME.to_owned(),
+            directory: PathBuf::from(input::DEFAULT_DIRECTORY),
+            newapi_bind: input::DEFAULT_BIND.to_owned(),
+            kuma_bind: input::DEFAULT_BIND.to_owned(),
             newapi_port: DEFAULT_NEWAPI_PORT,
             kuma_port: DEFAULT_KUMA_PORT,
             target: Target::Local,
-            newapi_admin_username: "admin".to_owned(),
+            newapi_admin_username: input::DEFAULT_ADMIN_USERNAME.to_owned(),
             newapi_admin_password: None,
-            kuma_admin_username: "admin".to_owned(),
+            kuma_admin_username: input::DEFAULT_ADMIN_USERNAME.to_owned(),
             kuma_admin_password: None,
             image: DEFAULT_IMAGE.to_owned(),
             image_ref: String::new(),
@@ -136,12 +137,11 @@ image_ref = ""
     }
 
     pub fn normalize(&mut self) {
-        if self.website_name.trim().is_empty() {
-            self.website_name = DEFAULT_WEBSITE_NAME.to_owned();
-        }
-        if self.directory.as_os_str().is_empty() {
-            self.directory = PathBuf::from(format!("/opt/meowai-deploy/{}", self.container_name));
-        }
+        let mut input = self.deployment_input();
+        input.normalize();
+        self.website_name = input.website_name;
+        self.container_name = input.container_name;
+        self.directory = input.directory;
     }
 
     pub fn resolve_passwords(&mut self) {
@@ -170,61 +170,12 @@ image_ref = ""
     }
 
     pub fn validate(&self) -> Result<()> {
-        Url::parse(&self.source_url)
-            .map_err(|_| AppError::InvalidConfig("source_url must be a valid URL".to_owned()))?;
-        if self.website_name.trim().is_empty() {
+        if matches!(self.target, Target::Local) && !platform::supports_local_target() {
             return Err(AppError::InvalidConfig(
-                "website_name cannot be empty".to_owned(),
+                "Windows 控制端不支持本机部署；请使用 --ssh user@linux-host".to_owned(),
             ));
         }
-        validate_identifier("container_name", &self.container_name)?;
-        validate_directory(&self.directory)?;
-        validate_bind("newapi_bind", &self.newapi_bind)?;
-        validate_bind("kuma_bind", &self.kuma_bind)?;
-        if self.newapi_port == 0 || self.kuma_port == 0 {
-            return Err(AppError::InvalidConfig(
-                "ports must be between 1 and 65535".to_owned(),
-            ));
-        }
-        if self.newapi_port == self.kuma_port {
-            return Err(AppError::InvalidConfig(
-                "New API and Kuma ports must be different".to_owned(),
-            ));
-        }
-        if self.newapi_admin_username.trim().is_empty()
-            || self.kuma_admin_username.trim().is_empty()
-        {
-            return Err(AppError::InvalidConfig(
-                "administrator usernames cannot be empty".to_owned(),
-            ));
-        }
-        if self.newapi_admin_username.len() > 12 {
-            return Err(AppError::InvalidConfig(
-                "New API administrator username must not exceed 12 characters".to_owned(),
-            ));
-        }
-        if self.image.trim().is_empty() || self.image_ref.trim().is_empty() {
-            return Err(AppError::InvalidConfig(
-                "image and image_ref cannot be empty".to_owned(),
-            ));
-        }
-        if !is_immutable_image_ref(&self.image_ref) {
-            return Err(AppError::InvalidConfig(
-                "image_ref must be a 7-64 character hexadecimal commit SHA or sha256 digest"
-                    .to_owned(),
-            ));
-        }
-        Ok(())
-    }
-
-    pub fn source_credentials(&self) -> Result<SourceCredentials> {
-        let password = self.source_password.clone().ok_or_else(|| {
-            AppError::InvalidConfig(
-                "source password is required; set MEOWAI_DEPLOY_SOURCE_PASSWORD or use the prompt"
-                    .to_owned(),
-            )
-        })?;
-        SourceCredentials::new(self.source_username.clone(), password).map_err(AppError::from)
+        self.deployment_input().validate().map_err(invalid_config)
     }
 
     pub fn deployment_id(&self) -> String {
@@ -246,6 +197,29 @@ image_ref = ""
         match &self.target {
             Target::Local => "local".to_owned(),
             Target::Ssh { destination } => format!("ssh:{destination}"),
+        }
+    }
+
+    pub fn deployment_input(&self) -> DeploymentInput {
+        DeploymentInput {
+            source_url: self.source_url.clone(),
+            website_name: self.website_name.clone(),
+            container_name: self.container_name.clone(),
+            directory: self.directory.clone(),
+            newapi_bind: self.newapi_bind.clone(),
+            kuma_bind: self.kuma_bind.clone(),
+            newapi_port: self.newapi_port,
+            kuma_port: self.kuma_port,
+            target: match &self.target {
+                Target::Local => DeploymentTargetInput::Local,
+                Target::Ssh { destination } => DeploymentTargetInput::Ssh {
+                    destination: destination.clone(),
+                },
+            },
+            newapi_admin_username: self.newapi_admin_username.clone(),
+            kuma_admin_username: self.kuma_admin_username.clone(),
+            image: self.image.clone(),
+            image_ref: self.image_ref.clone(),
         }
     }
 }
@@ -318,21 +292,28 @@ pub async fn interactive_config(
 pub async fn authenticate_source(
     config: &DeploymentConfig,
 ) -> Result<(SourceClient, SourceIdentity)> {
-    let mut source = SourceClient::new(&config.source_url)?;
-    source.check_connectivity().await?;
-    let credentials = config.source_credentials()?;
-    let identity = source
-        .authenticate(config.source_account_mode, &credentials)
-        .await?;
-    source.check_onboard_access().await?;
-    Ok((source, identity))
+    let password = config.source_password.clone().ok_or_else(|| {
+        AppError::InvalidConfig(
+            "source password is required; set MEOWAI_DEPLOY_SOURCE_PASSWORD or use the prompt"
+                .to_owned(),
+        )
+    })?;
+    let request = SourceAccountRequest::new(
+        config.source_url.clone(),
+        config.source_account_mode,
+        config.source_username.clone(),
+        password,
+    )?;
+    let authenticated = match config.source_account_mode {
+        SourceAccountMode::Login => application_source::login_source_account(request).await?,
+        SourceAccountMode::Register => application_source::register_source_account(request).await?,
+    };
+    Ok((authenticated.client, authenticated.identity))
 }
 
 pub async fn reauthenticate_source(
     config: &DeploymentConfig,
 ) -> Result<(SourceClient, SourceIdentity)> {
-    let mut source = SourceClient::new(&config.source_url)?;
-    source.check_connectivity().await?;
     let mut account_error = None;
     loop {
         prompt_screen("源站重新登录")?;
@@ -342,22 +323,20 @@ pub async fn reauthenticate_source(
             3,
         )?;
         let source_password = prompt_io(password(label).mask('•').interact())?;
-        let credentials = match SourceCredentials::new(
+        let request = match SourceAccountRequest::new(
+            config.source_url.clone(),
+            SourceAccountMode::Login,
             config.source_username.clone(),
             SecretString::from(source_password),
         ) {
-            Ok(credentials) => credentials,
+            Ok(request) => request,
             Err(_) => {
                 account_error = Some("密码长度不符合要求".to_owned());
                 continue;
             }
         };
-        match source
-            .authenticate(SourceAccountMode::Login, &credentials)
-            .await
-        {
-            Ok(identity) => {
-                source.check_onboard_access().await?;
+        match application_source::login_source_account(request).await {
+            Ok(authenticated) => {
                 redraw_success(
                     "源站账号",
                     &config.source_username,
@@ -365,7 +344,7 @@ pub async fn reauthenticate_source(
                     3,
                 )?;
                 finish_prompt_flow()?;
-                return Ok((source, identity));
+                return Ok((authenticated.client, authenticated.identity));
             }
             Err(_) => {
                 account_error = Some("登录失败，请检查密码".to_owned());
@@ -378,23 +357,22 @@ async fn prompt_config(
     args: &OnboardArgs,
 ) -> Result<(DeploymentConfig, SourceClient, SourceIdentity)> {
     let mut source_error = None;
-    let (source_url, mut source) = loop {
+    let source_url = loop {
         prompt_screen("源站账号")?;
         let label = retry_label("源站 URL", source_error.as_deref(), 3)?;
         let source_url: String =
             prompt_io(input(label).default_input(DEFAULT_SOURCE_URL).interact())?;
-        match SourceClient::new(&source_url) {
-            Ok(candidate) => match candidate.check_connectivity().await {
-                Ok(()) => {
-                    redraw_success("源站 URL", &source_url, "可连通", 3)?;
-                    break (source_url, candidate);
-                }
-                Err(_) => {
-                    source_error = Some("无法连通，请检查地址和网络".to_owned());
-                }
-            },
+        if input::validate_source_url(&source_url).is_err() {
+            source_error = Some("URL 格式无效".to_owned());
+            continue;
+        }
+        match application_source::probe_source_url(&source_url).await {
+            Ok(_) => {
+                redraw_success("源站 URL", &source_url, "可连通", 3)?;
+                break source_url;
+            }
             Err(_) => {
-                source_error = Some("URL 格式无效".to_owned());
+                source_error = Some("无法连通，请检查地址和网络".to_owned());
             }
         }
     };
@@ -415,32 +393,44 @@ async fn prompt_config(
             .interact(),
     )?;
     let mut account_error = None;
-    let (source_username, source_password, identity) = loop {
+    let (source_username, source_password, source, identity) = loop {
         prompt_screen("源站账号")?;
         let username_label = retry_label("源站用户名", account_error.as_deref(), 6)?;
         let source_username: String = prompt_io(input(username_label).interact())?;
         prompt_screen("源站账号")?;
         let source_password = prompt_io(password("源站密码").mask('•').interact())?;
-        let credentials = match SourceCredentials::new(
+        let request = match SourceAccountRequest::new(
+            source_url.clone(),
+            source_account_mode,
             source_username.clone(),
             SecretString::from(source_password.clone()),
         ) {
-            Ok(credentials) => credentials,
+            Ok(request) => request,
             Err(_) => {
                 account_error = Some("账号长度或密码长度不符合要求".to_owned());
                 continue;
             }
         };
-        match source.authenticate(source_account_mode, &credentials).await {
-            Ok(identity) => {
-                source.check_onboard_access().await?;
+        let authenticated = match source_account_mode {
+            SourceAccountMode::Login => application_source::login_source_account(request).await,
+            SourceAccountMode::Register => {
+                application_source::register_source_account(request).await
+            }
+        };
+        match authenticated {
+            Ok(authenticated) => {
                 let status = if source_account_mode == SourceAccountMode::Register {
                     "注册成功 · 已获上游批准"
                 } else {
                     "登录成功 · 已获上游批准"
                 };
                 redraw_success("源站账号", &source_username, status, 6)?;
-                break (source_username, Some(source_password), identity);
+                break (
+                    source_username,
+                    Some(source_password),
+                    authenticated.client,
+                    authenticated.identity,
+                );
             }
             Err(_) => {
                 account_error = Some("登录/注册失败，请检查账号密码".to_owned());
@@ -457,7 +447,7 @@ async fn prompt_config(
     let container_name = prompt_container_name()?;
     let default_directory = format!("/opt/meowai-deploy/{container_name}");
     let directory = prompt_directory(&default_directory)?;
-    let target: String = if args.ssh.is_some() {
+    let target: String = if cfg!(windows) || args.ssh.is_some() {
         "ssh".to_owned()
     } else if args.local {
         "local".to_owned()
@@ -486,7 +476,7 @@ async fn prompt_config(
     if matches!(target, Target::Ssh { .. }) {
         let progress = spinner();
         progress.start("正在验证 SSH 连接和部署权限");
-        match executor.validate_access() {
+        match executor.validate_access_interactive() {
             Ok(()) => progress.stop("SSH 连接和部署权限可用"),
             Err(error) => {
                 progress.error("SSH 连接或部署权限不可用");
@@ -569,7 +559,12 @@ fn prompt_directory(default: &str) -> Result<PathBuf> {
         let label = retry_label("部署目录", error.as_deref(), 3)?;
         let value: String = prompt_io(input(label).default_input(default).interact())?;
         let directory = PathBuf::from(value);
-        match validate_directory(&directory) {
+        let validation = if cfg!(windows) {
+            input::validate_remote_directory(&directory).map_err(invalid_config)
+        } else {
+            validate_directory(&directory)
+        };
+        match validation {
             Ok(()) => {
                 redraw_success("部署目录", &directory.display().to_string(), "路径有效", 3)?;
                 return Ok(directory);
@@ -774,26 +769,11 @@ fn finish_prompt_flow() -> Result<()> {
 }
 
 fn validate_directory(directory: &Path) -> Result<()> {
-    if !directory.is_absolute() {
-        return Err(AppError::InvalidConfig(
-            "directory must be an absolute path".to_owned(),
-        ));
-    }
-    let value = directory.to_string_lossy();
-    if !value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'_' | b'-' | b'.'))
-    {
-        return Err(AppError::InvalidConfig(
-            "directory may contain only letters, numbers, '/', '_', '-' and '.'".to_owned(),
-        ));
-    }
-    Ok(())
+    input::validate_directory(directory).map_err(invalid_config)
 }
 
 fn is_immutable_image_ref(value: &str) -> bool {
-    let value = value.strip_prefix("sha256:").unwrap_or(value);
-    (7..=64).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    input::is_immutable_image_ref(value)
 }
 
 pub fn random_secret() -> String {
@@ -805,29 +785,21 @@ pub fn random_secret() -> String {
 }
 
 fn validate_identifier(field: &str, value: &str) -> Result<()> {
-    if value.is_empty()
-        || value.len() > 63
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
-    {
-        return Err(AppError::InvalidConfig(format!(
-            "{field} must contain only ASCII letters, digits, '-', '_' or '.' and be at most 63 characters"
-        )));
-    }
-    Ok(())
+    let field = match field {
+        "container_name" => InputField::ContainerName,
+        _ => InputField::ContainerName,
+    };
+    input::validate_identifier(field, value).map_err(invalid_config)
 }
 
-fn validate_bind(field: &str, value: &str) -> Result<()> {
-    value
-        .parse::<IpAddr>()
-        .map_err(|_| AppError::InvalidConfig(format!("{field} must be an IP address")))?;
-    Ok(())
+fn invalid_config(error: ValidationError) -> AppError {
+    AppError::InvalidConfig(error.message)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source::SourceCredentials;
 
     #[test]
     fn defaults_are_deploy_defaults() {

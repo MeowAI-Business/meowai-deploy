@@ -1,51 +1,105 @@
-use std::collections::{BTreeMap, BTreeSet};
-
 use clap::CommandFactory;
-use cliclack::{confirm, select, spinner};
+use cliclack::{confirm, select};
 use console::style;
 use secrecy::ExposeSecret;
+use serde::Serialize;
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
+    application::{
+        error::ApplicationError,
+        manage::{ContainerStatus, clean_deployment, read_deployment_status, rollback_deployment},
+        onboard::{
+            DeploymentStateCheckpointStore, ProductionOnboardBackend, resume_onboard, start_onboard,
+        },
+        operation::{
+            CancellationToken, EventSeverity, EventSink, OperationEvent, OperationEventKind,
+            OperationStatus,
+        },
+    },
+    bootstrap,
     cli::{CleanArgs, Cli, Command, DeploymentArgs, OnboardArgs, RollbackArgs, SyncArgs},
     config::{DeploymentConfig, authenticate_source, interactive_config, reauthenticate_source},
     doctor,
     error::{AppError, Result},
+    lifecycle_outbox, platform,
     pricing::{MarginPreview, MarginRisk, PricingConfig},
     security::sha256_hex,
     source::{
         GroupCatalog, GroupTokenPlan, RemovedGroupTokenPlan, SourceClient, SourceError,
-        StatusKeyProvision, StatusManifest,
+        StatusManifest,
     },
-    source_key_store,
     state::{
         DOWNSTREAM_CLEANUP_PHASE, DeploymentState, SNAPSHOT_SCHEMA_VERSION, SyncSnapshot,
         load_snapshot, save_snapshot, unix_timestamp,
     },
     storage::{
         self, CONFIG_FILE, CREDENTIALS_FILE, DOWNSTREAM_LAST_SEEN_SNAPSHOT, LAST_APPLIED_SNAPSHOT,
-        PRE_APPLY_SNAPSHOT, SESSION_FILE, SOURCE_LAST_SEEN_SNAPSHOT, STATE_FILE,
+        OPERATION_FILE, PRE_APPLY_SNAPSHOT, SESSION_FILE, SOURCE_LAST_SEEN_SNAPSHOT, STATE_FILE,
     },
     sync_plan::{
         FieldDiff, RiskLevel, SnapshotClassification, SourceSnapshotInput, SyncModule, SyncPlan,
         advance_last_applied, build_source_modules, checkpoint_last_applied, parse_modules,
         snapshot_from_modules, snapshots_match, update_snapshot_module,
     },
+    target::compose::DeploymentRuntime,
     target::kuma,
     target::newapi::NewApiClient,
-    target::{
-        TargetExecutor,
-        compose::{DeploymentRuntime, DeploymentSecrets},
-    },
-    updater,
+    updater, web,
 };
 
+#[cfg(test)]
+use crate::source::DeploymentRegistration;
+
+struct CliEventSink;
+
+impl EventSink for CliEventSink {
+    fn emit(&self, event: OperationEvent) {
+        match event.kind {
+            OperationEventKind::StageStarted => print_action(&event.message),
+            OperationEventKind::StageCompleted => print_done(&event.message),
+            OperationEventKind::Message => match event.severity {
+                EventSeverity::Debug => print_action(&event.message),
+                EventSeverity::Info => print_done(&event.message),
+                EventSeverity::Warning => print_message("提示", &event.message),
+                EventSeverity::Error => print_message("失败", &event.message),
+            },
+            OperationEventKind::RecoverableFailure { .. }
+            | OperationEventKind::FatalFailure { .. } => print_message("部署失败", &event.message),
+            OperationEventKind::OperationCompleted => print_success(&event.message),
+            OperationEventKind::OperationStarted
+            | OperationEventKind::ProgressChanged { .. }
+            | OperationEventKind::CredentialGenerated { .. }
+            | OperationEventKind::OperationCancelled => {}
+        }
+    }
+}
+
 pub async fn run(cli: Cli) -> Result<()> {
-    if !matches!(cli.command, Some(Command::Update(_))) {
+    match lifecycle_outbox::flush().await {
+        Ok(sent) if sent > 0 => print_done(&format!("已补送 {sent} 条待处理生命周期事件")),
+        Err(error) => eprintln!(
+            "{}",
+            style(format!("警告：待处理生命周期事件仍未送达：{error}")).yellow()
+        ),
+        _ => {}
+    }
+    if !matches!(cli.command, Some(Command::Update(_) | Command::Web(_))) {
         updater::check_periodically().await;
     }
     match cli.command {
+        None if platform::should_launch_webui_without_args() => {
+            web::run(&crate::cli::WebArgs {
+                host: "0.0.0.0".parse().expect("valid default WebUI host"),
+                port: 0,
+                no_open: false,
+            })
+            .await
+        }
         None => print_help(),
+        Some(Command::Bootstrap(args)) => bootstrap::run(&args),
+        Some(Command::Web(args)) => web::run(&args).await,
         Some(Command::Doctor(args)) => doctor::run(&args).await,
         Some(Command::Onboard(args)) => run_onboard(&args).await,
         Some(Command::Sync(args)) => run_sync(&args).await,
@@ -67,6 +121,7 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
         );
         return Ok(());
     }
+    doctor::preflight_onboard(args)?;
     if args.non_interactive && args.config.is_none() {
         return Err(AppError::InvalidConfig(
             "--non-interactive requires --config FILE".to_owned(),
@@ -120,7 +175,7 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
     config.resolve_passwords();
     ensure_compatible_current_deployment(&config)?;
     persist_source_session(&source)?;
-
+    let deployment_input = config.deployment_input();
     if load_saved_deployment_state()?
         .as_ref()
         .is_some_and(DeploymentState::downstream_is_initialized)
@@ -135,6 +190,7 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
             apply: Vec::new(),
             pricing: false,
             force: false,
+            plan_fingerprint: None,
         };
         return run_sync_loaded(&sync_args, &config).await;
     }
@@ -180,213 +236,103 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
     persist_deployment_config(&config)?;
     println!();
 
-    print_action("同步源站分组 Token");
-    let token_sync = source.ensure_group_tokens(&catalog).await?;
-    print_done("源站分组 Token 已就绪");
-
-    print_action("准备源站公共状态密钥");
-    let (status_key, shared_status_key) =
-        resolve_source_status_key(&mut source, &config, identity.user_id).await?;
-    print_done(if status_key.created {
-        "源站公共状态密钥已创建"
+    let previous_checkpoint = if resume_existing {
+        load_operation_checkpoint()?
     } else {
-        "源站公共状态密钥已复用"
-    });
-    print_message(
-        "源站资源",
-        &format!(
-            "账号：{}\n分组：{}\n分组 Token：新建 {}，复用 {}，修正 {}\n公共状态密钥：{}\n分组响应哈希：{}",
-            identity.username,
-            catalog.groups.len(),
-            token_sync.created,
-            token_sync.reused,
-            token_sync.updated,
-            if status_key.created {
-                "已创建"
-            } else {
-                "已复用"
-            },
-            catalog.response_sha256
-        ),
-    );
+        None
+    };
+    let operation_id = format!("onboard-{}-{}", config.deployment_id(), unix_timestamp());
+    let mut backend = ProductionOnboardBackend::new(config, source, identity);
+    let mut checkpoint_store = DeploymentStateCheckpointStore;
+    let mut result = match previous_checkpoint {
+        Some(checkpoint)
+            if matches!(
+                checkpoint.status,
+                OperationStatus::Running | OperationStatus::Failed
+            ) =>
+        {
+            resume_onboard(
+                &mut backend,
+                &deployment_input,
+                checkpoint,
+                CliEventSink,
+                &mut checkpoint_store,
+            )
+            .await
+        }
+        _ => {
+            start_onboard(
+                &mut backend,
+                &deployment_input,
+                operation_id,
+                CliEventSink,
+                &mut checkpoint_store,
+            )
+            .await
+        }
+    };
+    if result
+        .as_ref()
+        .is_err_and(|error| error.code == "STATUS_KEY_CONTENT_UNAVAILABLE")
+    {
+        let confirmed = confirm(
+            "源站已有公共状态密钥，但这台机器没有保存密钥内容。继续会生成新密钥，其他正在使用旧密钥的下游状态页会失效。是否继续？",
+        )
+        .initial_value(true)
+        .interact()
+        .map_err(AppError::from_prompt)?;
+        if !confirmed {
+            return Err(AppError::State(
+                "未生成新公共状态密钥；旧密钥仍然有效，未作修改".to_owned(),
+            ));
+        }
+        backend.allow_status_key_rotation();
+        let checkpoint = load_operation_checkpoint()?.ok_or_else(|| {
+            AppError::State("公共状态密钥恢复缺少 operation checkpoint".to_owned())
+        })?;
+        result = resume_onboard(
+            &mut backend,
+            &deployment_input,
+            checkpoint,
+            CliEventSink,
+            &mut checkpoint_store,
+        )
+        .await;
+    }
+    let result = result.map_err(application_error)?;
 
-    print_action("准备下游部署状态");
-    let mut deployment = DeploymentRuntime::prepare(
-        &config,
-        identity.user_id,
-        &catalog.response_sha256,
-        status_key.metadata.id,
-        shared_status_key.as_ref(),
-    )?;
-    source_key_store::save(
-        &config.source_url,
-        identity.user_id,
-        status_key.metadata.id,
-        &deployment.secrets.public_status_source_key,
-    )?;
-    print_done("下游部署状态已就绪");
-    if deployment.credentials_should_display {
+    let credential_lines = result
+        .credentials
+        .iter()
+        .map(|credential| {
+            let label = match credential.kind.as_str() {
+                "newapi_admin" => "New API    ",
+                "kuma_admin" => "Uptime Kuma",
+                _ => credential.kind.as_str(),
+            };
+            format!(
+                "{label} {} / {}",
+                credential.username,
+                credential.password.expose_secret()
+            )
+        })
+        .collect::<Vec<_>>();
+    if !credential_lines.is_empty() {
         print_message(
             "管理员凭证",
             &format!(
-                "New API     {} / {}\nUptime Kuma {} / {}\n\n请立即保存；凭证不会写入普通日志。",
-                config.newapi_admin_username,
-                deployment.secrets.newapi_admin_password.expose_secret(),
-                config.kuma_admin_username,
-                deployment.secrets.kuma_admin_password.expose_secret()
+                "{}\n\n请立即保存；凭证不会写入普通日志。",
+                credential_lines.join("\n")
             ),
         );
     }
-    deploy_base_stack_with_progress(&mut deployment, &config)?;
-    print_action("初始化下游管理员和站点配置");
-    let mut downstream = NewApiClient::connect(&deployment.executor, deployment.state.newapi_port)?;
-    downstream
-        .initialize_and_login(&config, &deployment.secrets.newapi_admin_password)
-        .await?;
-    downstream.configure_site(&config.website_name).await?;
-    deployment
-        .state
-        .mark_phase("newapi", "DONE", "administrator and site initialized");
-    deployment.persist_state()?;
-    print_done("下游管理员已生成，站点配置已写入");
-
-    print_action("导入价格、计费、分组行为、价格表、Seedance 和市场配置");
-    downstream.apply_group_structure(&catalog).await?;
-    downstream.apply_group_pricing(&catalog).await?;
-    downstream.apply_topup_pricing(&catalog).await?;
-    let pricing_hashes = downstream.import_pricing(&source_pricing).await?;
-    deployment.state.pricing_sha256 = pricing_hashes;
-    deployment.state.mark_phase(
-        "pricing",
-        "DONE",
-        "价格、计费、分组行为、价格表、Seedance 和市场配置已写入并回读一致",
+    tracing::debug!(
+        operation_id = %result.operation_id,
+        status = ?result.checkpoint.status,
+        "onboard operation completed"
     );
-    deployment.persist_state()?;
-    print_done("价格、计费、分组行为、价格表、Seedance 和市场配置已校验");
-
-    print_action("同步下游分组渠道");
-    let (channel_result, channels) = downstream
-        .sync_channels_with_pricing(
-            &config,
-            &deployment.container_source_url,
-            &catalog,
-            &token_sync.bindings,
-            &deployment.state.channels,
-            true,
-            Some(&source_pricing),
-        )
-        .await?;
-    deployment.state.channels = channels;
-    deployment.state.mark_phase(
-        "channels",
-        "DONE",
-        format!(
-            "渠道新建 {}，复用 {}，更新 {}",
-            channel_result.created, channel_result.reused, channel_result.updated
-        ),
-    );
-    deployment.persist_state()?;
-    print_done(&format!(
-        "下游渠道已同步：新建 {}，复用 {}，更新 {}",
-        channel_result.created, channel_result.reused, channel_result.updated
-    ));
-    deploy_kuma_with_progress(&mut deployment, &config)?;
-
-    print_action("克隆公共状态页、分组和监控");
-    let manifest = source
-        .onboard_status_manifest(&deployment.secrets.public_status_source_key)
-        .await?;
-    let deployment_id = config.deployment_id();
-    let kuma_sync = kuma::sync_status_page(kuma::KumaSyncOptions {
-        executor: &deployment.executor,
-        container_name: &config.container_name,
-        deployment_id: &deployment_id,
-        website_name: &config.website_name,
-        source_base_url: &deployment.container_source_url,
-        status_key: &deployment.secrets.public_status_source_key,
-        kuma_username: &config.kuma_admin_username,
-        kuma_password: &deployment.secrets.kuma_admin_password,
-        force: true,
-        manifest: &manifest,
-    })?;
-    deployment.state.manifest_sha256 = kuma_sync.manifest_sha256;
-    deployment.state.kuma_monitors = kuma_sync.monitors;
-    let public_status_url = kuma::internal_status_page_url(&kuma_sync.page_slug);
-    downstream
-        .configure_public_status_url(&public_status_url)
-        .await?;
-    deployment.state.mark_phase(
-        "kuma",
-        "DONE",
-        format!(
-            "status page {} and managed monitors synchronized",
-            kuma_sync.page_slug
-        ),
-    );
-    deployment.persist_state()?;
-    print_done(&format!(
-        "已同步 {} 个公共状态监控，公开状态页 {}",
-        deployment.state.kuma_monitors.len(),
-        public_status_url
-    ));
-    let token_plan = source.plan_group_tokens(&catalog).await?;
-    let active_group_ids = catalog
-        .groups
-        .iter()
-        .map(|group| group.group_id.clone())
-        .collect::<BTreeSet<_>>();
-    let removed_tokens = source.plan_removed_group_tokens(&active_group_ids).await?;
-    let deployment_id = config.deployment_id();
-    let status_key_sha256 = sha256_hex(
-        format!(
-            "Bearer {}",
-            deployment.secrets.public_status_source_key.expose_secret()
-        )
-        .as_bytes(),
-    );
-    let source_modules = build_source_modules(SourceSnapshotInput {
-        catalog: &catalog,
-        pricing: &source_pricing,
-        token_plan: &token_plan,
-        removed_tokens: &removed_tokens,
-        manifest: &manifest,
-        deployment_id: &deployment_id,
-        website_name: &config.website_name,
-        container_source_url: &deployment.container_source_url,
-        status_key_sha256: &status_key_sha256,
-    })?;
-    let source_snapshot = snapshot_from_modules(source_modules);
-    let downstream_snapshot = snapshot_from_modules(
-        read_downstream_modules(
-            &downstream,
-            &catalog,
-            &source_pricing,
-            &manifest,
-            &source_snapshot,
-            &config,
-            &deployment,
-        )
-        .await?,
-    );
-    save_snapshot(SOURCE_LAST_SEEN_SNAPSHOT, &source_snapshot)?;
-    save_snapshot(DOWNSTREAM_LAST_SEEN_SNAPSHOT, &downstream_snapshot)?;
-    save_snapshot(LAST_APPLIED_SNAPSHOT, &downstream_snapshot)?;
-    deployment.state.snapshot_schema_version = SNAPSHOT_SCHEMA_VERSION;
-    deployment.state.last_applied_at = SyncModule::ALL
-        .into_iter()
-        .map(|module| (module.name().to_owned(), unix_timestamp()))
-        .collect();
-    deployment.persist_state()?;
-    deployment.state.last_sync_at = unix_timestamp();
-    deployment.state.last_sync_success = true;
-    deployment.state.mark_phase(
-        "onboard",
-        "DONE",
-        "base services, pricing, channels and public status initialized",
-    );
-    deployment.persist_state()?;
-    persist_source_session(&source)?;
-    print_success("下游基础服务、管理员、价格、渠道和公共状态初始化完成");
+    // Registration, updater installation and lifecycle reporting are handled by the shared
+    // application onboard backend. The CLI only renders its events.
     Ok(())
 }
 
@@ -404,9 +350,44 @@ async fn run_sync(args: &SyncArgs) -> Result<()> {
     run_sync_loaded(args, &config).await
 }
 
-async fn run_sync_loaded(args: &SyncArgs, config: &DeploymentConfig) -> Result<()> {
-    let mut deployment = DeploymentRuntime::load_existing(&config)?;
-    let result = run_sync_inner(args, &config, &mut deployment).await;
+pub(crate) async fn run_sync_loaded(args: &SyncArgs, config: &DeploymentConfig) -> Result<()> {
+    run_sync_loaded_with_credentials(args, config, None).await
+}
+
+pub(crate) async fn run_sync_loaded_with_credentials(
+    args: &SyncArgs,
+    config: &DeploymentConfig,
+    ssh_password: Option<secrecy::SecretString>,
+) -> Result<()> {
+    run_sync_loaded_with_credentials_mode(args, config, ssh_password, true).await
+}
+
+pub(crate) async fn run_sync_loaded_with_web_credentials(
+    args: &SyncArgs,
+    config: &DeploymentConfig,
+    ssh_password: Option<secrecy::SecretString>,
+) -> Result<()> {
+    run_sync_loaded_with_credentials_mode(args, config, ssh_password, false).await
+}
+
+async fn run_sync_loaded_with_credentials_mode(
+    args: &SyncArgs,
+    config: &DeploymentConfig,
+    ssh_password: Option<secrecy::SecretString>,
+    allow_prompt: bool,
+) -> Result<()> {
+    let mut deployment = DeploymentRuntime::load_existing_with_ssh_password(config, ssh_password)?;
+    if let Some(registration) =
+        crate::application::deployment_control::load_registration().map_err(application_error)?
+    {
+        crate::application::deployment_control::apply_registration(
+            &mut deployment.state,
+            &registration,
+        )
+        .map_err(application_error)?;
+        deployment.persist_state()?;
+    }
+    let result = run_sync_inner(args, config, &mut deployment, allow_prompt).await;
     deployment.state.last_sync_at = unix_timestamp();
     deployment.state.last_sync_success =
         result.is_ok() || matches!(result, Err(AppError::SyncChangesDetected(_)));
@@ -424,12 +405,125 @@ struct SyncObservation {
     manifest: StatusManifest,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct SyncPlanView {
+    pub fingerprint: String,
+    pub modules: Vec<SyncModuleView>,
+    pub group_margins: Vec<MarginPreviewView>,
+    pub seedance_margins: Vec<MarginPreviewView>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct SyncModuleView {
+    pub module: SyncModule,
+    pub label: &'static str,
+    pub actionable: bool,
+    pub conflict: bool,
+    pub diffs: Vec<FieldDiff>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct MarginPreviewView {
+    pub name: String,
+    pub purchase: Option<f64>,
+    pub sales: f64,
+    pub margin_percent: Option<f64>,
+    pub risk: &'static str,
+}
+
+pub(crate) async fn build_sync_plan_view(
+    config: &DeploymentConfig,
+    ssh_password: Option<secrecy::SecretString>,
+) -> Result<SyncPlanView> {
+    let mut deployment = DeploymentRuntime::load_existing_with_ssh_password(config, ssh_password)?;
+    if let Some(registration) =
+        crate::application::deployment_control::load_registration().map_err(application_error)?
+    {
+        crate::application::deployment_control::apply_registration(
+            &mut deployment.state,
+            &registration,
+        )
+        .map_err(application_error)?;
+    }
+    let mut source = source_for_operation_noninteractive(config).await?;
+    let identity = source
+        .identity()
+        .ok_or_else(|| AppError::State("source session has no identity".to_owned()))?;
+    if deployment.state.source_user_id != 0 && deployment.state.source_user_id != identity.user_id {
+        return Err(AppError::State("当前源站账号不属于这个部署".to_owned()));
+    }
+    let mut downstream = NewApiClient::connect(&deployment.executor, deployment.state.newapi_port)?;
+    downstream
+        .login_existing(config, &deployment.secrets.newapi_admin_password)
+        .await?;
+    let observation =
+        collect_sync_observation(&mut source, &downstream, config, &deployment).await?;
+    save_snapshot(SOURCE_LAST_SEEN_SNAPSHOT, &observation.source_snapshot)?;
+    save_snapshot(
+        DOWNSTREAM_LAST_SEEN_SNAPSHOT,
+        &observation.downstream_snapshot,
+    )?;
+    let plan = SyncPlan::new(
+        observation.source_snapshot.clone(),
+        observation.downstream_snapshot.clone(),
+        load_snapshot(LAST_APPLIED_SNAPSHOT)?,
+    );
+    let actionable = plan.actionable_modules();
+    let modules = SyncModule::ALL
+        .into_iter()
+        .map(|module| {
+            let diffs = plan.diffs.get(&module).cloned().unwrap_or_default();
+            SyncModuleView {
+                module,
+                label: module.label(),
+                actionable: actionable.contains(&module),
+                conflict: diffs
+                    .iter()
+                    .any(|diff| diff.classification == SnapshotClassification::Conflict),
+                diffs,
+            }
+        })
+        .collect();
+    let (group_margins, seedance_margins) = current_margin_previews(&observation);
+    Ok(SyncPlanView {
+        fingerprint: plan.fingerprint(),
+        modules,
+        group_margins: group_margins
+            .into_iter()
+            .map(MarginPreviewView::from)
+            .collect(),
+        seedance_margins: seedance_margins
+            .into_iter()
+            .map(MarginPreviewView::from)
+            .collect(),
+    })
+}
+
+impl From<MarginPreview> for MarginPreviewView {
+    fn from(value: MarginPreview) -> Self {
+        let risk = match value.risk {
+            MarginRisk::Profitable => "profitable",
+            MarginRisk::ZeroMargin => "zero_margin",
+            MarginRisk::Loss => "loss",
+            MarginRisk::Unknown => "unknown",
+        };
+        Self {
+            name: value.name,
+            purchase: value.purchase,
+            sales: value.sales,
+            margin_percent: value.margin_percent,
+            risk,
+        }
+    }
+}
+
 async fn run_sync_inner(
     args: &SyncArgs,
     config: &DeploymentConfig,
     deployment: &mut DeploymentRuntime,
+    allow_prompt: bool,
 ) -> Result<()> {
-    let mut source = source_for_operation(config).await?;
+    let mut source = source_for_operation_mode(config, allow_prompt).await?;
     let identity = source
         .identity()
         .cloned()
@@ -459,13 +553,20 @@ async fn run_sync_inner(
         observation.downstream_snapshot.clone(),
         last_applied,
     );
+    if let Some(expected) = args.plan_fingerprint.as_deref()
+        && plan.fingerprint() != expected
+    {
+        return Err(AppError::State(
+            "同步计划已经过期；源站、下游或本地基线已变化，请重新生成计划".to_owned(),
+        ));
+    }
     print_done("只读同步计划已生成；尚未执行任何远端写入");
     let (group_margins, seedance_margins) = current_margin_previews(&observation);
     let risk_status = margin_risk_status(&group_margins, &seedance_margins);
     print_margin_previews("普通分组当前额度毛利", &group_margins);
     print_margin_previews("Seedance 当前额度毛利", &seedance_margins);
     print_sync_plan(&plan, args.details);
-    let mut last_applied = plan.last_applied.clone().unwrap_or_else(SyncSnapshot::new);
+    let mut last_applied = plan.last_applied.clone().unwrap_or_default();
     let converged_modules = plan.converged_modules();
     if !converged_modules.is_empty() {
         for module in &converged_modules {
@@ -672,6 +773,7 @@ async fn run_sync_inner(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_and_checkpoint_sync_module(
     module: SyncModule,
     force: bool,
@@ -844,10 +946,15 @@ async fn read_downstream_modules(
         "account_purchase",
     );
     let newapi_kuma = modules.remove(&SyncModule::Kuma).unwrap_or(Value::Null);
+    let control_plane_deployment_id = if deployment.state.upstream_deployment_id.is_empty() {
+        deployment_id.clone()
+    } else {
+        deployment.state.upstream_deployment_id.clone()
+    };
     let mut kuma_snapshot = kuma::read_managed_snapshot(kuma::KumaSyncOptions {
         executor: &deployment.executor,
         container_name: &config.container_name,
-        deployment_id: &deployment_id,
+        deployment_id: &control_plane_deployment_id,
         website_name: &config.website_name,
         source_base_url: &deployment.container_source_url,
         status_key: &deployment.secrets.public_status_source_key,
@@ -887,6 +994,7 @@ fn copy_source_fact(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_sync_module(
     module: SyncModule,
     force: bool,
@@ -924,7 +1032,12 @@ async fn apply_sync_module(
             deployment.state.channels = channels;
         }
         SyncModule::Kuma => {
-            let deployment_id = config.deployment_id();
+            let local_deployment_id = config.deployment_id();
+            let deployment_id = if deployment.state.upstream_deployment_id.is_empty() {
+                local_deployment_id
+            } else {
+                deployment.state.upstream_deployment_id.clone()
+            };
             let helper_force = force || !plan.has_downstream_drift(SyncModule::Kuma);
             let result = kuma::sync_status_page(kuma::KumaSyncOptions {
                 executor: &deployment.executor,
@@ -1049,13 +1162,10 @@ async fn run_status(_args: &DeploymentArgs) -> Result<()> {
         return Ok(());
     }
     let config = load_deployment_config()?;
-    let deployment = DeploymentRuntime::prepare(&config, 0, "", 0, None)?;
-    let compose = deployment
-        .executor
-        .compose(&config.container_name, &["ps", "--format", "json"])?;
-    let compose_status = format_compose_status(&compose.stdout)?;
-    let phases = deployment
-        .state
+    let status = read_deployment_status(&config, &CancellationToken::default())
+        .map_err(application_error)?;
+    let compose_status = format_container_status(&status.containers);
+    let phases = status
         .phases
         .iter()
         .map(|(name, phase)| format!("{name}: {}", phase.status))
@@ -1065,15 +1175,15 @@ async fn run_status(_args: &DeploymentArgs) -> Result<()> {
         "部署状态",
         &format!(
             "目录：{}\nNew API：{}:{}\nUptime Kuma：{}:{}\n镜像：{}@{}\n最近同步：{}\n同步结果：{}\n\n阶段：\n{}\n\n容器：\n{}",
-            deployment.state.directory,
-            config.newapi_bind,
-            deployment.state.newapi_port,
-            config.kuma_bind,
-            deployment.state.kuma_port,
-            deployment.state.image,
-            deployment.state.image_ref,
-            deployment.state.last_sync_at,
-            if deployment.state.last_sync_success {
+            status.directory,
+            status.newapi_bind,
+            status.newapi_port,
+            status.kuma_bind,
+            status.kuma_port,
+            status.image,
+            status.image_ref,
+            status.last_sync_at,
+            if status.last_sync_success {
                 "成功"
             } else {
                 "尚未成功"
@@ -1110,17 +1220,9 @@ async fn run_clean(args: &CleanArgs) -> Result<()> {
 
     let mut config = load_deployment_config()?;
     config.resolve_passwords();
-    let executor = TargetExecutor::new(config.target.clone(), config.directory.clone());
-    executor.validate_access()?;
-    clean_downstream(&config, &executor)?;
-    if let Some(mut state) = load_saved_deployment_state()? {
-        state.mark_phase(
-            DOWNSTREAM_CLEANUP_PHASE,
-            "DONE",
-            "downstream resources removed",
-        );
-        persist_deployment_state(&state)?;
-    }
+    clean_deployment(&config, &CancellationToken::default())
+        .await
+        .map_err(application_error)?;
     print_success("下游容器、生成配置和数据已清理；onboard 配置、凭证和登录会话已保留");
     Ok(())
 }
@@ -1150,55 +1252,26 @@ async fn run_rollback(args: &RollbackArgs) -> Result<()> {
 
     let mut config = load_deployment_config()?;
     config.resolve_passwords();
-    let executor = TargetExecutor::new(config.target.clone(), config.directory.clone());
-    executor.validate_access()?;
-    let state = load_saved_deployment_state()?;
-    if let Some(state) = &state {
-        validate_cleanup_state(&config, &executor, state)?;
-    }
-    if args.revoke_source {
-        let mut source = source_for_operation(&config).await?;
-        let identity = source
-            .identity()
-            .cloned()
-            .ok_or_else(|| AppError::State("source session has no identity".to_owned()))?;
-        if state.as_ref().is_some_and(|state| {
-            state.source_user_id != 0 && state.source_user_id != identity.user_id
-        }) {
-            return Err(AppError::State(
-                "source account does not own this deployment".to_owned(),
-            ));
-        }
-        let revoked_tokens = source.revoke_account_group_tokens().await?;
-        source.revoke_onboard_status_key().await?;
-        source_key_store::remove(&config.source_url, identity.user_id)?;
+    let mut source = if args.revoke_source {
+        Some(source_for_operation(&config).await?)
+    } else {
+        None
+    };
+    let outcome = rollback_deployment(
+        &config,
+        source.as_mut(),
+        args.revoke_source,
+        &CancellationToken::default(),
+    )
+    .await
+    .map_err(application_error)?;
+    if outcome.source_status_key_revoked {
         print_success(&format!(
             "已撤销源站资源：{} 个分组 Token 和 1 个公共状态密钥",
-            revoked_tokens
+            outcome.source_tokens_revoked
         ));
-    } else if let (Some(state), Some(content)) = (state.as_ref(), storage::read(CREDENTIALS_FILE)?)
-    {
-        if state.source_user_id > 0 && state.status_key_id > 0 {
-            let secrets = DeploymentSecrets::parse(&content)?;
-            source_key_store::save(
-                &config.source_url,
-                state.source_user_id,
-                state.status_key_id,
-                &secrets.public_status_source_key,
-            )?;
-        }
     }
-
-    clean_downstream(&config, &executor)?;
-    storage::clear_deployment()?;
-    print_success("下游 Compose 项目、配置和数据已清理");
-    Ok(())
-}
-
-fn clean_downstream(config: &DeploymentConfig, executor: &TargetExecutor) -> Result<()> {
-    executor.compose(&config.container_name, &["down", "--remove-orphans"])?;
-    executor
-        .run_in_directory("rm -f secrets.env docker-compose.yml kuma-helper.js\nrm -rf data")?;
+    print_success("下游 Compose 项目、配置和数据已清理；生命周期事件已由共享应用层处理");
     Ok(())
 }
 
@@ -1211,10 +1284,14 @@ fn load_saved_deployment_state() -> Result<Option<DeploymentState>> {
         .transpose()
 }
 
-fn persist_deployment_state(state: &DeploymentState) -> Result<()> {
-    let content = serde_json::to_vec_pretty(state)
-        .map_err(|error| AppError::State(format!("serialize {STATE_FILE}: {error}")))?;
-    storage::write(STATE_FILE, &content)
+fn load_operation_checkpoint() -> Result<Option<crate::application::operation::OperationCheckpoint>>
+{
+    if let Some(content) = storage::read(OPERATION_FILE)? {
+        let checkpoint = serde_json::from_slice(&content)
+            .map_err(|error| AppError::State(format!("parse {OPERATION_FILE}: {error}")))?;
+        return Ok(Some(checkpoint));
+    }
+    Ok(load_saved_deployment_state()?.and_then(|state| state.operation))
 }
 
 fn downstream_was_cleaned() -> Result<bool> {
@@ -1224,27 +1301,6 @@ fn downstream_was_cleaned() -> Result<bool> {
             .get(DOWNSTREAM_CLEANUP_PHASE)
             .is_some_and(|phase| phase.status == "DONE")
     }))
-}
-
-fn validate_cleanup_state(
-    config: &DeploymentConfig,
-    executor: &TargetExecutor,
-    state: &DeploymentState,
-) -> Result<()> {
-    if state.deployment_id != config.deployment_id()
-        || state.container_name != config.container_name
-        || state.directory != config.directory.to_string_lossy()
-    {
-        return Err(AppError::State(
-            "state.json 属于另一个部署，无法执行清理".to_owned(),
-        ));
-    }
-    if state.target_fingerprint != executor.fingerprint()? {
-        return Err(AppError::State(
-            "目标主机与上次部署时不一致，无法执行清理".to_owned(),
-        ));
-    }
-    Ok(())
 }
 
 async fn clear_current_deployment_before_onboard() -> Result<()> {
@@ -1279,7 +1335,7 @@ async fn clear_current_deployment_before_onboard() -> Result<()> {
     Ok(())
 }
 
-fn load_deployment_config() -> Result<DeploymentConfig> {
+pub(crate) fn load_deployment_config() -> Result<DeploymentConfig> {
     let path = storage::directory()?.join(CONFIG_FILE);
     let mut config = DeploymentConfig::from_file(&path)?;
     config.normalize();
@@ -1287,13 +1343,33 @@ fn load_deployment_config() -> Result<DeploymentConfig> {
     Ok(config)
 }
 
-fn persist_deployment_config(config: &DeploymentConfig) -> Result<()> {
+pub(crate) fn persist_deployment_config(config: &DeploymentConfig) -> Result<()> {
     let content = toml::to_string_pretty(config)
         .map_err(|error| AppError::State(format!("serialize deployment.toml: {error}")))?;
     storage::write(CONFIG_FILE, content.as_bytes())
 }
 
-fn ensure_compatible_current_deployment(config: &DeploymentConfig) -> Result<()> {
+#[cfg(test)]
+fn write_target_downstream_credentials(
+    config: &DeploymentConfig,
+    registration: &DeploymentRegistration,
+) -> Result<()> {
+    let executor =
+        crate::target::TargetExecutor::new(config.target.clone(), config.directory.clone());
+    crate::application::deployment_control::persist_registration(config, &executor, registration)
+        .map_err(application_error)
+}
+
+#[cfg(test)]
+fn apply_authoritative_registration(
+    state: &mut DeploymentState,
+    registration: &DeploymentRegistration,
+) -> Result<()> {
+    crate::application::deployment_control::apply_registration(state, registration)
+        .map_err(application_error)
+}
+
+pub(crate) fn ensure_compatible_current_deployment(config: &DeploymentConfig) -> Result<()> {
     if !storage::exists(CONFIG_FILE)? {
         return Ok(());
     }
@@ -1309,7 +1385,20 @@ fn ensure_compatible_current_deployment(config: &DeploymentConfig) -> Result<()>
     Ok(())
 }
 
-async fn source_for_operation(config: &DeploymentConfig) -> Result<SourceClient> {
+pub(crate) async fn source_for_operation(config: &DeploymentConfig) -> Result<SourceClient> {
+    source_for_operation_mode(config, true).await
+}
+
+pub(crate) async fn source_for_operation_noninteractive(
+    config: &DeploymentConfig,
+) -> Result<SourceClient> {
+    source_for_operation_mode(config, false).await
+}
+
+async fn source_for_operation_mode(
+    config: &DeploymentConfig,
+    allow_prompt: bool,
+) -> Result<SourceClient> {
     if let Some(content) = storage::read(SESSION_FILE)? {
         let persisted = serde_json::from_slice(&content)
             .map_err(|error| AppError::State(format!("parse session.json: {error}")))?;
@@ -1326,6 +1415,8 @@ async fn source_for_operation(config: &DeploymentConfig) -> Result<SourceClient>
     }
     let (source, _) = if config.source_password.is_some() {
         authenticate_source(config).await?
+    } else if !allow_prompt {
+        return Err(SourceError::AuthenticationRequired.into());
     } else {
         reauthenticate_source(config).await?
     };
@@ -1344,76 +1435,11 @@ fn is_source_authentication_error(error: &SourceError) -> bool {
     }
 }
 
-fn persist_source_session(source: &SourceClient) -> Result<()> {
+pub(crate) fn persist_source_session(source: &SourceClient) -> Result<()> {
     let session = source.export_session()?;
     let content = serde_json::to_vec_pretty(&session)
         .map_err(|error| AppError::State(format!("serialize session.json: {error}")))?;
     storage::write(SESSION_FILE, &content)
-}
-
-async fn resolve_source_status_key(
-    source: &mut SourceClient,
-    config: &DeploymentConfig,
-    source_user_id: i64,
-) -> Result<(StatusKeyProvision, Option<secrecy::SecretString>)> {
-    source_key_store::ensure_writable()?;
-    let mut provision = source.ensure_onboard_status_key().await?;
-    if let Some(key) = provision.key() {
-        let key = key.clone();
-        source_key_store::save(
-            &config.source_url,
-            source_user_id,
-            provision.metadata.id,
-            &key,
-        )?;
-        return Ok((provision, Some(key)));
-    }
-    if let Some(key) =
-        source_key_store::load(&config.source_url, source_user_id, provision.metadata.id)?
-    {
-        return Ok((provision, Some(key)));
-    }
-    if current_deployment_has_status_key(source_user_id, provision.metadata.id)? {
-        return Ok((provision, None));
-    }
-
-    let confirmed = confirm(
-        "源站已有公共状态密钥，但这台机器没有保存密钥内容。继续会生成新密钥，其他正在使用旧密钥的下游状态页会失效。是否继续？",
-    )
-    .initial_value(true)
-    .interact()
-    .map_err(AppError::from_prompt)?;
-    if !confirmed {
-        return Err(AppError::State(
-            "未生成新公共状态密钥；旧密钥仍然有效，未作修改".to_owned(),
-        ));
-    }
-    source.revoke_onboard_status_key().await?;
-    source_key_store::remove(&config.source_url, source_user_id)?;
-    provision = source.ensure_onboard_status_key().await?;
-    let key = provision
-        .key()
-        .cloned()
-        .ok_or_else(|| AppError::State("源站生成新公共状态密钥后没有返回密钥内容".to_owned()))?;
-    source_key_store::save(
-        &config.source_url,
-        source_user_id,
-        provision.metadata.id,
-        &key,
-    )?;
-    Ok((provision, Some(key)))
-}
-
-fn current_deployment_has_status_key(source_user_id: i64, status_key_id: i64) -> Result<bool> {
-    if !storage::exists(CREDENTIALS_FILE)? {
-        return Ok(false);
-    }
-    let Some(content) = storage::read(STATE_FILE)? else {
-        return Ok(false);
-    };
-    let state: DeploymentState = serde_json::from_slice(&content)
-        .map_err(|error| AppError::State(format!("parse {STATE_FILE}: {error}")))?;
-    Ok(state.source_user_id == source_user_id && state.status_key_id == status_key_id)
 }
 
 fn print_deployment_preview(config: &DeploymentConfig) {
@@ -1435,48 +1461,6 @@ fn print_deployment_preview(config: &DeploymentConfig) {
     );
     print_field("镜像", &format!("{}@{}", config.image, config.image_ref));
     println!();
-}
-
-fn deploy_base_stack_with_progress(
-    deployment: &mut DeploymentRuntime,
-    config: &DeploymentConfig,
-) -> Result<()> {
-    let progress = spinner();
-    progress.start("正在准备 New API、PostgreSQL 和 Redis");
-    match deployment.deploy_base_stack(config, |message| progress.set_message(message)) {
-        Ok(()) => {
-            progress.stop(format!(
-                "基础服务已就绪，New API 端口 {}",
-                deployment.state.newapi_port
-            ));
-            Ok(())
-        }
-        Err(error) => {
-            progress.error("New API、PostgreSQL 和 Redis 部署失败");
-            Err(error)
-        }
-    }
-}
-
-fn deploy_kuma_with_progress(
-    deployment: &mut DeploymentRuntime,
-    config: &DeploymentConfig,
-) -> Result<()> {
-    let progress = spinner();
-    progress.start("正在准备 Uptime Kuma 2.5.0");
-    match deployment.deploy_kuma(config, |message| progress.set_message(message)) {
-        Ok(()) => {
-            progress.stop(format!(
-                "Uptime Kuma 已就绪，端口 {}",
-                deployment.state.kuma_port
-            ));
-            Ok(())
-        }
-        Err(error) => {
-            progress.error("Uptime Kuma 部署失败");
-            Err(error)
-        }
-    }
 }
 
 fn print_field(label: &str, value: &str) {
@@ -1712,43 +1696,33 @@ fn print_success(message: &str) {
     println!();
 }
 
-fn format_compose_status(raw: &[u8]) -> Result<String> {
-    let raw = String::from_utf8_lossy(raw);
-    let mut rows = Vec::new();
-    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
-        let value: serde_json::Value = serde_json::from_str(line)
-            .map_err(|error| AppError::Target(format!("decode Docker Compose status: {error}")))?;
-        let name = value
-            .get("Name")
-            .and_then(|value| value.as_str())
-            .unwrap_or("unknown");
-        let state = value
-            .get("State")
-            .and_then(|value| value.as_str())
-            .unwrap_or("unknown");
-        let health = value
-            .get("Health")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        let ports = value
-            .get("Ports")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        let state = if health.is_empty() {
-            state.to_owned()
-        } else {
-            format!("{state}/{health}")
-        };
-        rows.push(if ports.is_empty() {
-            format!("{name}: {state}")
-        } else {
-            format!("{name}: {state} · {ports}")
-        });
+fn application_error(error: ApplicationError) -> AppError {
+    if let Some(diagnostic) = &error.diagnostic {
+        tracing::debug!(code = %error.code, diagnostic, "application operation failed");
     }
+    error.into()
+}
+
+fn format_container_status(containers: &[ContainerStatus]) -> String {
+    let rows = containers
+        .iter()
+        .map(|container| {
+            let state = if container.health.is_empty() {
+                container.state.clone()
+            } else {
+                format!("{}/{}", container.state, container.health)
+            };
+            if container.ports.is_empty() {
+                format!("{}: {state}", container.name)
+            } else {
+                format!("{}: {state} · {}", container.name, container.ports)
+            }
+        })
+        .collect::<Vec<_>>();
     if rows.is_empty() {
-        Ok("没有运行中的容器".to_owned())
+        "没有运行中的容器".to_owned()
     } else {
-        Ok(rows.join("\n"))
+        rows.join("\n")
     }
 }
 
@@ -1762,6 +1736,7 @@ fn print_help() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source::DeploymentRegistration;
     use serde_json::json;
 
     fn pricing_table_plan() -> SyncPlan {
@@ -1860,5 +1835,168 @@ mod tests {
         let error = ensure_snapshots_are_current(&source, &downstream, &fresh_source, &downstream)
             .expect_err("stale plan must fail");
         assert!(error.to_string().contains("旧计划已拒绝应用"));
+    }
+
+    #[cfg(unix)]
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    use secrecy::SecretString;
+
+    fn registration() -> DeploymentRegistration {
+        DeploymentRegistration {
+            deployment_id: "dep_target_credentials".to_owned(),
+            installation_generation: 7,
+            control_plane_url: "http://127.0.0.1:3004/api".to_owned(),
+            report_credential: SecretString::from("report-secret"),
+            pull_credential: SecretString::from("pull-secret"),
+            heartbeat_interval_seconds: 60,
+            snapshot_interval_seconds: 300,
+            silent_updates_enabled: true,
+            release_schema_version: "1".to_owned(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn target_credentials_are_private_and_read_back_complete() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let config = DeploymentConfig {
+            directory: temporary.path().join("deployment"),
+            image_ref: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_owned(),
+            ..DeploymentConfig::default()
+        };
+        fs::create_dir_all(&config.directory).expect("create target directory");
+
+        write_target_downstream_credentials(&config, &registration())
+            .expect("write target credentials");
+
+        let path = config.directory.join("downstream-credentials.env");
+        let metadata = fs::metadata(&path).expect("target credentials metadata");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        let content = fs::read_to_string(path).expect("read target credentials");
+        for key in [
+            "MEOWAI_DEPLOYMENT_ID",
+            "MEOWAI_INSTALLATION_GENERATION",
+            "MEOWAI_CONTROL_PLANE_URL",
+            "MEOWAI_REPORT_CREDENTIAL",
+            "MEOWAI_PULL_CREDENTIAL",
+            "MEOWAI_HEARTBEAT_INTERVAL_SECONDS",
+            "MEOWAI_SNAPSHOT_INTERVAL_SECONDS",
+            "MEOWAI_CURRENT_IMAGE_DIGEST",
+            "MEOWAI_ALLOWED_IMAGE_REPOSITORY",
+            "MEOWAI_CONTAINER_NAME",
+            "MEOWAI_UPDATER_SOCKET_PATH",
+        ] {
+            assert_eq!(
+                content
+                    .lines()
+                    .filter(|line| line.starts_with(&format!("{key}=")))
+                    .count(),
+                1,
+                "expected one non-empty {key} entry"
+            );
+            assert!(!content.contains(&format!("{key}=\n")));
+        }
+        assert!(content.contains("MEOWAI_UPDATER_SOCKET_PATH=/run/meowai/updater.sock\n"));
+    }
+
+    #[test]
+    fn sync_uses_the_upstream_registration_as_the_authoritative_identity() {
+        let mut state = DeploymentState {
+            schema_version: 1,
+            deployment_id: "local-derived-id".to_owned(),
+            upstream_deployment_id: String::new(),
+            installation_generation: 0,
+            control_plane_url: String::new(),
+            target_fingerprint: String::new(),
+            container_name: String::new(),
+            directory: String::new(),
+            newapi_port: 0,
+            kuma_port: 0,
+            image: String::new(),
+            image_ref: String::new(),
+            image_digest: String::new(),
+            source_user_id: 0,
+            source_group_sha256: String::new(),
+            status_key_id: 0,
+            manifest_sha256: String::new(),
+            pricing_sha256: Default::default(),
+            channels: Default::default(),
+            kuma_monitors: Default::default(),
+            phases: Default::default(),
+            last_sync_at: 0,
+            last_sync_success: false,
+            operation: None,
+            snapshot_schema_version: 0,
+            last_applied_at: Default::default(),
+        };
+        let registration = registration();
+
+        apply_authoritative_registration(&mut state, &registration)
+            .expect("apply upstream registration");
+
+        assert_eq!(state.deployment_id, "local-derived-id");
+        assert_eq!(state.upstream_deployment_id, registration.deployment_id);
+        assert_eq!(
+            state.installation_generation,
+            registration.installation_generation
+        );
+        assert_eq!(state.control_plane_url, registration.control_plane_url);
+    }
+
+    #[test]
+    fn sync_rejects_a_registration_that_conflicts_with_persisted_upstream_identity() {
+        let mut state = DeploymentState {
+            schema_version: 1,
+            deployment_id: "local-derived-id".to_owned(),
+            upstream_deployment_id: "dep_original".to_owned(),
+            installation_generation: 1,
+            control_plane_url: String::new(),
+            target_fingerprint: String::new(),
+            container_name: String::new(),
+            directory: String::new(),
+            newapi_port: 0,
+            kuma_port: 0,
+            image: String::new(),
+            image_ref: String::new(),
+            image_digest: String::new(),
+            source_user_id: 0,
+            source_group_sha256: String::new(),
+            status_key_id: 0,
+            manifest_sha256: String::new(),
+            pricing_sha256: Default::default(),
+            channels: Default::default(),
+            kuma_monitors: Default::default(),
+            phases: Default::default(),
+            last_sync_at: 0,
+            last_sync_success: false,
+            operation: None,
+            snapshot_schema_version: 0,
+            last_applied_at: Default::default(),
+        };
+
+        let error = apply_authoritative_registration(&mut state, &registration())
+            .expect_err("conflicting registration must be rejected");
+
+        assert!(error.to_string().contains("不一致") || error.to_string().contains("不匹配"));
+        assert_eq!(state.upstream_deployment_id, "dep_original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn target_credentials_failure_leaves_no_partial_file() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let blocked = temporary.path().join("not-a-directory");
+        fs::write(&blocked, b"blocked").expect("create blocking file");
+        let config = DeploymentConfig {
+            directory: blocked.clone(),
+            image_ref: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_owned(),
+            ..DeploymentConfig::default()
+        };
+
+        assert!(write_target_downstream_credentials(&config, &registration()).is_err());
+        assert!(!blocked.join("downstream-credentials.env").exists());
     }
 }

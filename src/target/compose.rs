@@ -15,6 +15,7 @@ use crate::{
 };
 
 const TARGET_SECRETS_FILE: &str = "secrets.env";
+const TARGET_DOWNSTREAM_CREDENTIALS_FILE: &str = "downstream-credentials.env";
 const COMPOSE_FILE: &str = "docker-compose.yml";
 const KUMA_IMAGE: &str = "louislam/uptime-kuma:2.5.0";
 
@@ -126,8 +127,12 @@ pub struct DeploymentRuntime {
 impl DeploymentRuntime {
     /// Load an existing deployment for a read-only sync plan. This deliberately does not
     /// create directories, start containers, or write credentials/state.
-    pub fn load_existing(config: &DeploymentConfig) -> Result<Self> {
-        let executor = TargetExecutor::new(config.target.clone(), config.directory.clone());
+    pub fn load_existing_with_ssh_password(
+        config: &DeploymentConfig,
+        ssh_password: Option<SecretString>,
+    ) -> Result<Self> {
+        let executor = TargetExecutor::new(config.target.clone(), config.directory.clone())
+            .with_ssh_password(ssh_password);
         let state = load_state()?
             .ok_or_else(|| AppError::State("尚未找到部署状态，请先完成 onboard".to_owned()))?;
         let target_fingerprint = executor.fingerprint()?;
@@ -152,7 +157,26 @@ impl DeploymentRuntime {
         status_key_id: i64,
         issued_status_key: Option<&SecretString>,
     ) -> Result<Self> {
-        let executor = TargetExecutor::new(config.target.clone(), config.directory.clone());
+        Self::prepare_with_ssh_password(
+            config,
+            source_user_id,
+            source_group_sha256,
+            status_key_id,
+            issued_status_key,
+            None,
+        )
+    }
+
+    pub fn prepare_with_ssh_password(
+        config: &DeploymentConfig,
+        source_user_id: i64,
+        source_group_sha256: &str,
+        status_key_id: i64,
+        issued_status_key: Option<&SecretString>,
+        ssh_password: Option<SecretString>,
+    ) -> Result<Self> {
+        let executor = TargetExecutor::new(config.target.clone(), config.directory.clone())
+            .with_ssh_password(ssh_password);
         executor.prepare()?;
         let target_fingerprint = executor.fingerprint()?;
         let existing_state = load_state()?;
@@ -167,16 +191,29 @@ impl DeploymentRuntime {
                 state
             }
             None => {
-                let newapi_port = executor.allocate_port(config.newapi_port, &[])?;
-                let kuma_port = executor.allocate_port(config.kuma_port, &[newapi_port])?;
+                if !executor.is_port_available(config.newapi_port)? {
+                    return Err(AppError::Target(format!(
+                        "New API 端口 {} 已被占用，请返回站点设置选择其他端口",
+                        config.newapi_port
+                    )));
+                }
+                if !executor.is_port_available(config.kuma_port)? {
+                    return Err(AppError::Target(format!(
+                        "Uptime Kuma 端口 {} 已被占用，请返回站点设置选择其他端口",
+                        config.kuma_port
+                    )));
+                }
                 DeploymentState {
                     schema_version: 1,
                     deployment_id: config.deployment_id(),
+                    upstream_deployment_id: String::new(),
+                    installation_generation: 0,
+                    control_plane_url: String::new(),
                     target_fingerprint: target_fingerprint.clone(),
                     container_name: config.container_name.clone(),
                     directory: config.directory.to_string_lossy().into_owned(),
-                    newapi_port,
-                    kuma_port,
+                    newapi_port: config.newapi_port,
+                    kuma_port: config.kuma_port,
                     image: config.image.clone(),
                     image_ref: config.image_ref.clone(),
                     image_digest: String::new(),
@@ -190,6 +227,7 @@ impl DeploymentRuntime {
                     phases: BTreeMap::new(),
                     last_sync_at: 0,
                     last_sync_success: false,
+                    operation: None,
                     snapshot_schema_version: 0,
                     last_applied_at: BTreeMap::new(),
                 }
@@ -502,14 +540,16 @@ fn render_compose(config: &DeploymentConfig, runtime: &DeploymentRuntime) -> Res
         "container_name": config.container_name,
         "restart": "unless-stopped",
         "ports": [format!("{}:{}:3000", config.newapi_bind, runtime.state.newapi_port)],
-        "volumes": ["./data/newapi:/data"],
+        "volumes": ["./data/newapi:/data", "./run:/run/meowai"],
         "environment": {
             "SQL_DSN": "postgresql://meowai:${POSTGRES_PASSWORD}@postgres:5432/newapi",
             "REDIS_CONN_STRING": "redis://:${REDIS_PASSWORD}@redis:6379",
             "SESSION_SECRET": "${SESSION_SECRET}",
             "TZ": "Asia/Shanghai",
-            "SESSION_COOKIE_SECURE": "false"
+            "SESSION_COOKIE_SECURE": "false",
+            "MEOWAI_DOWNSTREAM_KUMA_HEALTH_URL": "http://uptime-kuma:3001/api/entry-page"
         },
+        "env_file": [TARGET_DOWNSTREAM_CREDENTIALS_FILE, "updater-credentials.env"],
         "extra_hosts": ["host.docker.internal:host-gateway"],
         "depends_on": {
             "postgres": {"condition": "service_healthy"},
@@ -661,6 +701,9 @@ mod tests {
             state: DeploymentState {
                 schema_version: 1,
                 deployment_id: "test".to_owned(),
+                upstream_deployment_id: "dep_test".to_owned(),
+                installation_generation: 1,
+                control_plane_url: "http://localhost:3004/api".to_owned(),
                 target_fingerprint: "host".to_owned(),
                 container_name: config.container_name.clone(),
                 directory: config.directory.to_string_lossy().into_owned(),
@@ -679,6 +722,7 @@ mod tests {
                 phases: BTreeMap::new(),
                 last_sync_at: 0,
                 last_sync_success: false,
+                operation: None,
                 snapshot_schema_version: 0,
                 last_applied_at: BTreeMap::new(),
             },
@@ -709,6 +753,10 @@ mod tests {
         assert!(environment.get("PUBLIC_STATUS_MODE").is_none());
         assert!(environment.get("PUBLIC_STATUS_SOURCE_URL").is_none());
         assert!(environment.get("PUBLIC_STATUS_SOURCE_KEY").is_none());
+        assert_eq!(
+            environment["MEOWAI_DOWNSTREAM_KUMA_HEALTH_URL"],
+            "http://uptime-kuma:3001/api/entry-page"
+        );
     }
 
     #[test]

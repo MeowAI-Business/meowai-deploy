@@ -1,6 +1,9 @@
 pub mod compose;
 pub mod kuma;
 pub mod newapi;
+pub mod remote_path;
+pub mod ssh;
+pub mod updater;
 
 use std::{
     borrow::Cow,
@@ -13,7 +16,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use secrecy::{ExposeSecret, SecretString};
 use shell_escape::escape;
+
+use self::remote_path::RemotePath;
+use self::ssh::SshClient;
+pub use self::ssh::ssh_askpass_exit_code;
 
 use crate::{
     config::Target,
@@ -34,6 +42,8 @@ fi"#;
 pub struct TargetExecutor {
     target: Target,
     directory: PathBuf,
+    ssh_client: Option<SshClient>,
+    ssh_password: Option<SecretString>,
 }
 
 pub struct TargetEndpoint {
@@ -58,36 +68,45 @@ impl Drop for TargetEndpoint {
 
 impl TargetExecutor {
     pub fn new(target: Target, directory: PathBuf) -> Self {
-        Self { target, directory }
+        Self {
+            target,
+            directory,
+            ssh_client: None,
+            ssh_password: None,
+        }
+    }
+
+    pub fn with_ssh_password(mut self, password: Option<SecretString>) -> Self {
+        self.ssh_password = password.filter(|value| !value.expose_secret().is_empty());
+        self
     }
 
     pub fn prepare(&self) -> Result<()> {
         self.validate_access()?;
+        let root = self.quoted_directory()?;
         self.run_script(&format!(
             "umask 077\nmkdir -p {root}/data/newapi {root}/data/postgres {root}/data/redis {root}/data/uptime-kuma\nchmod 700 {root} {root}/data {root}/data/newapi {root}/data/postgres {root}/data/redis {root}/data/uptime-kuma",
-            root = quote_path(&self.directory)
         ))?;
         Ok(())
     }
 
     pub fn validate_access(&self) -> Result<()> {
-        let directory = quote_path(&self.directory);
+        let directory = self.quoted_directory()?;
         let script = format!(
             r#"set -eu
-if [ "$(id -u)" -eq 0 ]; then
-    exit 0
-fi
-if command -v sudo >/dev/null 2>&1 && sudo -n sh -c true >/dev/null 2>&1; then
-    exit 0
-fi
 path={directory}
 while [ ! -e "$path" ] && [ "$path" != / ]; do
     path=$(dirname "$path")
 done
-if [ -d "$path" ] && [ -w "$path" ] && docker info >/dev/null 2>&1; then
-    exit 0
+if [ "$(id -u)" -eq 0 ]; then
+    [ -d "$path" ] && [ -r "$path" ] && [ -w "$path" ] && [ -x "$path" ] && docker info >/dev/null 2>&1 && exit 0
 fi
-printf '%s\n' '当前用户不是 root、没有可用的 sudo，且无法写入部署目录并使用 Docker' >&2
+if command -v sudo >/dev/null 2>&1 && sudo -n sh -c true >/dev/null 2>&1; then
+    sudo -n sh -c '[ -d "$1" ] && [ -r "$1" ] && [ -w "$1" ] && [ -x "$1" ] && docker info >/dev/null 2>&1' sh "$path" && exit 0
+else
+    [ -d "$path" ] && [ -r "$path" ] && [ -w "$path" ] && [ -x "$path" ] && docker info >/dev/null 2>&1 && exit 0
+fi
+printf '%s\n' '部署目录或最近的父目录必须可读、可写、可进入，并且 Docker 必须可用' >&2
 exit 1"#,
         );
         let output = match &self.target {
@@ -102,30 +121,62 @@ exit 1"#,
                 if direct.status.success() {
                     return Ok(());
                 }
-                Command::new("sudo")
-                    .arg("-v")
-                    .status()
+                let status = Command::new("sudo").arg("-v").status().map_err(|error| {
+                    AppError::Target(format!("本机部署目录需要提权，但无法启动 sudo: {error}"))
+                })?;
+                if !status.success() {
+                    return Err(AppError::Target(format!("sudo 身份验证失败（{status}）")));
+                }
+                let elevated = Command::new("sudo")
+                    .args(["-n", "sh", "-c", &script])
+                    .output()
                     .map_err(|error| {
-                        AppError::Target(format!("本机部署目录需要提权，但无法启动 sudo: {error}"))
-                    })
-                    .and_then(|status| {
-                        if status.success() {
-                            Ok(())
-                        } else {
-                            Err(AppError::Target(format!("sudo 身份验证失败（{status}）")))
-                        }
+                        AppError::Target(format!("无法执行提权后的目标检查: {error}"))
                     })?;
+                require_success("验证本机部署权限和 Docker", elevated)?;
                 return Ok(());
             }
-            Target::Ssh { destination } => Command::new("ssh")
-                .args(["-o", "ConnectTimeout=10"])
-                .arg(destination)
-                .arg(script)
-                .output()
-                .map_err(|error| AppError::Target(format!("failed to start ssh: {error}")))?,
+            Target::Ssh { destination } => {
+                let client = self.ssh_client()?;
+                client.probe(destination).map_err(ssh_error)?;
+                client
+                    .exec(destination, PRIVILEGED_SCRIPT_RUNNER, script.as_bytes())
+                    .map_err(ssh_error)?
+            }
         };
         require_success("验证 SSH 连接和部署权限", output)?;
         Ok(())
+    }
+
+    pub fn validate_access_interactive(&self) -> Result<()> {
+        if let Target::Ssh { destination } = &self.target {
+            self.ssh_client()?
+                .probe_interactive(destination)
+                .map_err(ssh_error)?;
+        }
+        self.validate_access()
+    }
+
+    pub fn remote_diagnostics(&self) -> Result<Output> {
+        let root = self.quoted_directory()?;
+        self.run_script(&format!(
+            r#"set +e
+printf 'os=%s\n' "$(uname -s 2>/dev/null || printf unknown)"
+printf 'arch=%s\n' "$(uname -m 2>/dev/null || printf unknown)"
+if command -v docker >/dev/null 2>&1; then docker_cli=pass; else docker_cli=fail; fi
+if docker info >/dev/null 2>&1; then docker_daemon=pass; else docker_daemon=fail; fi
+if docker compose version >/dev/null 2>&1; then compose=pass; else compose=fail; fi
+if command -v curl >/dev/null 2>&1; then curl=pass; else curl=fail; fi
+if mkdir -p {root} 2>/dev/null && test -w {root}; then directory=pass; else directory=fail; fi
+printf 'docker_cli=%s\n' "$docker_cli"
+printf 'docker_daemon=%s\n' "$docker_daemon"
+printf 'compose=%s\n' "$compose"
+printf 'curl=%s\n' "$curl"
+printf 'directory=%s\n' "$directory"
+disk_bytes=$(df -Pk {root} 2>/dev/null | awk 'NR==2 {{print $4 * 1024}}')
+printf 'disk_bytes=%s\n' "${{disk_bytes:-unknown}}"
+exit 0"#,
+        ))
     }
 
     pub fn fingerprint(&self) -> Result<String> {
@@ -149,7 +200,7 @@ exit 1"#,
 
     pub fn write_file(&self, relative: &str, content: &[u8], private: bool) -> Result<()> {
         validate_relative_name(relative)?;
-        let destination = self.directory.join(relative);
+        let destination = self.destination_path(relative)?;
         match &self.target {
             Target::Local => {
                 let temporary = tempfile::NamedTempFile::new().map_err(|error| {
@@ -160,7 +211,7 @@ exit 1"#,
                 self.run_script(&format!(
                     "install -m {mode} {temporary} {destination}",
                     temporary = quote_path(temporary.path()),
-                    destination = quote_path(&destination),
+                    destination = quote(&destination),
                 ))?;
                 Ok(())
             }
@@ -170,19 +221,16 @@ exit 1"#,
                 fs::write(temporary.path(), content)
                     .map_err(|error| AppError::Target(format!("write upload file: {error}")))?;
                 let remote_temporary = remote_upload_path(relative, temporary.path());
-                let remote_spec = format!("{host}:{remote_temporary}");
-                let output = Command::new("scp")
-                    .args(["-q", "-p"])
-                    .arg(temporary.path())
-                    .arg(&remote_spec)
-                    .output()
-                    .map_err(|error| AppError::Target(format!("failed to start scp: {error}")))?;
+                let output = self
+                    .ssh_client()?
+                    .upload(host, temporary.path(), &remote_temporary)
+                    .map_err(ssh_error)?;
                 require_success("scp upload", output)?;
                 let mode = if private { "600" } else { "644" };
                 self.run_script(&format!(
                     "temporary={temporary}\ntrap 'rm -f \"$temporary\"' EXIT HUP INT TERM\nchmod {mode} \"$temporary\"\nmv \"$temporary\" {destination}",
                     temporary = quote(&remote_temporary),
-                    destination = quote_path(&destination)
+                    destination = quote(&destination)
                 ))?;
                 Ok(())
             }
@@ -194,7 +242,7 @@ exit 1"#,
             if excluded.contains(&candidate) {
                 continue;
             }
-            if self.port_available(candidate)? {
+            if self.is_port_available(candidate)? {
                 return Ok(candidate);
             }
         }
@@ -203,7 +251,7 @@ exit 1"#,
         )))
     }
 
-    fn port_available(&self, port: u16) -> Result<bool> {
+    pub fn is_port_available(&self, port: u16) -> Result<bool> {
         if matches!(self.target, Target::Local) {
             let loopback = SocketAddr::from(([127, 0, 0, 1], port));
             if TcpStream::connect_timeout(&loopback, Duration::from_millis(100)).is_ok() {
@@ -230,8 +278,37 @@ exit 1"#,
             .collect::<Vec<_>>()
             .join(" ");
         self.run_script(&format!(
-            "cd {directory}\ndocker compose --env-file secrets.env -p {project} {arguments}",
-            directory = quote_path(&self.directory),
+            "cd {directory}\nfiles='-f docker-compose.yml'\nif [ -f docker-compose.updater.yml ]; then files=\"$files -f docker-compose.updater.yml\"; fi\n# shellcheck disable=SC2086\ndocker compose --env-file secrets.env -p {project} $files {arguments}",
+            directory = self.quoted_directory()?,
+            project = quote(project),
+        ))
+    }
+
+    pub fn remove_compose_project(&self, project: &str) -> Result<Output> {
+        self.run_script(&format!(
+            r#"project={project}
+if [ -d {directory} ]; then
+  cd {directory}
+  files='-f docker-compose.yml'
+  if [ -f docker-compose.updater.yml ]; then files="$files -f docker-compose.updater.yml"; fi
+  if [ -f secrets.env ]; then
+    # shellcheck disable=SC2086
+    docker compose --env-file secrets.env -p "$project" $files down --remove-orphans
+  else
+    # shellcheck disable=SC2086
+    docker compose -p "$project" $files down --remove-orphans || true
+  fi
+else
+  containers=$(docker ps -aq --filter "label=com.docker.compose.project=$project")
+  if [ -n "$containers" ]; then
+    docker rm -f $containers
+  fi
+  networks=$(docker network ls -q --filter "label=com.docker.compose.project=$project")
+  if [ -n "$networks" ]; then
+    docker network rm $networks
+  fi
+fi"#,
+            directory = self.quoted_directory()?,
             project = quote(project),
         ))
     }
@@ -276,12 +353,10 @@ docker --config "$registry_config" pull --platform linux/amd64 {image}"#,
                     .map_err(|error| AppError::Target(format!("read tunnel port: {error}")))?
                     .port();
                 drop(listener);
-                let mut child = Command::new("ssh")
-                    .args(["-o", "ExitOnForwardFailure=yes", "-N", "-L"])
-                    .arg(format!("127.0.0.1:{local_port}:127.0.0.1:{target_port}"))
-                    .arg(destination)
-                    .spawn()
-                    .map_err(|error| AppError::Target(format!("open SSH tunnel: {error}")))?;
+                let mut child = self
+                    .ssh_client()?
+                    .tunnel(destination, local_port, target_port)
+                    .map_err(ssh_error)?;
                 let tunnel_address = SocketAddr::from(([127, 0, 0, 1], local_port));
                 let deadline = Instant::now() + Duration::from_secs(10);
                 loop {
@@ -382,7 +457,7 @@ docker --config "$registry_config" pull --platform linux/amd64 {image}"#,
     pub fn run_in_directory(&self, script: &str) -> Result<Output> {
         self.run_script(&format!(
             "set -eu\ncd {}\n{}",
-            quote_path(&self.directory),
+            self.quoted_directory()?,
             script
         ))
     }
@@ -413,30 +488,43 @@ docker --config "$registry_config" pull --platform linux/amd64 {image}"#,
                 drop(stdin);
                 Ok(child)
             }
-            Target::Ssh { destination } => {
-                let mut child = Command::new("ssh")
-                    .arg(destination)
-                    .arg(PRIVILEGED_SCRIPT_RUNNER)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .map_err(|error| AppError::Target(format!("failed to start ssh: {error}")))?;
-                let mut stdin = child
-                    .stdin
-                    .take()
-                    .ok_or_else(|| AppError::Target("ssh stdin unavailable".to_owned()))?;
-                stdin
-                    .write_all(script.as_bytes())
-                    .map_err(|error| AppError::Target(format!("write ssh input: {error}")))?;
-                drop(stdin);
-                Ok(child)
-            }
+            Target::Ssh { destination } => self
+                .ssh_client()?
+                .spawn_exec(destination, PRIVILEGED_SCRIPT_RUNNER, script.as_bytes())
+                .map_err(ssh_error),
         }
     }
 
     pub fn directory(&self) -> &Path {
         &self.directory
+    }
+
+    fn quoted_directory(&self) -> Result<String> {
+        match &self.target {
+            Target::Local => Ok(quote_path(&self.directory)),
+            Target::Ssh { .. } => RemotePath::parse(&self.directory.to_string_lossy())
+                .map(|path| quote(path.as_str()))
+                .map_err(|error| AppError::Target(error.to_string())),
+        }
+    }
+
+    fn destination_path(&self, relative: &str) -> Result<String> {
+        match &self.target {
+            Target::Local => Ok(self.directory.join(relative).to_string_lossy().into_owned()),
+            Target::Ssh { .. } => RemotePath::parse(&self.directory.to_string_lossy())
+                .and_then(|path| path.join(relative))
+                .map(|path| path.into_string())
+                .map_err(|error| AppError::Target(error.to_string())),
+        }
+    }
+
+    fn ssh_client(&self) -> Result<SshClient> {
+        if let Some(client) = &self.ssh_client {
+            return Ok(client.clone().with_password(self.ssh_password.clone()));
+        }
+        SshClient::discover()
+            .map(|client| client.with_password(self.ssh_password.clone()))
+            .map_err(ssh_error)
     }
 }
 
@@ -505,6 +593,13 @@ fn target_output_error(operation: &str, output: &Output) -> AppError {
             format!("\n{detail}")
         }
     ))
+}
+
+fn ssh_error(error: ssh::SshError) -> AppError {
+    if let Some(diagnostic) = error.diagnostic() {
+        tracing::debug!(code = error.code(), diagnostic, "SSH operation failed");
+    }
+    AppError::Target(format!("{}: {}", error.code(), error.public_message()))
 }
 
 #[cfg(test)]

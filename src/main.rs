@@ -1,8 +1,12 @@
+pub mod application;
+mod bootstrap;
 mod cli;
 mod commands;
 mod config;
 mod doctor;
 mod error;
+mod lifecycle_outbox;
+mod platform;
 mod pricing;
 mod registry;
 mod security;
@@ -13,6 +17,7 @@ mod storage;
 mod sync_plan;
 mod target;
 mod updater;
+mod web;
 
 use std::env;
 
@@ -62,6 +67,9 @@ impl Theme for MeowAiTheme {
 
 #[tokio::main]
 async fn main() {
+    if let Some(exit_code) = target::ssh_askpass_exit_code() {
+        std::process::exit(exit_code);
+    }
     if let Err(error) = run().await {
         if !matches!(error, AppError::Cancelled) {
             eprintln!("error: {error}");
