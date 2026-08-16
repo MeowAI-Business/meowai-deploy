@@ -5,6 +5,7 @@ mod commands;
 mod config;
 mod doctor;
 mod error;
+mod lifecycle_outbox;
 mod platform;
 mod pricing;
 mod registry;
