@@ -1,8 +1,11 @@
+pub mod application;
+mod bootstrap;
 mod cli;
 mod commands;
 mod config;
 mod doctor;
 mod error;
+mod platform;
 mod pricing;
 mod registry;
 mod security;

@@ -16,6 +16,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Ensure that a supported OpenSSH client is installed.
+    Bootstrap(BootstrapArgs),
     /// Check local or target-host prerequisites.
     Doctor(DoctorArgs),
     /// Start the interactive onboard workflow.
@@ -32,6 +34,17 @@ pub enum Command {
     Logout(DeploymentArgs),
     /// Check for or install a newer meowai-deploy release.
     Update(UpdateArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct BootstrapArgs {
+    /// Check OpenSSH without installing or changing the system.
+    #[arg(long)]
+    pub check: bool,
+
+    /// Print a machine-readable check without installing or ANSI output.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -82,6 +95,10 @@ pub struct DoctorArgs {
     /// Directory whose parent will receive the deployment data.
     #[arg(long, default_value = "/opt/meowai-deploy/newapi")]
     pub directory: PathBuf,
+
+    /// Inspect an SSH Linux target instead of the local control machine.
+    #[arg(long)]
+    pub ssh: Option<String>,
 
     /// Print machine-readable JSON instead of a terminal table.
     #[arg(long)]

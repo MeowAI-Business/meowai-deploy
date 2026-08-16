@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Cache Rust build
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-test-
+
+      - name: Format check
+        run: cargo +stable fmt --all -- --check
+
+      - name: Run tests
+        run: cargo +stable test --locked
+        env:
+          MEOWAI_DEPLOY_DISABLE_UPDATE_CHECK: '1'
+
+      - name: OpenSSH bootstrap smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            powershell -NoProfile -NonInteractive -Command "\$env:MEOWAI_DEPLOY_DISABLE_UPDATE_CHECK='1'; cargo +stable run --quiet -- bootstrap --check --json"
+          else
+            MEOWAI_DEPLOY_DISABLE_UPDATE_CHECK=1 cargo +stable run --quiet -- bootstrap --check --json
+          fi
+
+      - name: PowerShell installer smoke test
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $mirror = Join-Path $env:RUNNER_TEMP 'meowai-deploy-mirror'
+          $install = Join-Path $env:RUNNER_TEMP 'meowai-deploy-install'
+          New-Item -ItemType Directory -Path $mirror -Force | Out-Null
+          $package = Join-Path $env:RUNNER_TEMP 'package'
+          New-Item -ItemType Directory -Path $package -Force | Out-Null
+          Set-Content -LiteralPath (Join-Path $package 'meowai-deploy.exe') -Value 'smoke-binary' -NoNewline
+          Compress-Archive -Path (Join-Path $package 'meowai-deploy.exe') -DestinationPath (Join-Path $mirror 'meowai-deploy-windows-amd64.zip') -Force
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $mirror 'meowai-deploy-windows-amd64.zip')).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath (Join-Path $mirror 'checksums-sha256.txt') -Value "$hash  meowai-deploy-windows-amd64.zip" -NoNewline
+          $port = 18765
+          $server = Start-Process -FilePath python -ArgumentList @('-m','http.server',$port,'--directory',$mirror) -PassThru -WindowStyle Hidden
+          try {
+            $env:MEOWAI_DEPLOY_RELEASE_BASE_URL = "http://127.0.0.1:$port"
+            $env:MEOWAI_DEPLOY_INSTALL_DIR = $install
+            & (Join-Path $env:GITHUB_WORKSPACE 'install.ps1')
+            if (-not (Test-Path (Join-Path $install 'meowai-deploy.exe'))) { throw 'installer did not write the executable' }
+            & (Join-Path $env:GITHUB_WORKSPACE 'install.ps1')
+            $userPath = [Environment]::GetEnvironmentVariable('Path','User') -split ';'
+            if (($userPath | Where-Object { $_ -ieq $install }).Count -ne 1) { throw 'installer did not keep PATH idempotent' }
+            Set-Content -LiteralPath (Join-Path $mirror 'checksums-sha256.txt') -Value ('0' * 64 + '  meowai-deploy-windows-amd64.zip') -NoNewline
+            $failed = $false
+            try { & (Join-Path $env:GITHUB_WORKSPACE 'install.ps1') } catch { $failed = $true }
+            if (-not $failed) { throw 'installer accepted an invalid checksum' }
+          } finally {
+            Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
+          }
+
+  secret-scan:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Scan tracked text for credential material
+        shell: bash
+        run: |
+          set -euo pipefail
+          if rg -n --hidden --glob '!.git/**' --glob '!Cargo.lock' \
+            'gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN (RSA|OPENSSH|EC) PRIVATE KEY-----|password[[:space:]]*=[[:space:]]*"[^"$]{8,}"' .; then
+            echo 'Potential credential material found.' >&2
+            exit 1
+          fi

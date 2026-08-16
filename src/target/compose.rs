@@ -169,6 +169,7 @@ impl DeploymentRuntime {
                     phases: BTreeMap::new(),
                     last_sync_at: 0,
                     last_sync_success: false,
+                    operation: None,
                 }
             }
         };
@@ -656,6 +657,7 @@ mod tests {
                 phases: BTreeMap::new(),
                 last_sync_at: 0,
                 last_sync_success: false,
+                operation: None,
             },
             secrets: DeploymentSecrets {
                 postgres_password: SecretString::from("postgres".to_owned()),

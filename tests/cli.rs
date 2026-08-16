@@ -10,7 +10,15 @@ fn help_lists_supported_commands() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     for command in [
-        "doctor", "onboard", "sync", "status", "clean", "rollback", "logout", "update",
+        "bootstrap",
+        "doctor",
+        "onboard",
+        "sync",
+        "status",
+        "clean",
+        "rollback",
+        "logout",
+        "update",
     ] {
         assert!(
             stdout.contains(command),
@@ -28,6 +36,7 @@ fn help_lists_supported_commands() {
     assert!(!doctor_help.contains("--kuma-port"));
     assert!(!doctor_help.contains("--source-url"));
     assert!(!doctor_help.contains("--skip-network"));
+    assert!(doctor_help.contains("--ssh"));
 }
 
 #[test]
@@ -90,6 +99,40 @@ fn status_without_deployment_is_a_normal_state() {
 }
 
 #[test]
+fn doctor_json_is_non_interactive_and_does_not_contact_saved_targets() {
+    let directory = tempfile::tempdir().expect("create temporary directory");
+    let output = binary()
+        .env("MEOWAI_DEPLOY_HOME", directory.path())
+        .env("MEOWAI_DEPLOY_DISABLE_UPDATE_CHECK", "1")
+        .args(["doctor", "--json"])
+        .output()
+        .expect("run doctor json");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("doctor JSON");
+    assert_eq!(report["schema_version"], 1);
+    assert!(report["platform"].as_str().is_some());
+    assert!(report["checks"].is_array());
+    assert!(report["blocking_failures"].is_number());
+}
+
+#[test]
+fn no_color_disables_ansi_in_terminal_facing_output() {
+    let directory = tempfile::tempdir().expect("create temporary directory");
+    let output = binary()
+        .env("NO_COLOR", "1")
+        .env("MEOWAI_DEPLOY_HOME", directory.path())
+        .args(["doctor", "--json"])
+        .output()
+        .expect("run no-color doctor");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!combined.contains('\u{1b}'));
+}
+
+#[test]
 fn installer_is_a_verified_bash_script() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh");
     let script = std::fs::read_to_string(path).expect("read install script");
@@ -113,4 +156,27 @@ fn linux_release_binaries_are_built_with_musl() {
     assert!(workflow.contains("aarch64-unknown-linux-musl"));
     assert!(workflow.contains("musl-tools"));
     assert!(workflow.contains("Requesting program interpreter"));
+}
+
+#[test]
+fn installer_is_a_verified_powershell_script_for_windows_users() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("install.ps1");
+    let script = std::fs::read_to_string(path).expect("read PowerShell installer");
+    for marker in [
+        "Invoke-WebRequest",
+        "Get-FileHash -Algorithm SHA256",
+        "Expand-Archive",
+        "meowai-deploy-windows-amd64.zip",
+        "meowai-deploy.exe",
+        "GetEnvironmentVariable('Path', 'User')",
+        "SetEnvironmentVariable('Path', $updatedPath, 'User')",
+        "Run: meowai-deploy doctor",
+        "Then: meowai-deploy onboard --ssh user@linux-host",
+    ] {
+        assert!(
+            script.contains(marker),
+            "missing PowerShell marker: {marker}"
+        );
+    }
+    assert!(!script.contains("MEOWAI_DEPLOY_SOURCE_PASSWORD"));
 }
