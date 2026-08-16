@@ -25,6 +25,12 @@ jobs:
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal
 
+      - name: Test and build embedded WebUI
+        run: |
+          npm ci --prefix webui
+          npm run test --prefix webui
+          npm run build --prefix webui
+
       - name: Cache Rust build
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
