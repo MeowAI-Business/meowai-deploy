@@ -110,22 +110,16 @@ impl DeploymentInput {
                 "New API administrator username must not exceed 12 characters",
             ));
         }
-        if self.image.trim().is_empty() || self.image_ref.trim().is_empty() {
+        if self.image.trim().is_empty() {
             return Err(ValidationError::new(
-                if self.image.trim().is_empty() {
-                    ValidationCode::EmptyImage
-                } else {
-                    ValidationCode::InvalidImageRef
-                },
-                if self.image.trim().is_empty() {
-                    InputField::Image
-                } else {
-                    InputField::ImageRef
-                },
-                "image and image_ref cannot be empty",
+                ValidationCode::EmptyImage,
+                InputField::Image,
+                "image cannot be empty",
             ));
         }
-        validate_image_ref(&self.image_ref)?;
+        if !self.image_ref.trim().is_empty() {
+            validate_image_ref(&self.image_ref)?;
+        }
         if let DeploymentTargetInput::Ssh { destination } = &self.target {
             validate_ssh_destination(destination)?;
         }
