@@ -1,10 +1,71 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::{error::Result, storage};
 
 use crate::application::operation::OperationCheckpoint;
 
 pub const DOWNSTREAM_CLEANUP_PHASE: &str = "downstream_cleanup";
+pub const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct SnapshotModule {
+    pub fingerprint: String,
+    pub data: Value,
+    pub observed_at: i64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct SyncSnapshot {
+    pub schema_version: u32,
+    pub captured_at: i64,
+    #[serde(default)]
+    pub modules: BTreeMap<String, SnapshotModule>,
+}
+
+impl SyncSnapshot {
+    pub fn new() -> Self {
+        Self {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            captured_at: unix_timestamp(),
+            modules: BTreeMap::new(),
+        }
+    }
+
+    pub fn set_module(
+        &mut self,
+        module: impl Into<String>,
+        data: Value,
+        fingerprint: impl Into<String>,
+    ) {
+        self.modules.insert(
+            module.into(),
+            SnapshotModule {
+                fingerprint: fingerprint.into(),
+                data,
+                observed_at: unix_timestamp(),
+            },
+        );
+        self.captured_at = unix_timestamp();
+    }
+}
+
+pub fn load_snapshot(name: &str) -> Result<Option<SyncSnapshot>> {
+    storage::read_snapshot(name)?.map_or(Ok(None), |content| {
+        serde_json::from_slice(&content).map(Some).map_err(|error| {
+            crate::error::AppError::State(format!("invalid sync snapshot: {error}"))
+        })
+    })
+}
+
+pub fn save_snapshot(name: &str, snapshot: &SyncSnapshot) -> Result<()> {
+    let content = serde_json::to_vec_pretty(snapshot).map_err(|error| {
+        crate::error::AppError::State(format!("serialize sync snapshot: {error}"))
+    })?;
+    storage::write_snapshot(name, &content)
+}
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ResourcePhase {
@@ -69,6 +130,10 @@ pub struct DeploymentState {
     pub last_sync_success: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation: Option<OperationCheckpoint>,
+    #[serde(default)]
+    pub snapshot_schema_version: u32,
+    #[serde(default)]
+    pub last_applied_at: BTreeMap<String, i64>,
 }
 
 impl DeploymentState {
@@ -81,6 +146,17 @@ impl DeploymentState {
                 detail: detail.into(),
             },
         );
+    }
+
+    pub fn downstream_is_initialized(&self) -> bool {
+        self.snapshot_schema_version > 0
+            || ["newapi", "pricing", "channels", "kuma", "onboard"]
+                .into_iter()
+                .any(|name| {
+                    self.phases
+                        .get(name)
+                        .is_some_and(|phase| phase.status == "DONE")
+                })
     }
 }
 
@@ -95,6 +171,7 @@ pub fn unix_timestamp() -> i64 {
 mod tests {
     use super::*;
     use crate::application::operation::{OperationCheckpoint, OperationKind, OperationStage};
+    use serde_json::json;
 
     fn legacy_state_json() -> serde_json::Value {
         serde_json::json!({
@@ -130,5 +207,54 @@ mod tests {
         let encoded = serde_json::to_vec(&state).expect("encode state");
         let decoded: DeploymentState = serde_json::from_slice(&encoded).expect("decode state");
         assert_eq!(decoded.operation, Some(checkpoint));
+    }
+
+    #[test]
+    fn legacy_state_deserializes_with_snapshot_defaults() {
+        let legacy = serde_json::json!({
+            "schema_version": 1,
+            "deployment_id": "legacy",
+            "target_fingerprint": "host",
+            "container_name": "newapi",
+            "directory": "/opt/newapi",
+            "newapi_port": 3000,
+            "kuma_port": 3001,
+            "image": "image",
+            "image_ref": "sha256:abc",
+            "image_digest": "",
+            "source_user_id": 7,
+            "source_group_sha256": "group",
+            "status_key_id": 1,
+            "manifest_sha256": "",
+            "pricing_sha256": {},
+            "channels": {},
+            "kuma_monitors": {},
+            "phases": {},
+            "last_sync_at": 0,
+            "last_sync_success": false
+        });
+        let state: DeploymentState = serde_json::from_value(legacy).expect("legacy state");
+        assert_eq!(state.snapshot_schema_version, 0);
+        assert!(state.last_applied_at.is_empty());
+        assert!(!state.downstream_is_initialized());
+    }
+
+    #[test]
+    fn completed_downstream_phase_marks_deployment_initialized() {
+        let mut state: DeploymentState = serde_json::from_value(json!({
+            "schema_version": 1,
+            "deployment_id": "deployment",
+            "target_fingerprint": "host",
+            "container_name": "newapi",
+            "directory": "/opt/newapi",
+            "newapi_port": 3000,
+            "kuma_port": 3001,
+            "image": "image",
+            "image_ref": "sha256:abc"
+        }))
+        .expect("state");
+        assert!(!state.downstream_is_initialized());
+        state.mark_phase("newapi", "DONE", "initialized");
+        assert!(state.downstream_is_initialized());
     }
 }

@@ -24,6 +24,11 @@ function emit(socket, event, ...args) {
     return new Promise((resolve) => socket.emit(event, ...args, resolve));
 }
 
+function emitMutation(socket, readOnly, event, ...args) {
+    if (readOnly) throw new Error(`Kuma plan mode attempted forbidden write event ${event}`);
+    return emit(socket, event, ...args);
+}
+
 function connect(socket) {
     return new Promise((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error("Kuma Socket.IO connection timed out")), 15000);
@@ -183,14 +188,76 @@ function monitorDrifted(existing, desired) {
         || Boolean(existing.active) !== Boolean(desired.active);
 }
 
+function managedSnapshot(input, pageResult, monitorList) {
+    const groupIDByMonitorID = new Map();
+    const groups = [];
+    for (const monitor of Object.values(monitorList || {})) {
+        const marker = String(monitor.description || "");
+        const prefix = `meowai-deploy:${input.deployment_id}:source-group:`;
+        if (!marker.startsWith(prefix)) continue;
+        const sourceGroupID = marker.slice(prefix.length);
+        groupIDByMonitorID.set(Number(monitor.id), sourceGroupID);
+        groups.push({
+            source_group_id: sourceGroupID,
+            name: String(monitor.name || ""),
+            active: monitor.active !== false,
+        });
+    }
+    groups.sort((left, right) => left.source_group_id.localeCompare(right.source_group_id));
+
+    const monitors = [];
+    for (const monitor of Object.values(monitorList || {})) {
+        const marker = String(monitor.description || "");
+        const prefix = `meowai-deploy:${input.deployment_id}:source-monitor:`;
+        if (!marker.startsWith(prefix)) continue;
+        const headers = parseJsonField(monitor.headers, {});
+        const authorization = String(headers.Authorization || headers.authorization || "");
+        monitors.push({
+            source_monitor_id: marker.slice(prefix.length),
+            name: String(monitor.name || ""),
+            group_id: groupIDByMonitorID.get(Number(monitor.parent || 0)) || "",
+            url: String(monitor.url || ""),
+            key_sha256: crypto.createHash("sha256").update(authorization).digest("hex"),
+            interval: Number(monitor.interval || 0),
+            timeout: Number(monitor.timeout || 0),
+            retries: Number(monitor.maxretries || 0),
+            enabled: monitor.active !== false,
+        });
+    }
+    monitors.sort((left, right) => left.source_monitor_id.localeCompare(right.source_monitor_id));
+
+    const pageExists = Boolean(pageResult && pageResult.ok);
+    const page = pageExists ? (pageResult.config || {}) : {};
+    return {
+        page: {
+            exists: pageExists,
+            slug: input.status_page_slug,
+            title: pageExists ? String(page.title || "") : "",
+            description: pageExists ? String(page.description || "") : "",
+            theme: pageExists ? String(page.theme || "auto") : "auto",
+        },
+        groups,
+        monitors,
+    };
+}
+
 async function sync(input) {
     const baseUrl = "http://127.0.0.1:3001";
-    await ensureDatabase(baseUrl);
+    const readOnly = input.mode === "plan";
+    if (readOnly) {
+        const database = await requestJson(baseUrl, "/setup-database-info");
+        if (database && database.needSetup) {
+            throw new Error("Kuma is not initialized; run onboard before sync");
+        }
+    } else {
+        await ensureDatabase(baseUrl);
+    }
     const socket = await connectWithRetry(baseUrl);
     try {
         let setup = await emit(socket, "needSetup");
         if (setup) {
-            const setupResult = await emit(socket, "setup", input.kuma_username, input.kuma_password);
+            if (readOnly) throw new Error("Kuma account is not initialized; run onboard before sync");
+            const setupResult = await emitMutation(socket, readOnly, "setup", input.kuma_username, input.kuma_password);
             if (!setupResult || !setupResult.ok) throw new Error(setupResult?.msg || "Kuma setup failed");
         }
         const login = await emit(socket, "login", {
@@ -205,12 +272,22 @@ async function sync(input) {
         let pageConfig;
         if (pageResult && pageResult.ok) {
             pageConfig = pageResult.config;
-        } else {
-            const added = await emit(socket, "addStatusPage", input.website_name, input.status_page_slug);
+        } else if (!readOnly) {
+            const added = await emitMutation(socket, readOnly, "addStatusPage", input.website_name, input.status_page_slug);
             if (!added || !added.ok) throw new Error(added?.msg || "Kuma status page creation failed");
             const created = await emit(socket, "getStatusPage", input.status_page_slug);
             if (!created || !created.ok) throw new Error(created?.msg || "Kuma status page readback failed");
             pageConfig = created.config;
+        } else {
+            pageConfig = {};
+        }
+        if (!readOnly && pageResult && pageResult.ok && !input.force) {
+            const current = pageResult.config || {};
+            if (String(current.title || "") !== input.website_name
+                || String(current.description || "") !== String(input.manifest.page_description || "")
+                || String(current.theme || "auto") !== String(input.manifest.theme || "auto")) {
+                throw new Error("managed Kuma status page drifted; rerun sync with --force");
+            }
         }
 
         const monitorListPromise = new Promise((resolve) => socket.once("monitorList", resolve));
@@ -229,7 +306,36 @@ async function sync(input) {
                 existingGroupByMarker.set(marker, monitor);
             }
         }
-
+        if (!readOnly && !input.force) {
+            for (const source of input.manifest.monitors || []) {
+                const groupKey = String(source.group_id || source.group || "default");
+                const groupMarker = `meowai-deploy:${input.deployment_id}:source-group:${groupKey}`;
+                const existingGroup = existingGroupByMarker.get(groupMarker);
+                if (existingGroup && String(existingGroup.name || "") !== String(source.group || groupKey)) {
+                    throw new Error(`managed Kuma group ${groupKey} drifted; rerun sync with --force`);
+                }
+                const marker = `meowai-deploy:${input.deployment_id}:source-monitor:${source.id}`;
+                const existing = existingByMarker.get(marker);
+                if (!existing) continue;
+                const desired = desiredMonitor(
+                    source,
+                    existing,
+                    input,
+                    existingGroup ? Number(existingGroup.id) : null,
+                );
+                if (monitorDrifted(existing, desired.monitor)) {
+                    throw new Error(`managed Kuma monitor ${existing.id} drifted; rerun sync with --force`);
+                }
+            }
+        }
+        if (readOnly) {
+            return {
+                ok: true,
+                page_slug: input.status_page_slug,
+                snapshot: managedSnapshot(input, pageResult, monitorList),
+                monitors: [],
+            };
+        }
         const groups = [];
         const groupsByID = new Map();
         const groupMonitorByID = new Map();
@@ -265,8 +371,8 @@ async function sync(input) {
             groupMonitor.id = existing ? existing.id : undefined;
             normalizeMonitorPayload(groupMonitor);
             const result = existing
-                ? await emit(socket, "editMonitor", groupMonitor)
-                : await emit(socket, "add", groupMonitor);
+                ? await emitMutation(socket, readOnly, "editMonitor", groupMonitor)
+                : await emitMutation(socket, readOnly, "add", groupMonitor);
             if (!result || !result.ok) {
                 throw new Error(`Kuma group sync failed for ${groupName}: ${result?.msg || "unknown error"}`);
             }
@@ -281,7 +387,7 @@ async function sync(input) {
 
         for (const monitor of existingGroupByMarker.values()) {
             if (monitor.active !== false) {
-                const paused = await emit(socket, "pauseMonitor", monitor.id);
+                const paused = await emitMutation(socket, readOnly, "pauseMonitor", monitor.id);
                 if (!paused || !paused.ok) throw new Error(paused?.msg || `Kuma group disable failed for ${monitor.id}`);
             }
         }
@@ -299,9 +405,9 @@ async function sync(input) {
             }
             let result;
             if (existing) {
-                result = await emit(socket, "editMonitor", desired.monitor);
+                result = await emitMutation(socket, readOnly, "editMonitor", desired.monitor);
             } else {
-                result = await emit(socket, "add", desired.monitor);
+                result = await emitMutation(socket, readOnly, "add", desired.monitor);
             }
             if (!result || !result.ok) throw new Error(result?.msg || `Kuma monitor sync failed for ${source.id}`);
             const monitorID = Number(result.monitorID || existing?.id);
@@ -320,7 +426,7 @@ async function sync(input) {
         for (const [marker, monitor] of existingByMarker.entries()) {
             if (seenMarkers.has(marker)) continue;
             if (monitor.active !== false) {
-                const paused = await emit(socket, "pauseMonitor", monitor.id);
+                const paused = await emitMutation(socket, readOnly, "pauseMonitor", monitor.id);
                 if (!paused || !paused.ok) throw new Error(paused?.msg || `Kuma monitor disable failed for ${monitor.id}`);
             }
             monitorStates.push({
@@ -351,7 +457,7 @@ async function sync(input) {
             showOnlyLastHeartbeat: false,
             rssTitle: null,
         };
-        const saved = await emit(socket, "saveStatusPage", input.status_page_slug, currentPage, currentPage.logo, groups);
+        const saved = await emitMutation(socket, readOnly, "saveStatusPage", input.status_page_slug, currentPage, currentPage.logo, groups);
         if (!saved || !saved.ok) throw new Error(saved?.msg || "Kuma status page save failed");
 
         return {

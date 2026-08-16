@@ -4,7 +4,10 @@ mod onboard_status;
 mod pricing;
 
 pub use auth::{SourceAccountMode, SourceCredentials, SourceIdentity};
-pub use groups::{GroupCatalog, SourceGroup, TokenBinding, TokenSync};
+pub use groups::{
+    GroupCatalog, GroupTokenPlan, GroupTokenPlanEntry, RemovedGroupTokenPlan, SourceGroup,
+    TokenBinding, TokenSync,
+};
 pub use onboard_status::{
     StatusKeyMetadata, StatusKeyProvision, StatusManifest, StatusMonitorManifest,
     StatusMonitorResponse, StatusMonitorSnapshot, StatusPage, StatusSnapshot,

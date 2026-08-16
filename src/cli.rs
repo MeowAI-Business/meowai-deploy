@@ -87,11 +87,23 @@ pub struct UpdateArgs {
 
 #[derive(Debug, Args)]
 pub struct SyncArgs {
-    /// Re-import current source pricing, billing, group behavior, Seedance, and marketplace settings.
+    /// Read all managed state and report differences without applying changes.
+    #[arg(long, conflicts_with = "apply")]
+    pub check: bool,
+
+    /// Show complete normalized field-level differences.
     #[arg(long)]
+    pub details: bool,
+
+    /// Apply only the listed modules (comma-separated), without interactive module selection.
+    #[arg(long, value_delimiter = ',', value_name = "MODULES")]
+    pub apply: Vec<String>,
+
+    /// Deprecated whole-pricing import switch. Use --apply with explicit modules.
+    #[arg(long, hide = true)]
     pub pricing: bool,
 
-    /// Apply managed configuration changes even when a drift was detected.
+    /// Allow confirmed modules to overwrite conflicting downstream fields.
     #[arg(long)]
     pub force: bool,
 }
