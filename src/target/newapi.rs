@@ -738,6 +738,7 @@ impl NewApiClient {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn sync_channels_with_pricing(
         &self,
         config: &DeploymentConfig,

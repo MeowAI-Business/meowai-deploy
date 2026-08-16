@@ -4,6 +4,7 @@ use secrecy::SecretString;
 use std::collections::BTreeSet;
 
 use super::{
+    deployment_control,
     error::{ApplicationError, ApplicationResult, ErrorCategory, app_error, source_error},
     input::DeploymentInput,
     operation::{
@@ -19,7 +20,10 @@ use crate::{
     config::DeploymentConfig,
     error::AppError,
     pricing::PricingConfig,
-    source::{GroupCatalog, SourceClient, SourceIdentity, StatusKeyProvision, TokenSync},
+    source::{
+        DeploymentMetadata, DeploymentRegistration, GroupCatalog, SourceClient, SourceIdentity,
+        StatusKeyProvision, TokenSync,
+    },
     source_key_store,
     state::DeploymentState,
     storage::{self, OPERATION_FILE, STATE_FILE},
@@ -67,6 +71,13 @@ pub trait OnboardBackend: Send {
     ) -> BoxFuture<'a, ApplicationResult<StageOutput>>;
 
     fn finish<'a>(&'a mut self) -> BoxFuture<'a, ApplicationResult<Vec<AdministratorCredential>>>;
+
+    fn report_failure<'a>(
+        &'a self,
+        _error: &'a ApplicationError,
+    ) -> BoxFuture<'a, ApplicationResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 pub trait CheckpointStore: Send {
@@ -307,6 +318,9 @@ where
                     let _ = tracker.fail_current_error(&error);
                 }
                 store_tracker(store, tracker)?;
+                if error.category != ErrorCategory::Cancelled {
+                    backend.report_failure(&error).await?;
+                }
                 return Err(error);
             }
         }
@@ -420,6 +434,7 @@ pub struct ProductionOnboardBackend {
     credentials: Vec<AdministratorCredential>,
     allow_status_key_rotation: bool,
     ssh_password: Option<SecretString>,
+    registration: Option<DeploymentRegistration>,
 }
 
 impl ProductionOnboardBackend {
@@ -438,6 +453,7 @@ impl ProductionOnboardBackend {
             credentials: Vec::new(),
             allow_status_key_rotation: false,
             ssh_password: None,
+            registration: None,
         }
     }
 
@@ -448,6 +464,19 @@ impl ProductionOnboardBackend {
 
     pub fn allow_status_key_rotation(&mut self) {
         self.allow_status_key_rotation = true;
+    }
+
+    pub async fn report_failure(&self, error: &ApplicationError) {
+        if let Some(registration) = &self.registration {
+            let reason = format!("{}: {}", error.code, error.message);
+            let _ = deployment_control::queue_lifecycle(
+                registration,
+                "deployment_failed",
+                "failed",
+                &reason,
+            )
+            .await;
+        }
     }
 
     fn deployment(&self) -> ApplicationResult<&DeploymentRuntime> {
@@ -555,7 +584,7 @@ impl ProductionOnboardBackend {
             ));
         }
 
-        let deployment = DeploymentRuntime::prepare_with_ssh_password(
+        let mut deployment = DeploymentRuntime::prepare_with_ssh_password(
             &self.config,
             self.identity.user_id,
             &catalog.response_sha256,
@@ -564,6 +593,28 @@ impl ProductionOnboardBackend {
             self.ssh_password.clone(),
         )
         .map_err(app_error)?;
+        let registration = match deployment_control::load_registration()? {
+            Some(registration) => registration,
+            None => self
+                .source
+                .register_deployment(&format!("reg_{}", self.config.deployment_id()))
+                .await
+                .map_err(source_error)?,
+        };
+        deployment_control::apply_registration(&mut deployment.state, &registration)?;
+        deployment_control::persist_registration(
+            &self.config,
+            &deployment.executor,
+            &registration,
+        )?;
+        deployment.persist_state().map_err(app_error)?;
+        let _ = deployment_control::queue_lifecycle(
+            &registration,
+            "provisioning",
+            "provisioning",
+            "onboard started",
+        )
+        .await?;
         source_key_store::save(
             &self.config.source_url,
             self.identity.user_id,
@@ -586,6 +637,7 @@ impl ProductionOnboardBackend {
         self.status_key = Some(status_key);
         self.shared_status_key = shared_status_key;
         self.deployment = Some(deployment);
+        self.registration = Some(registration);
         Ok(StageOutput {
             message,
             progress: None,
@@ -774,8 +826,34 @@ impl ProductionOnboardBackend {
         })
     }
 
-    fn complete_deployment(&mut self) -> ApplicationResult<StageOutput> {
+    async fn complete_deployment(&mut self) -> ApplicationResult<StageOutput> {
+        let config = self.config.clone();
+        let registration = self.registration.clone();
+        let updater_supported = matches!(config.target, crate::config::Target::Ssh { .. })
+            || (matches!(config.target, crate::config::Target::Local) && cfg!(target_os = "linux"));
+        if updater_supported {
+            let deployment = self.deployment()?;
+            crate::target::updater::install(
+                &deployment.executor,
+                &config,
+                deployment.state.newapi_port,
+            )
+            .map_err(app_error)?;
+        }
         let deployment = self.deployment_mut()?;
+        deployment.state.mark_phase(
+            "updater",
+            if updater_supported {
+                "DONE"
+            } else {
+                "UNSUPPORTED"
+            },
+            if updater_supported {
+                "Linux systemd updater installed"
+            } else {
+                "automatic updater requires a Linux target with systemd"
+            },
+        );
         deployment.state.last_sync_at = crate::state::unix_timestamp();
         deployment.state.last_sync_success = true;
         deployment.state.mark_phase(
@@ -785,6 +863,31 @@ impl ProductionOnboardBackend {
         );
         deployment.persist_state().map_err(app_error)?;
         persist_source_session(&self.source)?;
+        if let Some(registration) = registration.as_ref() {
+            self.source
+                .update_deployment_metadata(
+                    registration,
+                    &DeploymentMetadata {
+                        site_name: &config.website_name,
+                        container_name: &config.container_name,
+                        target_type: if matches!(config.target, crate::config::Target::Local) {
+                            "local"
+                        } else {
+                            "ssh"
+                        },
+                        verified_primary_endpoint: "",
+                    },
+                )
+                .await
+                .map_err(source_error)?;
+            let _ = deployment_control::queue_lifecycle(
+                registration,
+                "active",
+                "active",
+                "onboard completed",
+            )
+            .await?;
+        }
         Ok(StageOutput {
             message: "最终部署状态已保存".to_owned(),
             progress: None,
@@ -882,7 +985,7 @@ impl OnboardBackend for ProductionOnboardBackend {
                 OperationStage::PricingImport => self.import_pricing().await,
                 OperationStage::ChannelSynchronization => self.synchronize_channels().await,
                 OperationStage::KumaSynchronization => self.synchronize_kuma(progress).await,
-                OperationStage::FinalVerification => self.complete_deployment(),
+                OperationStage::FinalVerification => self.complete_deployment().await,
                 OperationStage::Cleanup | OperationStage::Rollback => Err(ApplicationError::new(
                     ErrorCategory::Conflict,
                     "UNEXPECTED_ONBOARD_STAGE",
@@ -895,6 +998,16 @@ impl OnboardBackend for ProductionOnboardBackend {
 
     fn finish<'a>(&'a mut self) -> BoxFuture<'a, ApplicationResult<Vec<AdministratorCredential>>> {
         Box::pin(async move { Ok(std::mem::take(&mut self.credentials)) })
+    }
+
+    fn report_failure<'a>(
+        &'a self,
+        error: &'a ApplicationError,
+    ) -> BoxFuture<'a, ApplicationResult<()>> {
+        Box::pin(async move {
+            ProductionOnboardBackend::report_failure(self, error).await;
+            Ok(())
+        })
     }
 }
 

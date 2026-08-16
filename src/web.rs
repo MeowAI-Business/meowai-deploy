@@ -44,8 +44,8 @@ use crate::{
             DEFAULT_NEWAPI_PORT, DEFAULT_SOURCE_URL, DEFAULT_WEBSITE_NAME, DeploymentTargetInput,
         },
         manage::{
-            SyncDeploymentRequest, clean_deployment, read_deployment_status, rollback_deployment,
-            rollback_deployment_with_ssh_password, sync_deployment_with_progress,
+            clean_deployment_with_ssh_password, read_deployment_status, rollback_deployment,
+            rollback_deployment_with_ssh_password,
         },
         onboard::{
             CheckpointStore, DeploymentStateCheckpointStore, OperationControl,
@@ -66,8 +66,8 @@ use crate::{
     },
     cli::WebArgs,
     commands::{
-        load_deployment_config, persist_deployment_config, persist_source_session,
-        source_for_operation,
+        build_sync_plan_view, load_deployment_config, persist_deployment_config,
+        persist_source_session, source_for_operation,
     },
     config::{DeploymentConfig, Target},
     error::{AppError, Result as AppResult},
@@ -148,6 +148,7 @@ struct WebOperation {
     result: Mutex<Option<Value>>,
     credentials: Mutex<Option<Vec<WebCredential>>>,
     ssh_password: Mutex<Option<SecretString>>,
+    source_password: Mutex<Option<SecretString>>,
     events: Mutex<Vec<OperationEvent>>,
     sequence: AtomicU64,
 }
@@ -164,9 +165,11 @@ struct CreateOperationRequest {
     #[serde(default)]
     kind: Option<OperationKind>,
     #[serde(default)]
-    include_pricing: bool,
-    #[serde(default)]
     force: bool,
+    #[serde(default)]
+    modules: Vec<String>,
+    #[serde(default)]
+    plan_fingerprint: Option<String>,
     #[serde(default)]
     revoke_source: bool,
     #[serde(default)]
@@ -811,6 +814,7 @@ pub fn router(state: WebState) -> Router {
         .route("/api/checks/directory", post(check_directory))
         .route("/api/checks/port", post(check_port))
         .route("/api/images/resolve", post(resolve_image))
+        .route("/api/sync/plan", post(read_sync_plan))
         .route("/api/events", get(events))
         .route("/api/operations", post(create_operation))
         .route("/api/operations/{id}", get(read_operation))
@@ -1041,6 +1045,29 @@ async fn read_bootstrap(
         draft: load_draft()?,
         current_operation: current_operation_summary(&state)?,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct SyncPlanRequest {
+    source_password: Option<String>,
+    ssh_password: Option<String>,
+}
+
+async fn read_sync_plan(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Json(payload): Json<SyncPlanRequest>,
+) -> ApiResult<Json<crate::commands::SyncPlanView>> {
+    require_session(&state, &headers)?;
+    enforce_rate_limit(&state, "operation_read", OPERATION_READ_LIMIT)?;
+    let mut config = load_deployment_config()
+        .map_err(|error| ApiError::from_application(crate::application::error::app_error(error)))?;
+    config.resolve_passwords();
+    config.source_password = optional_secret(payload.source_password);
+    let plan = build_sync_plan_view(&config, optional_secret(payload.ssh_password))
+        .await
+        .map_err(|error| ApiError::from_application(crate::application::error::app_error(error)))?;
+    Ok(Json(plan))
 }
 
 async fn preflight_target(
@@ -1430,6 +1457,7 @@ async fn create_operation(
                 None
             },
         ),
+        source_password: Mutex::new(optional_secret(payload.source_password.clone())),
         sequence: AtomicU64::new(0),
     });
     state
@@ -1980,6 +2008,33 @@ async fn run_manage_operation(
         );
         let mut config = load_deployment_config().map_err(crate::application::error::app_error)?;
         config.resolve_passwords();
+        let source_password = operation
+            .source_password
+            .lock()
+            .map_err(|_| {
+                ApplicationError::new(
+                    ErrorCategory::Internal,
+                    "WEB_LOCK_POISONED",
+                    "本地 Web 服务状态不可用",
+                    false,
+                )
+            })?
+            .clone();
+        if source_password.is_some() {
+            config.source_password = source_password;
+        }
+        let ssh_password = operation
+            .ssh_password
+            .lock()
+            .map_err(|_| {
+                ApplicationError::new(
+                    ErrorCategory::Internal,
+                    "WEB_LOCK_POISONED",
+                    "本地 Web 服务状态不可用",
+                    false,
+                )
+            })?
+            .clone();
         let control = operation
             .control
             .lock()
@@ -2007,49 +2062,39 @@ async fn run_manage_operation(
                 )?
             }
             OperationKind::Sync => {
-                let mut source = source_for_operation(&config)
+                emit_web_event(
+                    &state,
+                    &operation,
+                    Some(OperationStage::SourceResources),
+                    EventSeverity::Info,
+                    OperationEventKind::Message,
+                    "正在重新读取源站和下游，校验同步计划",
+                    None,
+                );
+                let args = crate::cli::SyncArgs {
+                    check: false,
+                    details: true,
+                    apply: payload.modules.clone(),
+                    pricing: false,
+                    force: payload.force,
+                    plan_fingerprint: payload.plan_fingerprint.clone(),
+                };
+                crate::commands::run_sync_loaded_with_web_credentials(&args, &config, ssh_password)
                     .await
                     .map_err(crate::application::error::app_error)?;
-                let progress_state = state.clone();
-                let progress_operation = operation.clone();
-                serde_json::to_value(
-                    sync_deployment_with_progress(
-                        &config,
-                        &mut source,
-                        web_sync_request(&payload),
-                        &cancellation,
-                        &mut |progress_stage, message| {
-                            emit_web_event(
-                                &progress_state,
-                                &progress_operation,
-                                Some(progress_stage),
-                                EventSeverity::Info,
-                                OperationEventKind::Message,
-                                message,
-                                None,
-                            );
-                        },
-                    )
-                    .await?,
-                )
-                .map_err(|error| {
-                    ApplicationError::new(
-                        ErrorCategory::Internal,
-                        "WEB_RESULT_SERIALIZE_FAILED",
-                        error.to_string(),
-                        false,
-                    )
-                })?
+                serde_json::json!({"applied_modules": args.apply})
             }
-            OperationKind::Clean => serde_json::to_value(clean_deployment(&config, &cancellation)?)
-                .map_err(|error| {
-                    ApplicationError::new(
-                        ErrorCategory::Internal,
-                        "WEB_RESULT_SERIALIZE_FAILED",
-                        error.to_string(),
-                        false,
-                    )
-                })?,
+            OperationKind::Clean => serde_json::to_value(
+                clean_deployment_with_ssh_password(&config, &cancellation, ssh_password).await?,
+            )
+            .map_err(|error| {
+                ApplicationError::new(
+                    ErrorCategory::Internal,
+                    "WEB_RESULT_SERIALIZE_FAILED",
+                    error.to_string(),
+                    false,
+                )
+            })?,
             OperationKind::Rollback => {
                 let mut source = if payload.revoke_source {
                     Some(
@@ -2130,13 +2175,6 @@ async fn run_manage_operation(
             error.message.clone(),
             error.diagnostic.clone(),
         );
-    }
-}
-
-fn web_sync_request(payload: &CreateOperationRequest) -> SyncDeploymentRequest {
-    SyncDeploymentRequest {
-        include_pricing: payload.include_pricing,
-        force: payload.force,
     }
 }
 
@@ -2738,6 +2776,7 @@ fn recover_saved_operation() -> AppResult<Option<Arc<WebOperation>>> {
         result: Mutex::new(None),
         credentials: Mutex::new(None),
         ssh_password: Mutex::new(None),
+        source_password: Mutex::new(None),
         events: Mutex::new(Vec::new()),
         sequence: AtomicU64::new(0),
     })))
@@ -3315,13 +3354,14 @@ mod tests {
     fn web_sync_request_preserves_explicit_flags() {
         let payload: CreateOperationRequest = serde_json::from_value(serde_json::json!({
             "kind": "sync",
-            "include_pricing": true,
+            "modules": ["group_pricing", "site"],
+            "plan_fingerprint": "plan-1",
             "force": true
         }))
         .expect("sync payload");
-        let request = web_sync_request(&payload);
-        assert!(request.include_pricing);
-        assert!(request.force);
+        assert_eq!(payload.modules, vec!["group_pricing", "site"]);
+        assert_eq!(payload.plan_fingerprint.as_deref(), Some("plan-1"));
+        assert!(payload.force);
     }
 
     #[test]
@@ -3375,6 +3415,7 @@ mod tests {
             result: Mutex::new(None),
             credentials: Mutex::new(None),
             ssh_password: Mutex::new(None),
+            source_password: Mutex::new(None),
             events: Mutex::new(Vec::new()),
             sequence: AtomicU64::new(0),
         });

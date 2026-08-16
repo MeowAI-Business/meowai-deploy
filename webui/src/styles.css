@@ -125,6 +125,30 @@ button:focus-visible, input:focus-visible { outline: 3px solid color-mix(in srgb
 .review-credentials { max-width: 760px; margin-top: 26px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 18px; }
 .review-credentials.has-ssh { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 
+.sync-plan { display: flex; flex-direction: column; gap: 20px; }
+.sync-plan-loading { min-height: 240px; display: flex; align-items: center; justify-content: center; gap: 10px; color: var(--text-secondary); font-size: 13px; }
+.sync-plan-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
+.sync-plan-heading strong { font-size: 14px; }
+.sync-plan-heading p { margin: 6px 0 0; color: var(--text-secondary); font-size: 12px; line-height: 1.5; }
+.sync-module-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-top: 1px solid var(--border); }
+.sync-module { min-width: 0; min-height: 64px; padding: 12px 10px; display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; align-items: center; gap: 10px; border-bottom: 1px solid var(--border); color: var(--text); cursor: pointer; }
+.sync-module:nth-child(odd) { border-right: 1px solid var(--border); }
+.sync-module:hover { background: var(--surface-subtle); }
+.sync-module.is-quiet { color: var(--text-secondary); cursor: default; }
+.sync-module.is-quiet:hover { background: transparent; }
+.sync-module input { width: 16px; height: 16px; margin: 0; accent-color: var(--primary); }
+.sync-module-copy { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.sync-module-copy strong { font-size: 12px; font-weight: 650; }
+.sync-module-copy small { color: var(--text-secondary); font-size: 11px; line-height: 1.4; overflow-wrap: anywhere; }
+.sync-risk { color: var(--danger); font-size: 11px; font-weight: 650; }
+.sync-force { display: flex; align-items: flex-start; gap: 10px; padding: 12px; border-radius: 7px; background: var(--warning-soft); color: var(--warning); cursor: pointer; }
+.sync-force input { width: 16px; height: 16px; margin: 1px 0 0; accent-color: var(--warning); }
+.sync-force > span { display: flex; flex-direction: column; gap: 3px; }
+.sync-force strong { font-size: 12px; }
+.sync-force small { font-size: 11px; line-height: 1.45; }
+.sync-margin-note { display: flex; justify-content: space-between; gap: 16px; color: var(--text-secondary); font-size: 11px; line-height: 1.5; }
+.sync-margin-note strong { flex: 0 0 auto; color: var(--text); font-weight: 620; }
+
 .operation-view { width: 100%; }
 .operation-status { display: flex; align-items: flex-start; gap: 14px; color: var(--primary); }
 .operation-status.complete { color: var(--success); }
@@ -219,6 +243,11 @@ button:focus-visible, input:focus-visible { outline: 3px solid color-mix(in srgb
   .form-row, .target-switch { grid-template-columns: 1fr; }
   .review-row { grid-template-columns: 100px minmax(0, 1fr); gap: 12px; }
   .review-credentials.has-ssh { grid-template-columns: 1fr; }
+  .sync-plan-heading { align-items: stretch; flex-direction: column; }
+  .sync-plan-heading .secondary-action { align-self: flex-start; }
+  .sync-module-list { grid-template-columns: 1fr; }
+  .sync-module:nth-child(odd) { border-right: 0; }
+  .sync-margin-note { flex-direction: column; gap: 5px; }
   .inline-error { max-width: 100%; margin-top: 24px; }
   .workflow-actions { padding: 13px 18px; }
   .primary-action, .secondary-action, .danger-action { padding: 0 13px; }

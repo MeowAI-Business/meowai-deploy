@@ -173,20 +173,23 @@ pub fn install(
     config: &DeploymentConfig,
     newapi_port: u16,
 ) -> Result<()> {
-    let token = random_secret(48);
+    prepare_credentials(executor)?;
     let script = render_script(config, newapi_port);
     executor.write_file("meowai-deploy-updater.sh", script.as_bytes(), true)?;
-    executor.write_file(
-        "updater-credentials.env",
-        format!("MEOWAI_UPDATER_LOCAL_CREDENTIAL={token}\n").as_bytes(),
-        true,
-    )?;
     let unit = render_service_unit(&config.directory);
     executor.write_file("meowai-deploy-updater.service", unit.as_bytes(), false)?;
     executor.write_file("meowai-deploy-updater.timer", TIMER_UNIT, false)?;
     executor.run_in_directory(
         "set -eu\nchmod 700 meowai-deploy-updater.sh\nmkdir -p run backups\nchmod 700 run backups\nnow=$(date +%s)\nprintf '{\"status\":\"installed\",\"updated_at\":%s}\\n' \"$now\" > run/updater-status.json\nchmod 600 run/updater-status.json\ninstall -m 0644 meowai-deploy-updater.service /etc/systemd/system/meowai-deploy-updater.service\ninstall -m 0644 meowai-deploy-updater.timer /etc/systemd/system/meowai-deploy-updater.timer\nsystemctl daemon-reload\nsystemctl enable --now meowai-deploy-updater.timer",
     )?;
+    Ok(())
+}
+
+pub fn prepare_credentials(executor: &TargetExecutor) -> Result<()> {
+    let token = random_secret(48);
+    crate::security::validate_env_value("MEOWAI_UPDATER_LOCAL_CREDENTIAL", &token)?;
+    let token = shell_escape::escape(token.into());
+    executor.run_in_directory(&format!("set -eu\nif [ ! -s updater-credentials.env ]; then\n  umask 077\n  printf 'MEOWAI_UPDATER_LOCAL_CREDENTIAL=%s\\n' {token} > updater-credentials.env\n  chmod 600 updater-credentials.env\nfi\ntest -s updater-credentials.env"))?;
     Ok(())
 }
 
@@ -393,9 +396,11 @@ mod tests {
         )
         .expect("write current digest");
 
-        let mut config = DeploymentConfig::default();
-        config.directory = root.clone();
-        config.container_name = "runtime-test".to_owned();
+        let config = DeploymentConfig {
+            directory: root.clone(),
+            container_name: "runtime-test".to_owned(),
+            ..DeploymentConfig::default()
+        };
         let script = render_script(&config, 43127);
         let script_path = root.join("meowai-deploy-updater.sh");
         write_executable(&script_path, &script);
@@ -550,9 +555,11 @@ esac
 
     #[test]
     fn updater_health_check_uses_allocated_runtime_port() {
-        let mut config = DeploymentConfig::default();
-        config.directory = PathBuf::from("/tmp/meowai");
-        config.newapi_port = 3000;
+        let config = DeploymentConfig {
+            directory: PathBuf::from("/tmp/meowai"),
+            newapi_port: 3000,
+            ..DeploymentConfig::default()
+        };
 
         let script = render_script(&config, 43127);
 

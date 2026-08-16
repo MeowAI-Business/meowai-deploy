@@ -1,43 +1,24 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 
 use super::{
+    deployment_control,
     error::{ApplicationError, ApplicationResult, ErrorCategory, app_error, source_error},
-    operation::{CancellationToken, OperationStage},
-    source::persist_source_session,
+    operation::CancellationToken,
 };
 use crate::{
     config::DeploymentConfig,
     source::SourceClient,
     source_key_store,
-    state::{DOWNSTREAM_CLEANUP_PHASE, DeploymentState, ResourcePhase, unix_timestamp},
+    state::{DOWNSTREAM_CLEANUP_PHASE, DeploymentState, ResourcePhase},
     storage::{self, CREDENTIALS_FILE, STATE_FILE},
     target::{
         TargetExecutor,
         compose::{DeploymentRuntime, DeploymentSecrets},
-        kuma,
-        newapi::NewApiClient,
     },
 };
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub struct SyncDeploymentRequest {
-    pub include_pricing: bool,
-    pub force: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub struct SyncDeploymentOutcome {
-    pub group_count: usize,
-    pub channels_created: usize,
-    pub channels_updated: usize,
-    pub channels_reused: usize,
-    pub channels_disabled: usize,
-    pub source_tokens_disabled: usize,
-    pub kuma_monitor_count: usize,
-}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ContainerStatus {
@@ -73,226 +54,6 @@ pub struct RollbackDeploymentOutcome {
     pub source_status_key_revoked: bool,
 }
 
-pub async fn sync_deployment(
-    config: &DeploymentConfig,
-    source: &mut SourceClient,
-    request: SyncDeploymentRequest,
-    cancellation: &CancellationToken,
-) -> ApplicationResult<SyncDeploymentOutcome> {
-    check_cancellation(cancellation)?;
-    let mut deployment = DeploymentRuntime::prepare(config, 0, "", 0, None).map_err(app_error)?;
-    let result =
-        sync_deployment_inner(config, &mut deployment, source, request, cancellation).await;
-    deployment.state.last_sync_at = unix_timestamp();
-    deployment.state.last_sync_success = result.is_ok();
-    let persist_result = deployment.persist_state().map_err(app_error);
-    match (result, persist_result) {
-        (Ok(outcome), Ok(())) => Ok(outcome),
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-    }
-}
-
-pub async fn sync_deployment_with_progress(
-    config: &DeploymentConfig,
-    source: &mut SourceClient,
-    request: SyncDeploymentRequest,
-    cancellation: &CancellationToken,
-    progress: &mut (dyn FnMut(OperationStage, &str) + Send),
-) -> ApplicationResult<SyncDeploymentOutcome> {
-    progress(OperationStage::BaseServices, "正在同步部署服务");
-    let result = sync_deployment(config, source, request, cancellation).await;
-    if result.is_ok() {
-        progress(OperationStage::FinalVerification, "同步部署已完成");
-    }
-    result
-}
-
-async fn sync_deployment_inner(
-    config: &DeploymentConfig,
-    deployment: &mut DeploymentRuntime,
-    source: &mut SourceClient,
-    request: SyncDeploymentRequest,
-    cancellation: &CancellationToken,
-) -> ApplicationResult<SyncDeploymentOutcome> {
-    deployment
-        .deploy_base_stack(config, |message| {
-            tracing::info!(stage = "base_services", %message, "deployment progress");
-        })
-        .map_err(app_error)?;
-    check_cancellation(cancellation)?;
-    let identity = source.identity().cloned().ok_or_else(|| {
-        ApplicationError::new(
-            ErrorCategory::Authentication,
-            "SOURCE_IDENTITY_MISSING",
-            "源站会话没有用户身份",
-            true,
-        )
-    })?;
-    if deployment.state.source_user_id != 0 && deployment.state.source_user_id != identity.user_id {
-        return Err(ApplicationError::new(
-            ErrorCategory::Conflict,
-            "SOURCE_ACCOUNT_MISMATCH",
-            "当前源站账号不属于这个部署",
-            false,
-        ));
-    }
-
-    let catalog = source.groups().await.map_err(source_error)?;
-    check_cancellation(cancellation)?;
-    let source_pricing = if request.include_pricing {
-        Some(source.pricing().await.map_err(source_error)?)
-    } else {
-        None
-    };
-    let active_group_ids = catalog
-        .groups
-        .iter()
-        .map(|group| group.group_id.clone())
-        .collect::<BTreeSet<_>>();
-    let source_tokens_disabled = source
-        .disable_removed_group_tokens(&active_group_ids)
-        .await
-        .map_err(source_error)?;
-    let token_sync = source
-        .ensure_group_tokens(&catalog)
-        .await
-        .map_err(source_error)?;
-    let status_key = source
-        .ensure_onboard_status_key()
-        .await
-        .map_err(source_error)?;
-    if let Some(key) = status_key.key() {
-        deployment.secrets.public_status_source_key = key.clone();
-    } else if deployment.state.status_key_id != 0
-        && deployment.state.status_key_id != status_key.metadata.id
-    {
-        deployment.secrets.public_status_source_key =
-            source_key_store::load(&config.source_url, identity.user_id, status_key.metadata.id)
-                .map_err(app_error)?
-                .ok_or_else(|| {
-                    ApplicationError::new(
-                        ErrorCategory::Conflict,
-                        "STATUS_KEY_CONTENT_UNAVAILABLE",
-                        "源站公共状态密钥已更换，但当前控制端没有保存新密钥内容",
-                        false,
-                    )
-                })?;
-    }
-    source_key_store::save(
-        &config.source_url,
-        identity.user_id,
-        status_key.metadata.id,
-        &deployment.secrets.public_status_source_key,
-    )
-    .map_err(app_error)?;
-    deployment.state.source_user_id = identity.user_id;
-    deployment.state.source_group_sha256 = catalog.response_sha256.clone();
-    deployment.state.status_key_id = status_key.metadata.id;
-    deployment.persist(config).map_err(app_error)?;
-    persist_source_session(source)?;
-    check_cancellation(cancellation)?;
-
-    let mut downstream = NewApiClient::connect(&deployment.executor, deployment.state.newapi_port)
-        .map_err(app_error)?;
-    downstream
-        .initialize_and_login(config, &deployment.secrets.newapi_admin_password)
-        .await
-        .map_err(app_error)?;
-    let previous_channels = deployment.state.channels.clone();
-    let (channel_result, mut channels) = downstream
-        .sync_channels_with_pricing(
-            config,
-            &deployment.container_source_url,
-            &catalog,
-            &token_sync.bindings,
-            &previous_channels,
-            request.force,
-            source_pricing.as_ref(),
-        )
-        .await
-        .map_err(app_error)?;
-    let channels_disabled = downstream
-        .disable_removed_channels(&previous_channels, &mut channels)
-        .await
-        .map_err(app_error)?;
-    deployment.state.channels = channels;
-    if let Some(source_pricing) = &source_pricing {
-        deployment.state.pricing_sha256 = downstream
-            .import_pricing(source_pricing)
-            .await
-            .map_err(app_error)?;
-        deployment.state.mark_phase(
-            "pricing",
-            "DONE",
-            "价格表、Seedance 和市场配置已重新导入并回读一致",
-        );
-    }
-    check_cancellation(cancellation)?;
-
-    deployment
-        .deploy_kuma(config, |message| {
-            tracing::info!(stage = "kuma_synchronization", %message, "deployment progress");
-        })
-        .map_err(app_error)?;
-    let manifest = source
-        .onboard_status_manifest(&deployment.secrets.public_status_source_key)
-        .await
-        .map_err(source_error)?;
-    let deployment_id = config.deployment_id();
-    let kuma_sync = kuma::sync_status_page(kuma::KumaSyncOptions {
-        executor: &deployment.executor,
-        container_name: &config.container_name,
-        deployment_id: &deployment_id,
-        website_name: &config.website_name,
-        source_base_url: &deployment.container_source_url,
-        status_key: &deployment.secrets.public_status_source_key,
-        kuma_username: &config.kuma_admin_username,
-        kuma_password: &deployment.secrets.kuma_admin_password,
-        force: request.force,
-        manifest: &manifest,
-    })
-    .map_err(app_error)?;
-    deployment.state.manifest_sha256 = kuma_sync.manifest_sha256;
-    deployment.state.kuma_monitors = kuma_sync.monitors;
-    let public_status_url = kuma::internal_status_page_url(&kuma_sync.page_slug);
-    downstream
-        .configure_public_status_url(&public_status_url)
-        .await
-        .map_err(app_error)?;
-    let kuma_monitor_count = deployment.state.kuma_monitors.len();
-    deployment.state.mark_phase(
-        "kuma",
-        "DONE",
-        format!("status page {} synchronized", kuma_sync.page_slug),
-    );
-    deployment.state.mark_phase(
-        "sync",
-        "DONE",
-        format!(
-            "groups {}, channels created {}, updated {}, reused {}, disabled {}, source tokens disabled {}, Kuma monitors {}",
-            catalog.groups.len(),
-            channel_result.created,
-            channel_result.updated,
-            channel_result.reused,
-            channels_disabled,
-            source_tokens_disabled,
-            kuma_monitor_count
-        ),
-    );
-    deployment.persist(config).map_err(app_error)?;
-    check_cancellation(cancellation)?;
-    Ok(SyncDeploymentOutcome {
-        group_count: catalog.groups.len(),
-        channels_created: channel_result.created,
-        channels_updated: channel_result.updated,
-        channels_reused: channel_result.reused,
-        channels_disabled,
-        source_tokens_disabled,
-        kuma_monitor_count,
-    })
-}
-
 pub fn read_deployment_status(
     config: &DeploymentConfig,
     cancellation: &CancellationToken,
@@ -319,16 +80,35 @@ pub fn read_deployment_status(
     })
 }
 
-pub fn clean_deployment(
+pub async fn clean_deployment(
     config: &DeploymentConfig,
     cancellation: &CancellationToken,
 ) -> ApplicationResult<CleanDeploymentOutcome> {
+    clean_deployment_with_ssh_password(config, cancellation, None).await
+}
+
+pub async fn clean_deployment_with_ssh_password(
+    config: &DeploymentConfig,
+    cancellation: &CancellationToken,
+    ssh_password: Option<SecretString>,
+) -> ApplicationResult<CleanDeploymentOutcome> {
     check_cancellation(cancellation)?;
-    let executor = TargetExecutor::new(config.target.clone(), config.directory.clone());
+    let executor = TargetExecutor::new(config.target.clone(), config.directory.clone())
+        .with_ssh_password(ssh_password);
     executor.validate_access().map_err(app_error)?;
     let mut state = load_saved_deployment_state()?;
     if let Some(state) = &state {
         validate_cleanup_state(config, &executor, state)?;
+    }
+    let registration = deployment_control::load_registration()?;
+    if let Some(registration) = &registration {
+        let _ = deployment_control::queue_lifecycle(
+            registration,
+            "cleanup_started",
+            "cleanup_started",
+            "clean started",
+        )
+        .await?;
     }
     clean_downstream(config, &executor)?;
     check_cancellation(cancellation)?;
@@ -339,6 +119,15 @@ pub fn clean_deployment(
             "downstream resources removed",
         );
         persist_deployment_state(state)?;
+    }
+    if let Some(registration) = &registration {
+        let _ = deployment_control::queue_lifecycle(
+            registration,
+            "removed",
+            "removed",
+            "clean completed",
+        )
+        .await?;
     }
     Ok(CleanDeploymentOutcome {
         state_preserved: state.is_some(),
@@ -370,6 +159,16 @@ pub async fn rollback_deployment_with_ssh_password(
         validate_cleanup_state(config, &executor, state)?;
     }
 
+    let registration = deployment_control::load_registration()?;
+    if let Some(registration) = &registration {
+        let _ = deployment_control::queue_lifecycle(
+            registration,
+            "cleanup_started",
+            "cleanup_started",
+            "rollback started",
+        )
+        .await?;
+    }
     let mut source_tokens_revoked = 0;
     let mut source_status_key_revoked = false;
     if revoke_source {
@@ -427,6 +226,16 @@ pub async fn rollback_deployment_with_ssh_password(
     check_cancellation(cancellation)?;
     clean_downstream(config, &executor)?;
     storage::clear_deployment().map_err(app_error)?;
+    if let Some(registration) = &registration {
+        let _ = deployment_control::queue_lifecycle(
+            registration,
+            "removed",
+            "removed",
+            "rollback completed",
+        )
+        .await?;
+    }
+    deployment_control::remove_registration()?;
     Ok(RollbackDeploymentOutcome {
         source_tokens_revoked,
         source_status_key_revoked,
@@ -470,7 +279,20 @@ fn clean_downstream(config: &DeploymentConfig, executor: &TargetExecutor) -> App
         .remove_compose_project(&config.container_name)
         .map_err(app_error)?;
     executor
-        .run_in_directory("rm -f secrets.env docker-compose.yml kuma-helper.js\nrm -rf data")
+        .run_script(&format!(
+            r#"directory={directory}
+if command -v systemctl >/dev/null 2>&1 && [ "$(id -u)" -eq 0 ]; then
+  systemctl disable --now meowai-deploy-updater.timer 2>/dev/null || true
+  rm -f /etc/systemd/system/meowai-deploy-updater.service /etc/systemd/system/meowai-deploy-updater.timer
+  systemctl daemon-reload || true
+fi
+if [ -d "$directory" ]; then
+  cd "$directory"
+  rm -f secrets.env downstream-credentials.env updater-credentials.env docker-compose.yml docker-compose.updater.yml kuma-helper.js meowai-deploy-updater.sh meowai-deploy-updater.service meowai-deploy-updater.timer
+  rm -rf data run backups
+fi"#,
+            directory = shell_escape::escape(config.directory.to_string_lossy())
+        ))
         .map_err(app_error)?;
     Ok(())
 }

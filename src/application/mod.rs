@@ -1,3 +1,4 @@
+pub mod deployment_control;
 pub mod error;
 pub mod input;
 pub mod manage;

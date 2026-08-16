@@ -234,6 +234,14 @@ describe("deployment workbench", () => {
       if (path.endsWith("/api/operations")) {
         return json({ operation_id: "web-saved-config" });
       }
+      if (path.endsWith("/api/sync/plan")) {
+        return json({
+          fingerprint: "plan-saved",
+          modules: [{ module: "site", label: "首页与市场", actionable: true, conflict: false, diffs: [{ path: "home_setting.pricing_title", classification: "source_changed", risk: "low", sensitive: false }] }],
+          group_margins: [],
+          seedance_margins: [],
+        });
+      }
     }));
 
     render(<App />);
@@ -248,15 +256,10 @@ describe("deployment workbench", () => {
 
     expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "确认信息" })).toBeInTheDocument();
-    expect(screen.getByText("deploy@existing.example.test")).toBeInTheDocument();
-    expect(screen.getByText("/opt/meowai-deploy/saved-newapi")).toBeInTheDocument();
-    expect(screen.getByPlaceholderText("源站登录密码")).toHaveValue("");
-    expect(screen.getByPlaceholderText("服务器登录密码")).toHaveValue("");
-
-    fireEvent.change(screen.getByPlaceholderText("源站登录密码"), { target: { value: "source-password" } });
-    fireEvent.change(screen.getByPlaceholderText("服务器登录密码"), { target: { value: "ssh-password" } });
+    expect(await screen.findByText("首页与市场")).toBeInTheDocument();
+    expect(screen.getByText("1 项差异")).toBeInTheDocument();
     const startDeployment = screen
-      .getAllByRole("button", { name: "开始部署" })
+      .getAllByRole("button", { name: "应用选中的同步" })
       .find((button) => !button.hasAttribute("disabled"));
     expect(startDeployment).toBeDefined();
     fireEvent.click(startDeployment!);

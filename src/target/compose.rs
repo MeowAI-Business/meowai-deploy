@@ -127,8 +127,12 @@ pub struct DeploymentRuntime {
 impl DeploymentRuntime {
     /// Load an existing deployment for a read-only sync plan. This deliberately does not
     /// create directories, start containers, or write credentials/state.
-    pub fn load_existing(config: &DeploymentConfig) -> Result<Self> {
-        let executor = TargetExecutor::new(config.target.clone(), config.directory.clone());
+    pub fn load_existing_with_ssh_password(
+        config: &DeploymentConfig,
+        ssh_password: Option<SecretString>,
+    ) -> Result<Self> {
+        let executor = TargetExecutor::new(config.target.clone(), config.directory.clone())
+            .with_ssh_password(ssh_password);
         let state = load_state()?
             .ok_or_else(|| AppError::State("尚未找到部署状态，请先完成 onboard".to_owned()))?;
         let target_fingerprint = executor.fingerprint()?;
