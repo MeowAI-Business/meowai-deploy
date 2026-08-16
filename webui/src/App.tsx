@@ -88,6 +88,21 @@ type SavedDeployment = {
 
 type DialogKind = "existing-deployment" | "replacement-required" | "rotate-status-key" | "close-running";
 
+type SyncModulePlan = {
+  module: string;
+  label: string;
+  actionable: boolean;
+  conflict: boolean;
+  diffs: Array<{ path: string; classification: string; risk: string; sensitive: boolean }>;
+};
+
+type SyncPlan = {
+  fingerprint: string;
+  modules: SyncModulePlan[];
+  group_margins: Array<{ name: string; purchase: number | null; sales: number; margin_percent: number | null; risk: string }>;
+  seedance_margins: Array<{ name: string; purchase: number | null; sales: number; margin_percent: number | null; risk: string }>;
+};
+
 type PreflightStep = "target" | "source" | "site";
 type ImageCheckState = "idle" | "loading" | "valid" | "error";
 
@@ -230,6 +245,13 @@ export default function App() {
   const [dialog, setDialog] = useState<DialogKind | null>(null);
   const [replaceExisting, setReplaceExisting] = useState(false);
   const [directoryCustomized, setDirectoryCustomized] = useState(false);
+  const [usingSavedConfig, setUsingSavedConfig] = useState(false);
+  const [syncPlan, setSyncPlan] = useState<SyncPlan | null>(null);
+  const [syncPlanLoading, setSyncPlanLoading] = useState(false);
+  const [selectedSyncModules, setSelectedSyncModules] = useState<string[]>([]);
+  const [forceSyncConflicts, setForceSyncConflicts] = useState(false);
+  const [syncSourceAuthRequired, setSyncSourceAuthRequired] = useState(false);
+  const [syncSshAuthRequired, setSyncSshAuthRequired] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -606,6 +628,37 @@ export default function App() {
 
   async function startOperation(forceReplace = replaceExisting) {
     if (!session) return;
+    if (usingSavedConfig) {
+      if (!syncPlan || selectedSyncModules.length === 0) return;
+      setError(null);
+      setLastEvent("正在校验同步计划");
+      setOperationEvents([]);
+      setOperationFailure(null);
+      setOperationProgress(0);
+      setCurrentStage(null);
+      try {
+        const result = await request<{ operation_id: string }>("/api/operations", {
+          method: "POST",
+          body: JSON.stringify({
+            kind: "sync",
+            modules: selectedSyncModules,
+            plan_fingerprint: syncPlan.fingerprint,
+            force: forceSyncConflicts,
+            source_password: draft.sourcePassword || null,
+            ssh_password: draft.target === "ssh" ? draft.sshPassword || null : null,
+          }),
+        }, session);
+        setOperationId(result.operation_id);
+        setOperationStatus("running");
+        setActiveStep("operation");
+        setLastEvent("同步任务已开始");
+      } catch (cause) {
+        const message = cause instanceof Error ? cause.message : "无法启动同步";
+        setError(message);
+        if ((cause as ApiError).code === "SYNC_PLAN_STALE" || message.includes("过期")) void loadSyncPlan();
+      }
+      return;
+    }
     const validation = validateStep("review", draft);
     if (validation) {
       setError(validation);
@@ -741,13 +794,54 @@ export default function App() {
     return true;
   }
 
+  async function loadSyncPlan(nextDraft = draft) {
+    if (!session) return;
+    setSyncPlanLoading(true);
+    setError(null);
+    try {
+      const plan = await request<SyncPlan>("/api/sync/plan", {
+        method: "POST",
+        body: JSON.stringify({
+          source_password: nextDraft.sourcePassword || null,
+          ssh_password: nextDraft.target === "ssh" ? nextDraft.sshPassword || null : null,
+        }),
+      }, session);
+      setSyncPlan(plan);
+      setSyncSourceAuthRequired(false);
+      setSyncSshAuthRequired(false);
+      setSelectedSyncModules(plan.modules.filter((module) => module.actionable).map((module) => module.module));
+    } catch (cause) {
+      const apiError = cause as ApiError;
+      setSyncSourceAuthRequired(apiError.code === "SOURCE_AUTHENTICATION_FAILED" || apiError.code === "SOURCE_SESSION_REQUIRED");
+      setSyncSshAuthRequired(apiError.code === "SSH_AUTHENTICATION_FAILED" || apiError.code === "SSH_AUTH_UNAVAILABLE");
+      setError(cause instanceof Error ? cause.message : "无法读取同步计划");
+    } finally {
+      setSyncPlanLoading(false);
+    }
+  }
+
   function useSavedDeployment() {
-    if (!fillSavedDeployment()) return;
+    const saved = bootstrap?.savedDeployment;
+    if (!saved) return;
+    const nextDraft: Draft = {
+      ...draft, target: saved.target, sshDestination: saved.sshDestination,
+      sshPassword: credentialMemory.current.sshPassword || draft.sshPassword,
+      sourceUrl: saved.sourceUrl, sourceUsername: saved.sourceUsername,
+      sourcePassword: credentialMemory.current.sourcePassword || draft.sourcePassword,
+      websiteName: saved.websiteName, containerName: saved.containerName, directory: saved.directory,
+      newapiPort: String(saved.newapiPort), kumaPort: String(saved.kumaPort),
+      newapiAdminUsername: saved.newapiAdminUsername, newapiAdminPassword: "",
+      kumaAdminUsername: saved.kumaAdminUsername, kumaAdminPassword: "", image: saved.image, imageRef: saved.imageRef,
+    };
+    setDraft(nextDraft);
+    setUsingSavedConfig(true);
+    setForceSyncConflicts(false);
     setValidatedSteps({ target: true, source: true, site: true });
     setImageCheckState("valid");
     setResolvedImage(bootstrap?.savedDeployment?.image ?? null);
     setActiveStep("review");
     setDialog(null);
+    void loadSyncPlan(nextDraft);
   }
 
   function restoreCurrentOperation() {
@@ -770,6 +864,11 @@ export default function App() {
   }
 
   function startNewDeployment() {
+    setUsingSavedConfig(false);
+    setSyncPlan(null);
+    setForceSyncConflicts(false);
+    setSyncSourceAuthRequired(false);
+    setSyncSshAuthRequired(false);
     setReplaceExisting(true);
     setDirectoryCustomized(false);
     setDialog(null);
@@ -843,7 +942,9 @@ export default function App() {
                 onRetryImage={() => setImageReloadKey((current) => current + 1)}
               />
             )}
-            {activeStep === "review" && <ReviewStep draft={draft} update={update} />}
+            {activeStep === "review" && (usingSavedConfig
+              ? <SyncPlanStep plan={syncPlan} loading={syncPlanLoading} draft={draft} update={update} sourceAuthRequired={syncSourceAuthRequired} sshAuthRequired={syncSshAuthRequired} selected={selectedSyncModules} onSelectedChange={setSelectedSyncModules} forceConflicts={forceSyncConflicts} onForceConflictsChange={setForceSyncConflicts} onReload={() => void loadSyncPlan()} />
+              : <ReviewStep draft={draft} update={update} />)}
             {activeStep === "operation" && (
               <OperationStep
                 status={operationStatus}
@@ -898,8 +999,8 @@ export default function App() {
                 <ArrowLeft size={16} />上一步
               </button>
               {activeStep === "review" ? (
-              <button className="primary-action" onClick={() => void startOperation()} disabled={!canAdvance || operationStatus === "running"}>
-                <TerminalSquare size={17} />开始部署
+              <button className="primary-action" onClick={() => void startOperation()} disabled={usingSavedConfig ? syncPlanLoading || !syncPlan || selectedSyncModules.length === 0 : !canAdvance || operationStatus === "running"}>
+                <TerminalSquare size={17} />{usingSavedConfig ? "应用选中的同步" : "开始部署"}
               </button>
             ) : (
               <button className={`primary-action ${checkingStep || (activeStep === "site" && imageCheckState === "loading") ? "is-loading" : ""}`} onClick={() => void goNext()} disabled={!canAdvance || checkingStep !== null || (activeStep === "site" && imageCheckState !== "valid")}>
@@ -1187,6 +1288,63 @@ function ReviewStep({ draft, update }: {
         )}
       </div>
     </>
+  );
+}
+
+function SyncPlanStep({
+  plan,
+  loading,
+  draft,
+  update,
+  sourceAuthRequired,
+  sshAuthRequired,
+  selected,
+  onSelectedChange,
+  forceConflicts,
+  onForceConflictsChange,
+  onReload,
+}: {
+  plan: SyncPlan | null;
+  loading: boolean;
+  draft: Draft;
+  update: <K extends keyof Draft>(key: K, value: Draft[K]) => void;
+  sourceAuthRequired: boolean;
+  sshAuthRequired: boolean;
+  selected: string[];
+  onSelectedChange: (modules: string[]) => void;
+  forceConflicts: boolean;
+  onForceConflictsChange: (value: boolean) => void;
+  onReload: () => void;
+}) {
+  if (loading) {
+    return <div className="sync-plan-loading"><LoaderCircle className="button-loader" size={18} /><span>正在读取源站与下游差异…</span></div>;
+  }
+  const toggle = (module: string) => {
+    onSelectedChange(selected.includes(module) ? selected.filter((item) => item !== module) : [...selected, module]);
+  };
+  return (
+    <div className="sync-plan">
+      <div className="sync-plan-heading"><div><strong>同步计划</strong><p>{plan ? "只应用明确选择的模块；冲突字段需要显式覆盖。" : "需要凭证才能读取当前部署的差异。"}</p></div><button type="button" className="secondary-action" onClick={onReload}><RefreshCcw size={15} />重新读取</button></div>
+      {(sourceAuthRequired || sshAuthRequired) && (
+        <div className={`review-credentials ${sourceAuthRequired && sshAuthRequired ? "has-ssh" : ""}`}>
+          {sourceAuthRequired && <Field label="源站密码" hint="同步计划需要重新验证源站账号。"><input type="password" value={draft.sourcePassword} onChange={(event) => update("sourcePassword", event.target.value)} placeholder="源站登录密码" autoComplete="current-password" /></Field>}
+          {sshAuthRequired && <Field label="SSH 密码" hint="同步计划需要连接部署目标。"><input type="password" value={draft.sshPassword} onChange={(event) => update("sshPassword", event.target.value)} placeholder="服务器登录密码" autoComplete="current-password" /></Field>}
+        </div>
+      )}
+      {plan && <div className="sync-module-list">
+        {plan.modules.map((module) => (
+          <label className={`sync-module ${module.actionable ? "is-actionable" : "is-quiet"}`} key={module.module}>
+            <input type="checkbox" checked={selected.includes(module.module)} disabled={!module.actionable} onChange={() => toggle(module.module)} />
+            <span className="sync-module-copy"><strong>{module.label}</strong><small>{module.actionable ? `${module.diffs.length} 项差异${module.conflict ? " · 存在冲突" : ""}` : "已一致或由下游保留"}</small></span>
+            {module.conflict && <span className="sync-risk">冲突</span>}
+          </label>
+        ))}
+      </div>}
+      {plan && plan.modules.some((module) => module.conflict && selected.includes(module.module)) && (
+        <label className="sync-force"><input type="checkbox" checked={forceConflicts} onChange={(event) => onForceConflictsChange(event.target.checked)} /><span><strong>覆盖冲突字段</strong><small>仅对已选择模块生效；未勾选时保留下游手动修改。</small></span></label>
+      )}
+      {plan && <div className="sync-margin-note"><span>毛利预览仅供确认，采购价与终端售价保持分离。</span><strong>{plan.group_margins.length + plan.seedance_margins.length} 项价格策略</strong></div>}
+    </div>
   );
 }
 

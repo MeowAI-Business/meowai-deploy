@@ -106,6 +106,10 @@ pub struct SyncArgs {
     /// Allow confirmed modules to overwrite conflicting downstream fields.
     #[arg(long)]
     pub force: bool,
+
+    /// Fingerprint returned by the read-only sync plan.
+    #[arg(long, hide = true)]
+    pub plan_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Args)]

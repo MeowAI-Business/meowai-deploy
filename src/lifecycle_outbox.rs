@@ -80,12 +80,6 @@ pub fn enqueue(registration: &DeploymentRegistration, report: LifecycleReport) -
     Ok(event_id)
 }
 
-pub fn remove(event_id: &str) -> Result<()> {
-    let mut pending = load()?;
-    pending.retain(|report| report.report.event_id != event_id);
-    save(&pending)
-}
-
 pub async fn flush() -> Result<usize> {
     let mut pending = load()?;
     if pending.is_empty() {
