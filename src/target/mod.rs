@@ -3,6 +3,7 @@ pub mod kuma;
 pub mod newapi;
 pub mod remote_path;
 pub mod ssh;
+pub mod updater;
 
 use std::{
     borrow::Cow,
@@ -277,7 +278,7 @@ exit 0"#,
             .collect::<Vec<_>>()
             .join(" ");
         self.run_script(&format!(
-            "cd {directory}\ndocker compose --env-file secrets.env -p {project} {arguments}",
+            "cd {directory}\nfiles='-f docker-compose.yml'\nif [ -f docker-compose.updater.yml ]; then files=\"$files -f docker-compose.updater.yml\"; fi\n# shellcheck disable=SC2086\ndocker compose --env-file secrets.env -p {project} $files {arguments}",
             directory = self.quoted_directory()?,
             project = quote(project),
         ))
@@ -285,12 +286,18 @@ exit 0"#,
 
     pub fn remove_compose_project(&self, project: &str) -> Result<Output> {
         self.run_script(&format!(
-            r#"cd {directory}
-project={project}
-if [ -f secrets.env ]; then
-  docker compose --env-file secrets.env -p "$project" down --remove-orphans
-elif docker compose -p "$project" down --remove-orphans; then
-  :
+            r#"project={project}
+if [ -d {directory} ]; then
+  cd {directory}
+  files='-f docker-compose.yml'
+  if [ -f docker-compose.updater.yml ]; then files="$files -f docker-compose.updater.yml"; fi
+  if [ -f secrets.env ]; then
+    # shellcheck disable=SC2086
+    docker compose --env-file secrets.env -p "$project" $files down --remove-orphans
+  else
+    # shellcheck disable=SC2086
+    docker compose -p "$project" $files down --remove-orphans || true
+  fi
 else
   containers=$(docker ps -aq --filter "label=com.docker.compose.project=$project")
   if [ -n "$containers" ]; then
