@@ -198,6 +198,8 @@ button:focus-visible, input:focus-visible { outline: 3px solid color-mix(in srgb
 .primary-action:hover:not(:disabled) { border-color: var(--primary-hover); background: var(--primary-hover); }
 .secondary-action { border: 1px solid var(--border-strong); background: transparent; color: var(--text); }
 .secondary-action:hover:not(:disabled) { background: var(--surface-subtle); }
+.preset-import { cursor: pointer; }
+.preset-import input { display: none; }
 .danger-action { border: 1px solid var(--danger); background: var(--danger); color: #ffffff; }
 .danger-action:hover { border-color: color-mix(in srgb, var(--danger) 82%, #000000); background: color-mix(in srgb, var(--danger) 82%, #000000); }
 .primary-action:disabled, .secondary-action:disabled { opacity: 0.42; }

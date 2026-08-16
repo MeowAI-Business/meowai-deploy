@@ -97,6 +97,10 @@ impl DeploymentConfig {
         toml::from_str(&content).map_err(AppError::from)
     }
 
+    pub fn from_toml(content: &str) -> Result<Self> {
+        toml::from_str(content).map_err(AppError::from)
+    }
+
     pub fn write_template(path: &Path) -> Result<()> {
         let template = r#"# meowai-deploy onboard configuration
 source_url = "https://enterprise.meowai.net"

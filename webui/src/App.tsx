@@ -17,6 +17,7 @@ import {
   TerminalSquare,
   Wifi,
   X,
+  Upload,
 } from "lucide-react";
 
 type StepKey = "target" | "source" | "site" | "review" | "operation";
@@ -40,6 +41,22 @@ type Draft = {
   kumaAdminPassword: string;
   image: string;
   imageRef: string;
+};
+
+type ImportedDraft = {
+  target: DeploymentTarget;
+  ssh_destination: string;
+  source_url: string;
+  source_username: string;
+  website_name: string;
+  container_name: string;
+  directory: string;
+  newapi_port: number;
+  kuma_port: number;
+  newapi_admin_username: string;
+  kuma_admin_username: string;
+  image: string;
+  image_ref: string;
 };
 
 type Session = { csrfToken: string };
@@ -636,6 +653,24 @@ export default function App() {
     if (previous) setActiveStep(previous.key);
   }
 
+  async function importPreset(file: File) {
+    if (!session) return;
+    setError(null);
+    try {
+      const imported = await request<ImportedDraft>("/api/config/import", {
+        method: "POST",
+        body: JSON.stringify({ toml: await file.text() }),
+      }, session);
+      setDraft((current) => ({ ...current, target: imported.target, sshDestination: imported.ssh_destination, sourceUrl: imported.source_url, sourceUsername: imported.source_username, websiteName: imported.website_name, containerName: imported.container_name, directory: imported.directory, newapiPort: String(imported.newapi_port), kumaPort: String(imported.kuma_port), newapiAdminUsername: imported.newapi_admin_username, kumaAdminUsername: imported.kuma_admin_username, image: imported.image, imageRef: imported.image_ref }));
+      setValidatedSteps({ target: true, source: true, site: true });
+      setImageCheckState(imported.image_ref ? "valid" : "idle");
+      setActiveStep("review");
+      setLastEvent(`已导入预设：${file.name}`);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "无法导入 TOML 预设");
+    }
+  }
+
   async function startOperation(forceReplace = replaceExisting) {
     if (!session) return;
     if (usingSavedConfig) {
@@ -907,6 +942,7 @@ export default function App() {
             <h1>部署 NewAPI</h1>
             <p>填写部署信息，确认后开始安装。</p>
           </div>
+          <label className="secondary-action preset-import"><Upload size={16} />导入 TOML 预设<input type="file" accept=".toml,text/plain" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importPreset(file); event.currentTarget.value = ""; }} /></label>
           <button className="icon-button" title="关闭部署工具" aria-label="关闭部署工具" onClick={() => void closeWebUi()}>
             <LogOut size={18} />
           </button>

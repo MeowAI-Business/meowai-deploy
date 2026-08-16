@@ -401,6 +401,11 @@ struct ImagePreflightResponse {
     updated_at: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ImportConfigRequest {
+    toml: String,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct WebDraft {
@@ -417,6 +422,31 @@ struct WebDraft {
     kuma_admin_username: String,
     image: String,
     image_ref: String,
+}
+
+impl From<&DeploymentConfig> for WebDraft {
+    fn from(config: &DeploymentConfig) -> Self {
+        let ssh_destination = match &config.target {
+            Target::Local => String::new(),
+            Target::Ssh { destination } => destination.clone(),
+        };
+        Self {
+            source_url: config.source_url.clone(),
+            source_account_mode: config.source_account_mode,
+            source_username: config.source_username.clone(),
+            website_name: config.website_name.clone(),
+            container_name: config.container_name.clone(),
+            directory: config.directory.to_string_lossy().into_owned(),
+            newapi_port: config.newapi_port,
+            kuma_port: config.kuma_port,
+            ssh_destination,
+            newapi_admin_username: config.newapi_admin_username.clone(),
+            kuma_admin_username: config.kuma_admin_username.clone(),
+            image: config.image.clone(),
+            image_ref: config.image_ref.clone(),
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -801,6 +831,7 @@ pub fn router(state: WebState) -> Router {
             post(exchange_session).get(read_session).delete(logout),
         )
         .route("/api/bootstrap", get(read_bootstrap))
+        .route("/api/config/import", post(import_config))
         .route("/api/preflight/target", post(preflight_target))
         .route("/api/preflight/source", post(preflight_source))
         .route("/api/preflight/image", post(preflight_image))
@@ -1494,6 +1525,21 @@ async fn create_operation(
     }))
 }
 
+async fn import_config(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Json(payload): Json<ImportConfigRequest>,
+) -> ApiResult<Json<WebDraft>> {
+    require_mutation(&state, &headers)?;
+    let config = DeploymentConfig::from_toml(&payload.toml)
+        .map_err(|error| ApiError::bad_request("INVALID_CONFIG", error.to_string()))?;
+    config
+        .deployment_input()
+        .validate()
+        .map_err(|error| ApiError::bad_request(error.code.as_str(), error.message))?;
+    Ok(Json(WebDraft::from(&config)))
+}
+
 async fn read_operation(
     State(state): State<WebState>,
     headers: HeaderMap,
@@ -1668,14 +1714,11 @@ fn config_from_request(payload: &CreateOperationRequest) -> ApiResult<Deployment
             destination: required(&payload.ssh_destination, "ssh_destination")?,
         },
     };
-    let config = DeploymentConfig {
+    let mut config = DeploymentConfig {
         source_url: required(&payload.source_url, "source_url")?,
         source_account_mode: payload.source_account_mode,
         source_username: required(&payload.source_username, "source_username")?,
-        source_password: Some(SecretString::from(required(
-            &payload.source_password,
-            "source_password",
-        )?)),
+        source_password: optional_secret(payload.source_password.clone()),
         website_name: required(&payload.website_name, "website_name")?,
         container_name: required(&payload.container_name, "container_name")?,
         directory: required(&payload.directory, "directory")?.into(),
@@ -1691,9 +1734,16 @@ fn config_from_request(payload: &CreateOperationRequest) -> ApiResult<Deployment
         kuma_admin_username: required(&payload.kuma_admin_username, "kuma_admin_username")?,
         kuma_admin_password: payload.kuma_admin_password.clone(),
         image: required(&payload.image, "image")?,
-        image_ref: required(&payload.image_ref, "image_ref")?,
+        image_ref: payload.image_ref.clone().unwrap_or_default(),
         ..DeploymentConfig::default()
     };
+    config.resolve_passwords();
+    if config.source_password.is_none() {
+        return Err(ApiError::bad_request(
+            "WEB_FIELD_REQUIRED",
+            "缺少字段：source_password（或设置 MEOWAI_DEPLOY_SOURCE_PASSWORD）",
+        ));
+    }
     config
         .deployment_input()
         .validate()
