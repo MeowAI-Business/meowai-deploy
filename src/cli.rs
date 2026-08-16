@@ -51,6 +51,10 @@ pub struct BootstrapArgs {
 
 #[derive(Debug, Args)]
 pub struct WebArgs {
+    /// Load non-secret deployment values from a TOML preset.
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+
     /// Address to listen on.
     #[arg(long, default_value = "0.0.0.0")]
     pub host: IpAddr,
@@ -69,6 +73,10 @@ pub struct DeploymentArgs {}
 
 #[derive(Debug, Args)]
 pub struct CleanArgs {
+    /// Load the deployment target from a TOML configuration file.
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+
     /// Confirm deletion of downstream containers, generated files, and data.
     #[arg(long)]
     pub yes: bool,
@@ -114,6 +122,10 @@ pub struct SyncArgs {
 
 #[derive(Debug, Args)]
 pub struct RollbackArgs {
+    /// Load the deployment target from a TOML configuration file.
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+
     /// Confirm deletion of the downstream Compose project and its bind-mounted data.
     #[arg(long)]
     pub yes: bool,

@@ -195,9 +195,10 @@ struct CreateOperationRequest {
     image_ref: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum WebDeploymentTarget {
+    #[default]
     Local,
     Ssh,
 }
@@ -409,6 +410,7 @@ struct ImportConfigRequest {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct WebDraft {
+    target: WebDeploymentTarget,
     source_url: String,
     source_account_mode: SourceAccountMode,
     source_username: String,
@@ -431,6 +433,10 @@ impl From<&DeploymentConfig> for WebDraft {
             Target::Ssh { destination } => destination.clone(),
         };
         Self {
+            target: match &config.target {
+                Target::Local => WebDeploymentTarget::Local,
+                Target::Ssh { .. } => WebDeploymentTarget::Ssh,
+            },
             source_url: config.source_url.clone(),
             source_account_mode: config.source_account_mode,
             source_username: config.source_username.clone(),
@@ -707,6 +713,18 @@ pub async fn run(args: &WebArgs) -> AppResult<()> {
         return reopen_existing_instance(args).await;
     };
     let lock = Arc::new(lock);
+    if let Some(path) = &args.config {
+        let config = DeploymentConfig::from_file(path)?;
+        config
+            .deployment_input()
+            .validate()
+            .map_err(|error| AppError::InvalidConfig(error.message))?;
+        storage::write(
+            storage::WEB_DRAFT_FILE,
+            &serde_json::to_vec(&WebDraft::from(&config))
+                .map_err(|error| AppError::State(format!("serialize WebUI preset: {error}")))?,
+        )?;
+    }
     let bootstrap_token = random_token(48);
     let instance_token = random_token(48);
     let listener = TcpListener::bind(SocketAddr::new(args.host, args.port))
@@ -1173,7 +1191,12 @@ async fn preflight_source(
         payload.source_url,
         SourceAccountMode::Login,
         payload.source_username,
-        SecretString::from(payload.source_password),
+        SecretString::from(if payload.source_password.trim().is_empty() {
+            std::env::var("MEOWAI_DEPLOY_SOURCE_PASSWORD")
+                .map_err(|_| ApiError::bad_request("WEB_FIELD_REQUIRED", "缺少源站密码"))?
+        } else {
+            payload.source_password
+        }),
     )
     .map_err(ApiError::from_application)?;
     let authenticated = login_source_account(request)

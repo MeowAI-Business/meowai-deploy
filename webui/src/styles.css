@@ -203,6 +203,7 @@ button:focus-visible, input:focus-visible { outline: 3px solid color-mix(in srgb
 .secondary-action { border: 1px solid var(--border-strong); background: transparent; color: var(--text); }
 .secondary-action:hover:not(:disabled) { background: var(--surface-subtle); }
 .preset-import {
+  margin-left: auto;
   min-height: 30px;
   padding: 0 8px;
   border-color: transparent;

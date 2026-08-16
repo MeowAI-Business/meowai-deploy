@@ -272,6 +272,8 @@ export default function App() {
   const [replaceExisting, setReplaceExisting] = useState(false);
   const [directoryCustomized, setDirectoryCustomized] = useState(false);
   const [usingSavedConfig, setUsingSavedConfig] = useState(false);
+  const [presetLoaded, setPresetLoaded] = useState(false);
+  const autoPreflightStep = useRef<StepKey | null>(null);
   const [syncPlan, setSyncPlan] = useState<SyncPlan | null>(null);
   const [syncPlanLoading, setSyncPlanLoading] = useState(false);
   const [selectedSyncModules, setSelectedSyncModules] = useState<string[]>([]);
@@ -324,6 +326,7 @@ export default function App() {
             kuma_port: number;
             image: string;
           };
+          draft?: ImportedDraft;
         }>("/api/bootstrap", {}, sessionValue);
         if (!cancelled) {
           const savedDeployment = nextBootstrap.saved_deployment ? {
@@ -376,6 +379,29 @@ export default function App() {
             kumaPort: String(nextBootstrap.defaults.kuma_port),
             image: nextBootstrap.defaults.image,
           }));
+          if (nextBootstrap.draft) {
+            const imported = nextBootstrap.draft;
+            setDraft((current) => ({
+              ...current,
+              target: imported.target,
+              sshDestination: imported.ssh_destination,
+              sourceUrl: imported.source_url,
+              sourceUsername: imported.source_username,
+              websiteName: imported.website_name,
+              containerName: imported.container_name,
+              directory: imported.directory,
+              newapiPort: String(imported.newapi_port),
+              kumaPort: String(imported.kuma_port),
+              newapiAdminUsername: imported.newapi_admin_username,
+              kumaAdminUsername: imported.kuma_admin_username,
+              image: imported.image,
+              imageRef: imported.image_ref,
+            }));
+            setValidatedSteps({ target: false, source: false, site: false });
+            setActiveStep("target");
+            autoPreflightStep.current = null;
+            setPresetLoaded(true);
+          }
           if (nextBootstrap.has_saved_deployment && savedDeployment) {
             setDialog("existing-deployment");
           }
@@ -526,7 +552,7 @@ export default function App() {
 
   const activeIndex = steps.findIndex((step) => step.key === activeStep);
   const active = steps[activeIndex] ?? steps[0];
-  const canAdvance = useMemo(() => validateStep(activeStep, draft) === null, [activeStep, draft]);
+  const canAdvance = useMemo(() => validateStep(activeStep, draft, presetLoaded) === null, [activeStep, draft, presetLoaded]);
 
   function update<K extends keyof Draft>(key: K, value: Draft[K]) {
     const preflight = preflightForField(key);
@@ -563,7 +589,7 @@ export default function App() {
 
   async function goNext() {
     if (!session || checkingStep) return;
-    const validation = validateStep(activeStep, draft);
+    const validation = validateStep(activeStep, draft, presetLoaded);
     if (validation) {
       setError(validation);
       return;
@@ -656,6 +682,15 @@ export default function App() {
     if (next) setActiveStep(next.key);
   }
 
+  useEffect(() => {
+    if (!presetLoaded || checkingStep || !["target", "source", "site"].includes(activeStep)) return;
+    if (activeStep === "site" && imageCheckState !== "valid") return;
+    if (autoPreflightStep.current === activeStep) return;
+    autoPreflightStep.current = activeStep;
+    const timer = window.setTimeout(() => void goNext(), 0);
+    return () => window.clearTimeout(timer);
+  }, [activeStep, presetLoaded, checkingStep, imageCheckState]);
+
   function goBack() {
     const previous = steps[activeIndex - 1];
     if (previous) setActiveStep(previous.key);
@@ -670,9 +705,11 @@ export default function App() {
         body: JSON.stringify({ toml: await file.text() }),
       }, session);
       setDraft((current) => ({ ...current, target: imported.target, sshDestination: imported.ssh_destination, sourceUrl: imported.source_url, sourceUsername: imported.source_username, websiteName: imported.website_name, containerName: imported.container_name, directory: imported.directory, newapiPort: String(imported.newapi_port), kumaPort: String(imported.kuma_port), newapiAdminUsername: imported.newapi_admin_username, kumaAdminUsername: imported.kuma_admin_username, image: imported.image, imageRef: imported.image_ref }));
-      setValidatedSteps({ target: true, source: true, site: true });
+      setValidatedSteps({ target: false, source: false, site: false });
       setImageCheckState(imported.image_ref ? "valid" : "idle");
-      setActiveStep("review");
+      setActiveStep("target");
+      autoPreflightStep.current = null;
+      setPresetLoaded(true);
       setLastEvent(`已导入预设：${file.name}`);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "无法导入 TOML 预设");
@@ -713,10 +750,11 @@ export default function App() {
       }
       return;
     }
-    const validation = validateStep("review", draft);
+    const validation = validateStep("review", draft, presetLoaded);
     if (validation) {
       setError(validation);
-      setActiveStep("review");
+            setActiveStep("review");
+            setPresetLoaded(true);
       return;
     }
     if (!validatedSteps.target || !validatedSteps.source || !validatedSteps.site) {
@@ -896,7 +934,8 @@ export default function App() {
     setValidatedSteps({ target: true, source: true, site: true });
     setImageCheckState("valid");
     setResolvedImage(bootstrap?.savedDeployment?.image ?? null);
-    setActiveStep("review");
+      setActiveStep("review");
+      setPresetLoaded(true);
     setDialog(null);
     void loadSyncPlan(nextDraft);
   }
@@ -1561,13 +1600,13 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
   return <label className="field"><span className="field-label">{label}</span>{children}{hint && <small>{hint}</small>}</label>;
 }
 
-function validateStep(step: StepKey, draft: Draft): string | null {
+function validateStep(step: StepKey, draft: Draft, presetLoaded = false): string | null {
   if (step === "target") {
     if (draft.target === "ssh" && !/^[A-Za-z0-9._-]+@(?:[A-Za-z0-9][A-Za-z0-9._-]*|\[[0-9A-Fa-f:]+\])$/.test(draft.sshDestination)) return "SSH 地址必须使用 user@host 格式。";
   }
   if (step === "source") {
     if (!/^https:\/\//.test(draft.sourceUrl) && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?/.test(draft.sourceUrl)) return "源站地址需要使用 HTTPS。";
-    if (!draft.sourceUsername.trim() || !draft.sourcePassword) return "请填写源站用户名和密码。";
+    if (!draft.sourceUsername.trim() || (!draft.sourcePassword && !presetLoaded)) return "请填写源站用户名和密码。";
   }
   if (step === "site") {
     if (!draft.websiteName.trim() || !/^[A-Za-z0-9_.-]+$/.test(draft.containerName)) return "请填写有效的站点名称和容器项目名。";
@@ -1579,9 +1618,9 @@ function validateStep(step: StepKey, draft: Draft): string | null {
     if (!draft.image.trim()) return "请填写容器镜像。";
   }
   if (step === "review") {
-    const validation = validateStep("target", draft) ?? validateStep("source", draft) ?? validateStep("site", draft);
+    const validation = validateStep("target", draft, presetLoaded) ?? validateStep("source", draft, presetLoaded) ?? validateStep("site", draft, presetLoaded);
     if (validation) return validation;
-    if (!/^sha256:[A-Fa-f0-9]{64}$/.test(draft.imageRef)) return "镜像 digest 尚未解析或无效，请返回站点设置重新检查。";
+    if (!presetLoaded && !/^sha256:[A-Fa-f0-9]{64}$/.test(draft.imageRef)) return "镜像 digest 尚未解析或无效，请返回站点设置重新检查。";
   }
   return null;
 }

@@ -94,6 +94,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 host: "0.0.0.0".parse().expect("valid default WebUI host"),
                 port: 0,
                 no_open: false,
+                config: None,
             })
             .await
         }
@@ -1207,6 +1208,10 @@ async fn run_logout(_args: &DeploymentArgs) -> Result<()> {
 
 async fn run_clean(args: &CleanArgs) -> Result<()> {
     let _operation_lock = storage::acquire_operation_lock()?;
+    if args.config.is_none() && !storage::exists(CONFIG_FILE)? {
+        print_success("没有已保存的部署配置，无需清理");
+        return Ok(());
+    }
     if !args.yes {
         let confirmed =
             confirm("删除下游容器、生成配置和数据，但保留 onboard 配置、凭证和登录会话？")
@@ -1218,7 +1223,7 @@ async fn run_clean(args: &CleanArgs) -> Result<()> {
         }
     }
 
-    let mut config = load_deployment_config()?;
+    let mut config = load_config_path(args.config.as_deref())?;
     config.resolve_passwords();
     clean_deployment(&config, &CancellationToken::default())
         .await
@@ -1250,7 +1255,7 @@ async fn run_rollback(args: &RollbackArgs) -> Result<()> {
         }
     }
 
-    let mut config = load_deployment_config()?;
+    let mut config = load_config_path(args.config.as_deref())?;
     config.resolve_passwords();
     let mut source = if args.revoke_source {
         Some(source_for_operation(&config).await?)
@@ -1318,6 +1323,7 @@ async fn clear_current_deployment_before_onboard() -> Result<()> {
         return run_rollback(&RollbackArgs {
             yes: false,
             revoke_source: false,
+            config: None,
         })
         .await;
     }
@@ -1343,6 +1349,16 @@ async fn clear_current_deployment_before_onboard() -> Result<()> {
 pub(crate) fn load_deployment_config() -> Result<DeploymentConfig> {
     let path = storage::directory()?.join(CONFIG_FILE);
     let mut config = DeploymentConfig::from_file(&path)?;
+    config.normalize();
+    config.validate()?;
+    Ok(config)
+}
+
+fn load_config_path(path: Option<&std::path::Path>) -> Result<DeploymentConfig> {
+    let mut config = match path {
+        Some(path) => DeploymentConfig::from_file(path)?,
+        None => load_deployment_config()?,
+    };
     config.normalize();
     config.validate()?;
     Ok(config)
