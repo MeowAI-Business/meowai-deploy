@@ -1,3 +1,4 @@
+use serde::Serialize;
 use std::collections::BTreeSet;
 
 use clap::CommandFactory;
@@ -7,13 +8,21 @@ use secrecy::ExposeSecret;
 
 use crate::{
     cli::{CleanArgs, Cli, Command, DeploymentArgs, OnboardArgs, RollbackArgs, SyncArgs},
-    config::{DeploymentConfig, authenticate_source, interactive_config, reauthenticate_source},
+    config::{
+        DeploymentConfig, Target, authenticate_source, interactive_config, reauthenticate_source,
+    },
     doctor,
     error::{AppError, Result},
-    source::{SourceClient, SourceError, StatusKeyProvision},
+    lifecycle_outbox,
+    source::{
+        DeploymentMetadata, DeploymentRegistration, LifecycleReport, SourceClient, SourceError,
+        StatusKeyProvision,
+    },
     source_key_store,
     state::{DOWNSTREAM_CLEANUP_PHASE, DeploymentState, unix_timestamp},
-    storage::{self, CONFIG_FILE, CREDENTIALS_FILE, SESSION_FILE, STATE_FILE},
+    storage::{
+        self, CONFIG_FILE, CREDENTIALS_FILE, DOWNSTREAM_CREDENTIALS_FILE, SESSION_FILE, STATE_FILE,
+    },
     target::kuma,
     target::newapi::NewApiClient,
     target::{
@@ -24,6 +33,14 @@ use crate::{
 };
 
 pub async fn run(cli: Cli) -> Result<()> {
+    match lifecycle_outbox::flush().await {
+        Ok(sent) if sent > 0 => print_done(&format!("已补送 {sent} 条待处理生命周期事件")),
+        Err(error) => eprintln!(
+            "{}",
+            style(format!("警告：待处理生命周期事件仍未送达：{error}")).yellow()
+        ),
+        _ => {}
+    }
     if !matches!(cli.command, Some(Command::Update(_))) {
         updater::check_periodically().await;
     }
@@ -123,6 +140,20 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
     persist_deployment_config(&config)?;
     println!();
 
+    print_action("登记下游部署并写入控制面凭证");
+    let registration_key = format!("reg_{}", crate::security::random_secret(32));
+    let registration = source.register_deployment(&registration_key).await?;
+    persist_downstream_registration(&config, &registration)?;
+    source
+        .report_lifecycle(
+            &registration,
+            "provisioning",
+            "provisioning",
+            "onboard started",
+        )
+        .await?;
+    print_done("部署 ID、安装代次和四个控制面变量已安全写入本机及目标目录");
+
     print_action("读取源站分组");
     let catalog = source.groups().await?;
     print_done(&format!("已读取 {} 个可见分组", catalog.groups.len()));
@@ -169,6 +200,10 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
         status_key.metadata.id,
         shared_status_key.as_ref(),
     )?;
+    deployment.state.upstream_deployment_id = registration.deployment_id.clone();
+    deployment.state.installation_generation = registration.installation_generation;
+    deployment.state.control_plane_url = registration.control_plane_url.clone();
+    deployment.persist_state()?;
     source_key_store::save(
         &config.source_url,
         identity.user_id,
@@ -188,6 +223,9 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
             ),
         );
     }
+    print_action("安装目标主机更新服务");
+    crate::target::updater::install(&deployment.executor, &config, deployment.state.newapi_port)?;
+    print_done("已安装固定 digest 更新服务；不开放远程命令");
     deploy_base_stack_with_progress(&mut deployment, &config)?;
     print_action("初始化下游管理员和站点配置");
     let mut downstream = NewApiClient::connect(&deployment.executor, deployment.state.newapi_port)?;
@@ -234,12 +272,11 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
         channel_result.created, channel_result.reused, channel_result.updated
     ));
     deploy_kuma_with_progress(&mut deployment, &config)?;
-
     print_action("克隆公共状态页、分组和监控");
     let manifest = source
         .onboard_status_manifest(&deployment.secrets.public_status_source_key)
         .await?;
-    let deployment_id = config.deployment_id();
+    let deployment_id = registration.deployment_id.clone();
     let kuma_sync = kuma::sync_status_page(kuma::KumaSyncOptions {
         executor: &deployment.executor,
         container_name: &config.container_name,
@@ -281,6 +318,24 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
     );
     deployment.persist_state()?;
     persist_source_session(&source)?;
+    source
+        .update_deployment_metadata(
+            &registration,
+            &DeploymentMetadata {
+                site_name: &config.website_name,
+                container_name: &config.container_name,
+                target_type: if matches!(config.target, Target::Local) {
+                    "local"
+                } else {
+                    "ssh"
+                },
+                verified_primary_endpoint: "",
+            },
+        )
+        .await?;
+    source
+        .report_lifecycle(&registration, "active", "active", "onboard completed")
+        .await?;
     print_success("下游基础服务、管理员、价格、渠道和公共状态初始化完成");
     Ok(())
 }
@@ -289,6 +344,13 @@ async fn run_sync(args: &SyncArgs) -> Result<()> {
     let mut config = load_deployment_config()?;
     config.resolve_passwords();
     let mut deployment = DeploymentRuntime::prepare(&config, 0, "", 0, None)?;
+    let registration = load_downstream_registration()?.ok_or_else(|| {
+        AppError::State(
+            "missing upstream deployment registration; run onboard before sync".to_owned(),
+        )
+    })?;
+    apply_authoritative_registration(&mut deployment.state, &registration)?;
+    deployment.persist_state()?;
     let result = run_sync_inner(args, &config, &mut deployment).await;
     deployment.state.last_sync_at = unix_timestamp();
     deployment.state.last_sync_success = result.is_ok();
@@ -388,7 +450,12 @@ async fn run_sync_inner(
     let manifest = source
         .onboard_status_manifest(&deployment.secrets.public_status_source_key)
         .await?;
-    let deployment_id = config.deployment_id();
+    let deployment_id = deployment.state.upstream_deployment_id.trim();
+    if deployment_id.is_empty() {
+        return Err(AppError::State(
+            "upstream deployment registration has no deployment ID".to_owned(),
+        ));
+    }
     let kuma_sync = kuma::sync_status_page(kuma::KumaSyncOptions {
         executor: &deployment.executor,
         container_name: &config.container_name,
@@ -509,7 +576,32 @@ async fn run_clean(args: &CleanArgs) -> Result<()> {
     config.resolve_passwords();
     let executor = TargetExecutor::new(config.target.clone(), config.directory.clone());
     executor.validate_access()?;
+    let registration = load_downstream_registration()?;
+    let mut cleanup_report_confirmed = true;
+    if let Some(registration) = &registration {
+        cleanup_report_confirmed = queue_lifecycle_report(
+            registration,
+            "cleanup_started",
+            "cleanup_started",
+            "clean started",
+            true,
+            args.yes,
+        )
+        .await?;
+    }
     clean_downstream(&config, &executor)?;
+    let mut removed_report_confirmed = true;
+    if let Some(registration) = &registration {
+        removed_report_confirmed = queue_lifecycle_report(
+            registration,
+            "removed",
+            "removed",
+            "clean completed",
+            false,
+            true,
+        )
+        .await?;
+    }
     if let Some(mut state) = load_saved_deployment_state()? {
         state.mark_phase(
             DOWNSTREAM_CLEANUP_PHASE,
@@ -518,7 +610,15 @@ async fn run_clean(args: &CleanArgs) -> Result<()> {
         );
         persist_deployment_state(&state)?;
     }
-    print_success("下游容器、生成配置和数据已清理；onboard 配置、凭证和登录会话已保留");
+    if cleanup_report_confirmed && removed_report_confirmed {
+        print_success(
+            "下游容器、生成配置和数据已清理；上游已确认 removed，onboard 配置、凭证和登录会话已保留",
+        );
+    } else {
+        print_success(
+            "下游容器、生成配置和数据已清理；未送达的生命周期事件已加密排队，onboard 配置、凭证和登录会话已保留",
+        );
+    }
     Ok(())
 }
 
@@ -548,6 +648,19 @@ async fn run_rollback(args: &RollbackArgs) -> Result<()> {
     config.resolve_passwords();
     let executor = TargetExecutor::new(config.target.clone(), config.directory.clone());
     executor.validate_access()?;
+    let registration = load_downstream_registration()?;
+    let mut cleanup_report_confirmed = true;
+    if let Some(registration) = &registration {
+        cleanup_report_confirmed = queue_lifecycle_report(
+            registration,
+            "cleanup_started",
+            "cleanup_started",
+            "rollback started",
+            true,
+            args.yes,
+        )
+        .await?;
+    }
     let state = load_saved_deployment_state()?;
     if let Some(state) = &state {
         validate_cleanup_state(&config, &executor, state)?;
@@ -586,15 +699,69 @@ async fn run_rollback(args: &RollbackArgs) -> Result<()> {
     }
 
     clean_downstream(&config, &executor)?;
+    let mut removed_report_confirmed = true;
+    if let Some(registration) = &registration {
+        removed_report_confirmed = queue_lifecycle_report(
+            registration,
+            "removed",
+            "removed",
+            "rollback completed",
+            false,
+            true,
+        )
+        .await?;
+    }
     storage::clear_deployment()?;
-    print_success("下游 Compose 项目、配置和数据已清理");
+    storage::remove(DOWNSTREAM_CREDENTIALS_FILE)?;
+    if cleanup_report_confirmed && removed_report_confirmed {
+        print_success("下游 Compose 项目、配置和数据已清理；上游已确认 removed");
+    } else {
+        print_success(
+            "下游 Compose 项目、配置和数据已清理；未送达的生命周期事件已加密排队并保留最小重试材料",
+        );
+    }
     Ok(())
+}
+
+async fn queue_lifecycle_report(
+    registration: &DeploymentRegistration,
+    event_type: &str,
+    state: &str,
+    reason: &str,
+    confirm_before_destructive_action: bool,
+    preconfirmed: bool,
+) -> Result<bool> {
+    let report = LifecycleReport::new(event_type, state, reason);
+    let event_id = lifecycle_outbox::enqueue(registration, report)?;
+    match lifecycle_outbox::flush().await {
+        Ok(_) => Ok(true),
+        Err(error) => {
+            eprintln!(
+                "{}",
+                style(format!(
+                    "警告：上游暂时不可达，无法保证 {event_type} 已即时显示；事件已写入 0600 加密 outbox：{error}"
+                ))
+                .yellow()
+            );
+            if confirm_before_destructive_action && !preconfirmed {
+                let confirmed = confirm("仍继续删除下游资源，并由后续 CLI 自动重试上报？")
+                    .initial_value(false)
+                    .interact()
+                    .map_err(AppError::from_prompt)?;
+                if !confirmed {
+                    lifecycle_outbox::remove(&event_id)?;
+                    return Err(AppError::Cancelled);
+                }
+            }
+            Ok(false)
+        }
+    }
 }
 
 fn clean_downstream(config: &DeploymentConfig, executor: &TargetExecutor) -> Result<()> {
     executor.compose(&config.container_name, &["down", "--remove-orphans"])?;
     executor
-        .run_in_directory("rm -f secrets.env docker-compose.yml kuma-helper.js\nrm -rf data")?;
+		.run_in_directory("if command -v systemctl >/dev/null 2>&1 && [ \"$(id -u)\" -eq 0 ]; then systemctl disable --now meowai-deploy-updater.timer 2>/dev/null || true; rm -f /etc/systemd/system/meowai-deploy-updater.service /etc/systemd/system/meowai-deploy-updater.timer; systemctl daemon-reload || true; fi\nrm -f secrets.env downstream-credentials.env updater-credentials.env docker-compose.yml kuma-helper.js meowai-deploy-updater.sh meowai-deploy-updater.service meowai-deploy-updater.timer\nrm -rf data")?;
     Ok(())
 }
 
@@ -687,6 +854,127 @@ fn persist_deployment_config(config: &DeploymentConfig) -> Result<()> {
     let content = toml::to_string_pretty(config)
         .map_err(|error| AppError::State(format!("serialize deployment.toml: {error}")))?;
     storage::write(CONFIG_FILE, content.as_bytes())
+}
+
+#[derive(Serialize, serde::Deserialize)]
+
+struct PersistedDownstreamCredentials {
+    deployment_id: String,
+    installation_generation: u32,
+    control_plane_url: String,
+    report_credential: String,
+    pull_credential: String,
+}
+
+fn load_downstream_registration() -> Result<Option<DeploymentRegistration>> {
+    let Some(content) = storage::read(DOWNSTREAM_CREDENTIALS_FILE)? else {
+        return Ok(None);
+    };
+    let stored: PersistedDownstreamCredentials = serde_json::from_slice(&content)
+        .map_err(|error| AppError::State(format!("parse downstream credentials: {error}")))?;
+    Ok(Some(DeploymentRegistration {
+        deployment_id: stored.deployment_id,
+        installation_generation: stored.installation_generation,
+        control_plane_url: stored.control_plane_url,
+        report_credential: secrecy::SecretString::from(stored.report_credential),
+        pull_credential: secrecy::SecretString::from(stored.pull_credential),
+        heartbeat_interval_seconds: 60,
+        snapshot_interval_seconds: 300,
+        silent_updates_enabled: true,
+        release_schema_version: "1".to_owned(),
+    }))
+}
+
+fn apply_authoritative_registration(
+    state: &mut DeploymentState,
+    registration: &DeploymentRegistration,
+) -> Result<()> {
+    if !state.upstream_deployment_id.is_empty()
+        && state.upstream_deployment_id != registration.deployment_id
+    {
+        return Err(AppError::State(
+            "stored deployment state does not match the upstream registration".to_owned(),
+        ));
+    }
+    state.upstream_deployment_id = registration.deployment_id.clone();
+    state.installation_generation = registration.installation_generation;
+    state.control_plane_url = registration.control_plane_url.clone();
+    Ok(())
+}
+
+fn persist_downstream_registration(
+    config: &DeploymentConfig,
+    registration: &DeploymentRegistration,
+) -> Result<()> {
+    for (name, value) in [
+        ("MEOWAI_DEPLOYMENT_ID", registration.deployment_id.as_str()),
+        (
+            "MEOWAI_CONTROL_PLANE_URL",
+            registration.control_plane_url.as_str(),
+        ),
+        (
+            "MEOWAI_REPORT_CREDENTIAL",
+            registration.report_credential.expose_secret(),
+        ),
+        (
+            "MEOWAI_PULL_CREDENTIAL",
+            registration.pull_credential.expose_secret(),
+        ),
+        ("MEOWAI_CURRENT_IMAGE_DIGEST", config.image_ref.as_str()),
+        ("MEOWAI_ALLOWED_IMAGE_REPOSITORY", config.image.as_str()),
+        ("MEOWAI_CONTAINER_NAME", config.container_name.as_str()),
+    ] {
+        crate::security::validate_env_value(name, value)?;
+    }
+    let stored = PersistedDownstreamCredentials {
+        deployment_id: registration.deployment_id.clone(),
+        installation_generation: registration.installation_generation,
+        control_plane_url: registration.control_plane_url.clone(),
+        report_credential: registration.report_credential.expose_secret().to_owned(),
+        pull_credential: registration.pull_credential.expose_secret().to_owned(),
+    };
+    let content = serde_json::to_vec_pretty(&stored)
+        .map_err(|error| AppError::State(format!("serialize downstream credentials: {error}")))?;
+    storage::write(DOWNSTREAM_CREDENTIALS_FILE, &content)?;
+    write_target_downstream_credentials(config, registration)
+}
+
+fn write_target_downstream_credentials(
+    config: &DeploymentConfig,
+    registration: &DeploymentRegistration,
+) -> Result<()> {
+    let target = TargetExecutor::new(config.target.clone(), config.directory.clone());
+    target.prepare()?;
+    let target_content = format!(
+        "MEOWAI_DEPLOYMENT_ID={}\nMEOWAI_INSTALLATION_GENERATION={}\nMEOWAI_CONTROL_PLANE_URL={}\nMEOWAI_REPORT_CREDENTIAL={}\nMEOWAI_PULL_CREDENTIAL={}\nMEOWAI_HEARTBEAT_INTERVAL_SECONDS={}\nMEOWAI_SNAPSHOT_INTERVAL_SECONDS={}\nMEOWAI_CURRENT_IMAGE_DIGEST={}\nMEOWAI_ALLOWED_IMAGE_REPOSITORY={}\nMEOWAI_CONTAINER_NAME={}\nMEOWAI_UPDATER_SOCKET_PATH=/run/meowai/updater.sock\n",
+        registration.deployment_id,
+        registration.installation_generation,
+        registration.control_plane_url,
+        registration.report_credential.expose_secret(),
+        registration.pull_credential.expose_secret(),
+        registration.heartbeat_interval_seconds,
+        registration.snapshot_interval_seconds,
+        config.image_ref,
+        config.image,
+        config.container_name,
+    );
+    target.write_file(
+        "downstream-credentials.env",
+        target_content.as_bytes(),
+        true,
+    )?;
+    target.run_in_directory(
+        r#"set -eu
+file=downstream-credentials.env
+test -s "$file"
+mode=$(stat -c '%a' "$file" 2>/dev/null || stat -f '%Lp' "$file")
+test "$mode" = 600
+for key in MEOWAI_DEPLOYMENT_ID MEOWAI_INSTALLATION_GENERATION MEOWAI_CONTROL_PLANE_URL MEOWAI_REPORT_CREDENTIAL MEOWAI_PULL_CREDENTIAL MEOWAI_HEARTBEAT_INTERVAL_SECONDS MEOWAI_SNAPSHOT_INTERVAL_SECONDS MEOWAI_CURRENT_IMAGE_DIGEST MEOWAI_ALLOWED_IMAGE_REPOSITORY MEOWAI_CONTAINER_NAME MEOWAI_UPDATER_SOCKET_PATH; do
+  count=$(grep -c "^${key}=..*" "$file" || true)
+  test "$count" = 1
+done"#,
+    )?;
+    Ok(())
 }
 
 fn ensure_compatible_current_deployment(config: &DeploymentConfig) -> Result<()> {
@@ -947,4 +1235,158 @@ fn print_help() -> Result<()> {
     command.print_help().map_err(AppError::from_prompt)?;
     println!();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    use secrecy::SecretString;
+
+    use super::*;
+
+    fn registration() -> DeploymentRegistration {
+        DeploymentRegistration {
+            deployment_id: "dep_target_credentials".to_owned(),
+            installation_generation: 7,
+            control_plane_url: "http://127.0.0.1:3004/api".to_owned(),
+            report_credential: SecretString::from("report-secret"),
+            pull_credential: SecretString::from("pull-secret"),
+            heartbeat_interval_seconds: 60,
+            snapshot_interval_seconds: 300,
+            silent_updates_enabled: true,
+            release_schema_version: "1".to_owned(),
+        }
+    }
+
+    #[test]
+    fn target_credentials_are_private_and_read_back_complete() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let mut config = DeploymentConfig::default();
+        config.directory = temporary.path().join("deployment");
+        config.image_ref =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned();
+
+        write_target_downstream_credentials(&config, &registration())
+            .expect("write target credentials");
+
+        let path = config.directory.join("downstream-credentials.env");
+        let metadata = fs::metadata(&path).expect("target credentials metadata");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        let content = fs::read_to_string(path).expect("read target credentials");
+        for key in [
+            "MEOWAI_DEPLOYMENT_ID",
+            "MEOWAI_INSTALLATION_GENERATION",
+            "MEOWAI_CONTROL_PLANE_URL",
+            "MEOWAI_REPORT_CREDENTIAL",
+            "MEOWAI_PULL_CREDENTIAL",
+            "MEOWAI_HEARTBEAT_INTERVAL_SECONDS",
+            "MEOWAI_SNAPSHOT_INTERVAL_SECONDS",
+            "MEOWAI_CURRENT_IMAGE_DIGEST",
+            "MEOWAI_ALLOWED_IMAGE_REPOSITORY",
+            "MEOWAI_CONTAINER_NAME",
+            "MEOWAI_UPDATER_SOCKET_PATH",
+        ] {
+            assert_eq!(
+                content
+                    .lines()
+                    .filter(|line| line.starts_with(&format!("{key}=")))
+                    .count(),
+                1,
+                "expected one non-empty {key} entry"
+            );
+            assert!(!content.contains(&format!("{key}=\n")));
+        }
+        assert!(content.contains("MEOWAI_UPDATER_SOCKET_PATH=/run/meowai/updater.sock\n"));
+    }
+
+    #[test]
+    fn sync_uses_the_upstream_registration_as_the_authoritative_identity() {
+        let mut state = DeploymentState {
+            schema_version: 1,
+            deployment_id: "local-derived-id".to_owned(),
+            upstream_deployment_id: String::new(),
+            installation_generation: 0,
+            control_plane_url: String::new(),
+            target_fingerprint: String::new(),
+            container_name: String::new(),
+            directory: String::new(),
+            newapi_port: 0,
+            kuma_port: 0,
+            image: String::new(),
+            image_ref: String::new(),
+            image_digest: String::new(),
+            source_user_id: 0,
+            source_group_sha256: String::new(),
+            status_key_id: 0,
+            manifest_sha256: String::new(),
+            pricing_sha256: Default::default(),
+            channels: Default::default(),
+            kuma_monitors: Default::default(),
+            phases: Default::default(),
+            last_sync_at: 0,
+            last_sync_success: false,
+        };
+        let registration = registration();
+
+        apply_authoritative_registration(&mut state, &registration)
+            .expect("apply upstream registration");
+
+        assert_eq!(state.deployment_id, "local-derived-id");
+        assert_eq!(state.upstream_deployment_id, registration.deployment_id);
+        assert_eq!(
+            state.installation_generation,
+            registration.installation_generation
+        );
+        assert_eq!(state.control_plane_url, registration.control_plane_url);
+    }
+
+    #[test]
+    fn sync_rejects_a_registration_that_conflicts_with_persisted_upstream_identity() {
+        let mut state = DeploymentState {
+            schema_version: 1,
+            deployment_id: "local-derived-id".to_owned(),
+            upstream_deployment_id: "dep_original".to_owned(),
+            installation_generation: 1,
+            control_plane_url: String::new(),
+            target_fingerprint: String::new(),
+            container_name: String::new(),
+            directory: String::new(),
+            newapi_port: 0,
+            kuma_port: 0,
+            image: String::new(),
+            image_ref: String::new(),
+            image_digest: String::new(),
+            source_user_id: 0,
+            source_group_sha256: String::new(),
+            status_key_id: 0,
+            manifest_sha256: String::new(),
+            pricing_sha256: Default::default(),
+            channels: Default::default(),
+            kuma_monitors: Default::default(),
+            phases: Default::default(),
+            last_sync_at: 0,
+            last_sync_success: false,
+        };
+
+        let error = apply_authoritative_registration(&mut state, &registration())
+            .expect_err("conflicting registration must be rejected");
+
+        assert!(error.to_string().contains("does not match"));
+        assert_eq!(state.upstream_deployment_id, "dep_original");
+    }
+
+    #[test]
+    fn target_credentials_failure_leaves_no_partial_file() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let blocked = temporary.path().join("not-a-directory");
+        fs::write(&blocked, b"blocked").expect("create blocking file");
+        let mut config = DeploymentConfig::default();
+        config.directory = blocked.clone();
+        config.image_ref =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned();
+
+        assert!(write_target_downstream_credentials(&config, &registration()).is_err());
+        assert!(!blocked.join("downstream-credentials.env").exists());
+    }
 }

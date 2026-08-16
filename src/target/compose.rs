@@ -15,6 +15,7 @@ use crate::{
 };
 
 const TARGET_SECRETS_FILE: &str = "secrets.env";
+const TARGET_DOWNSTREAM_CREDENTIALS_FILE: &str = "downstream-credentials.env";
 const COMPOSE_FILE: &str = "docker-compose.yml";
 const KUMA_IMAGE: &str = "louislam/uptime-kuma:2.5.0";
 
@@ -151,6 +152,9 @@ impl DeploymentRuntime {
                 DeploymentState {
                     schema_version: 1,
                     deployment_id: config.deployment_id(),
+                    upstream_deployment_id: String::new(),
+                    installation_generation: 0,
+                    control_plane_url: String::new(),
                     target_fingerprint: target_fingerprint.clone(),
                     container_name: config.container_name.clone(),
                     directory: config.directory.to_string_lossy().into_owned(),
@@ -479,14 +483,16 @@ fn render_compose(config: &DeploymentConfig, runtime: &DeploymentRuntime) -> Res
         "container_name": config.container_name,
         "restart": "unless-stopped",
         "ports": [format!("{}:{}:3000", config.newapi_bind, runtime.state.newapi_port)],
-        "volumes": ["./data/newapi:/data"],
+        "volumes": ["./data/newapi:/data", "./run:/run/meowai"],
         "environment": {
             "SQL_DSN": "postgresql://meowai:${POSTGRES_PASSWORD}@postgres:5432/newapi",
             "REDIS_CONN_STRING": "redis://:${REDIS_PASSWORD}@redis:6379",
             "SESSION_SECRET": "${SESSION_SECRET}",
             "TZ": "Asia/Shanghai",
-            "SESSION_COOKIE_SECURE": "false"
+            "SESSION_COOKIE_SECURE": "false",
+            "MEOWAI_DOWNSTREAM_KUMA_HEALTH_URL": "http://uptime-kuma:3001/api/entry-page"
         },
+        "env_file": [TARGET_DOWNSTREAM_CREDENTIALS_FILE, "updater-credentials.env"],
         "extra_hosts": ["host.docker.internal:host-gateway"],
         "depends_on": {
             "postgres": {"condition": "service_healthy"},
@@ -638,6 +644,9 @@ mod tests {
             state: DeploymentState {
                 schema_version: 1,
                 deployment_id: "test".to_owned(),
+                upstream_deployment_id: "dep_test".to_owned(),
+                installation_generation: 1,
+                control_plane_url: "http://localhost:3004/api".to_owned(),
                 target_fingerprint: "host".to_owned(),
                 container_name: config.container_name.clone(),
                 directory: config.directory.to_string_lossy().into_owned(),
@@ -684,6 +693,10 @@ mod tests {
         assert!(environment.get("PUBLIC_STATUS_MODE").is_none());
         assert!(environment.get("PUBLIC_STATUS_SOURCE_URL").is_none());
         assert!(environment.get("PUBLIC_STATUS_SOURCE_KEY").is_none());
+        assert_eq!(
+            environment["MEOWAI_DOWNSTREAM_KUMA_HEALTH_URL"],
+            "http://uptime-kuma:3001/api/entry-page"
+        );
     }
 
     #[test]

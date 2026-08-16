@@ -36,6 +36,12 @@ pub struct KumaMonitorState {
 pub struct DeploymentState {
     pub schema_version: u32,
     pub deployment_id: String,
+    #[serde(default)]
+    pub upstream_deployment_id: String,
+    #[serde(default)]
+    pub installation_generation: u32,
+    #[serde(default)]
+    pub control_plane_url: String,
     pub target_fingerprint: String,
     pub container_name: String,
     pub directory: String,

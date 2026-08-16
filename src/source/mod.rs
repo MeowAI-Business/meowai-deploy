@@ -1,9 +1,13 @@
 mod auth;
+mod deployments;
 mod groups;
 mod onboard_status;
 mod pricing;
 
 pub use auth::{SourceAccountMode, SourceCredentials, SourceIdentity};
+pub use deployments::{
+    DeploymentMetadata, DeploymentRegistration, LifecycleReport, send_lifecycle_report,
+};
 pub use groups::{GroupCatalog, SourceGroup, TokenBinding, TokenSync};
 pub use onboard_status::{
     StatusKeyMetadata, StatusKeyProvision, StatusManifest, StatusMonitorManifest,
@@ -12,12 +16,14 @@ pub use onboard_status::{
 
 use std::{fmt, net::IpAddr, sync::Arc, time::Duration};
 
+use hmac::{Hmac, Mac};
 use reqwest::{
     Client, Method, StatusCode, Url,
     cookie::{CookieStore, Jar},
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sha2::Sha256;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -332,6 +338,110 @@ impl SourceClient {
         }
     }
 
+    async fn authenticated_request_with_headers<T: DeserializeOwned>(
+        &mut self,
+        method: Method,
+        path: &str,
+        body: Option<serde_json::Value>,
+        headers: &[(&str, &str)],
+    ) -> SourceResult<ApiEnvelope<T>> {
+        self.refresh_if_needed().await?;
+        let token = self
+            .session
+            .as_ref()
+            .ok_or(SourceError::AuthenticationRequired)?
+            .access_token
+            .expose_secret()
+            .to_owned();
+        let endpoint = self.endpoint(path)?;
+        let mut request = self.http.request(method, endpoint).bearer_auth(token);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|source| SourceError::Transport {
+                endpoint: path.to_owned(),
+                source,
+            })?;
+        parse_response(response, path).await
+    }
+
+    async fn signed_request_with_credential<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        control_plane_url: &str,
+        mut body: Option<serde_json::Value>,
+        credential: &SecretString,
+        installation_generation: u32,
+    ) -> SourceResult<ApiEnvelope<T>> {
+        let endpoint = control_plane_endpoint(control_plane_url, path)?;
+        let sequence = unix_timestamp_nanos();
+        if let Some(serde_json::Value::Object(object)) = body.as_mut() {
+            object.insert("sequence".to_owned(), serde_json::Value::from(sequence));
+            object.insert(
+                "installation_generation".to_owned(),
+                serde_json::Value::from(installation_generation),
+            );
+        }
+        let idempotency_key = body.as_ref().and_then(|value| {
+            value
+                .get("event_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+        let body_bytes = match body {
+            Some(value) => {
+                serde_json::to_vec(&value).map_err(|error| SourceError::InvalidResponse {
+                    endpoint: path.to_owned(),
+                    message: error.to_string(),
+                })?
+            }
+            None => Vec::new(),
+        };
+        let timestamp = unix_timestamp();
+        let nonce = crate::security::random_secret(32);
+        let canonical = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}",
+            method.as_str(),
+            endpoint.path(),
+            timestamp,
+            nonce,
+            sequence,
+            String::from_utf8_lossy(&body_bytes),
+        );
+        let mut mac = Hmac::<Sha256>::new_from_slice(credential.expose_secret().as_bytes())
+            .map_err(|_| SourceError::InvalidDeployment("invalid report credential".to_owned()))?;
+        mac.update(canonical.as_bytes());
+        let signature = encode_hex(&mac.finalize().into_bytes());
+        let mut request = self
+            .http
+            .request(method, endpoint)
+            .bearer_auth(credential.expose_secret())
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header("X-MeowAI-Timestamp", timestamp.to_string())
+            .header("X-MeowAI-Nonce", nonce)
+            .header("X-MeowAI-Sequence", sequence.to_string())
+            .header("X-MeowAI-Signature", signature)
+            .body(body_bytes);
+        if let Some(idempotency_key) = idempotency_key {
+            request = request.header("Idempotency-Key", idempotency_key);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|source| SourceError::Transport {
+                endpoint: path.to_owned(),
+                source,
+            })?;
+        parse_response(response, path).await
+    }
+
     async fn refresh_if_needed(&mut self) -> SourceResult<()> {
         let now = unix_timestamp();
         let should_refresh = self
@@ -469,6 +579,24 @@ fn unix_timestamp() -> i64 {
         .as_secs() as i64
 }
 
+fn unix_timestamp_nanos() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .min(i64::MAX as u128) as i64
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
 fn is_loopback(url: &Url) -> bool {
     match url.host_str() {
         Some("localhost") => true,
@@ -477,6 +605,27 @@ fn is_loopback(url: &Url) -> bool {
             .is_ok_and(|address| address.is_loopback()),
         None => false,
     }
+}
+
+fn control_plane_endpoint(control_plane_url: &str, path: &str) -> SourceResult<Url> {
+    let mut endpoint = Url::parse(control_plane_url)
+        .map_err(|error| SourceError::InvalidUrl(error.to_string()))?;
+    if endpoint.username() != ""
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return Err(SourceError::InvalidUrl(
+            "control plane URL must not contain credentials, query, or fragment".to_owned(),
+        ));
+    }
+    if endpoint.scheme() != "https" && !(endpoint.scheme() == "http" && is_loopback(&endpoint)) {
+        return Err(SourceError::InvalidUrl(
+            "HTTPS is required for non-loopback control planes".to_owned(),
+        ));
+    }
+    endpoint.set_path(path);
+    Ok(endpoint)
 }
 
 #[cfg(test)]

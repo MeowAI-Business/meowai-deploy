@@ -1,6 +1,7 @@
 pub mod compose;
 pub mod kuma;
 pub mod newapi;
+pub mod updater;
 
 use std::{
     borrow::Cow,
@@ -230,7 +231,7 @@ exit 1"#,
             .collect::<Vec<_>>()
             .join(" ");
         self.run_script(&format!(
-            "cd {directory}\ndocker compose --env-file secrets.env -p {project} {arguments}",
+            "cd {directory}\nfiles='-f docker-compose.yml'\nif [ -f docker-compose.updater.yml ]; then files=\"$files -f docker-compose.updater.yml\"; fi\n# shellcheck disable=SC2086\ndocker compose --env-file secrets.env -p {project} $files {arguments}",
             directory = quote_path(&self.directory),
             project = quote(project),
         ))
