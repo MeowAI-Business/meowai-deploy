@@ -324,10 +324,7 @@ mod tests {
                 }
             }
 
-            let Some(headers_end) = request
-                .windows(4)
-                .position(|part| part == b"\r\n\r\n")
-            else {
+            let Some(headers_end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
                 // A client may close a probe socket before sending a complete request.
                 // Ignore that connection; the updater test server must not turn it into a
                 // process-wide panic.
