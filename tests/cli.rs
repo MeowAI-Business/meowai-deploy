@@ -57,12 +57,13 @@ fn sync_is_implemented_and_exposes_operational_flags() {
         .expect("run sync help");
     assert!(help.status.success());
     let stdout = String::from_utf8_lossy(&help.stdout);
-    for flag in ["--pricing", "--force"] {
+    for flag in ["--check", "--details", "--apply", "--force"] {
         assert!(
             stdout.contains(flag),
             "missing {flag} in sync help: {stdout}"
         );
     }
+    assert!(!stdout.contains("--pricing"));
 
     let output = binary()
         .env(
@@ -78,6 +79,26 @@ fn sync_is_implemented_and_exposes_operational_flags() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("deployment.toml"));
     assert!(!stderr.contains("not implemented"));
+}
+
+#[test]
+fn sync_check_conflicts_with_apply_and_apply_accepts_csv_modules() {
+    let conflict = binary()
+        .args(["sync", "--check", "--apply", "groups,channels"])
+        .output()
+        .expect("run conflicting sync flags");
+    assert_eq!(conflict.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&conflict.stderr);
+    assert!(stderr.contains("cannot be used with"));
+
+    let directory = tempfile::tempdir().expect("create temporary directory");
+    let parsed = binary()
+        .env("MEOWAI_DEPLOY_HOME", directory.path())
+        .args(["sync", "--apply", "groups,channels"])
+        .output()
+        .expect("run sync with CSV modules");
+    assert_eq!(parsed.status.code(), Some(1));
+    assert!(!String::from_utf8_lossy(&parsed.stderr).contains("invalid value"));
 }
 
 #[test]

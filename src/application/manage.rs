@@ -201,13 +201,14 @@ async fn sync_deployment_inner(
         .map_err(app_error)?;
     let previous_channels = deployment.state.channels.clone();
     let (channel_result, mut channels) = downstream
-        .sync_channels(
+        .sync_channels_with_pricing(
             config,
             &deployment.container_source_url,
             &catalog,
             &token_sync.bindings,
             &previous_channels,
             request.force,
+            source_pricing.as_ref(),
         )
         .await
         .map_err(app_error)?;

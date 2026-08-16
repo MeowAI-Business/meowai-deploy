@@ -632,10 +632,27 @@ impl ProductionOnboardBackend {
     }
 
     async fn import_pricing(&mut self) -> ApplicationResult<StageOutput> {
+        let catalog = self
+            .catalog
+            .as_ref()
+            .ok_or_else(|| missing_stage("源站分组"))?
+            .clone();
         let pricing = self
             .pricing
             .as_ref()
             .ok_or_else(|| missing_stage("源站价格配置"))?;
+        self.downstream()?
+            .apply_group_structure(&catalog)
+            .await
+            .map_err(app_error)?;
+        self.downstream()?
+            .apply_group_pricing(&catalog)
+            .await
+            .map_err(app_error)?;
+        self.downstream()?
+            .apply_topup_pricing(&catalog)
+            .await
+            .map_err(app_error)?;
         let pricing_hashes = self
             .downstream()?
             .import_pricing(pricing)
@@ -666,16 +683,18 @@ impl ProductionOnboardBackend {
             .token_sync
             .as_ref()
             .ok_or_else(|| missing_stage("源站 Token"))?;
+        let pricing = self.pricing.clone();
         let deployment = self.deployment()?;
         let (result, channels) = self
             .downstream()?
-            .sync_channels(
+            .sync_channels_with_pricing(
                 &config,
                 &deployment.container_source_url,
                 catalog,
                 &token_sync.bindings,
                 &deployment.state.channels,
                 true,
+                pricing.as_ref(),
             )
             .await
             .map_err(app_error)?;

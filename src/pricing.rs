@@ -6,6 +6,7 @@ use serde_json::Value;
 use crate::{
     error::{AppError, Result},
     security::sha256_hex,
+    source::GroupCatalog,
 };
 
 #[derive(Clone, Debug)]
@@ -100,6 +101,56 @@ pub struct VideoCapabilityPolicy {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct AccountGroupPurchase {
+    pub terminal_ratio: f64,
+    pub purchase_ratio: f64,
+    #[serde(default)]
+    pub purchase_source: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct AccountSeedancePurchase {
+    pub public_model: String,
+    pub terminal_rate_bps: i64,
+    pub purchase_rate_bps: i64,
+    #[serde(default)]
+    pub purchase_source: String,
+    #[serde(default)]
+    pub policy_version: i32,
+    #[serde(default)]
+    pub effective_from: i64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct AccountPurchase {
+    #[serde(default)]
+    pub user_id: i64,
+    #[serde(default)]
+    pub user_group: String,
+    #[serde(default)]
+    pub group_ratios: BTreeMap<String, AccountGroupPurchase>,
+    #[serde(default)]
+    pub seedance: Vec<AccountSeedancePurchase>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarginRisk {
+    Profitable,
+    ZeroMargin,
+    Loss,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MarginPreview {
+    pub name: String,
+    pub purchase: Option<f64>,
+    pub sales: f64,
+    pub margin_percent: Option<f64>,
+    pub risk: MarginRisk,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct GeneralSettingConfig {
     pub quota_display_type: String,
     pub custom_currency_symbol: String,
@@ -128,6 +179,8 @@ pub struct GroupBehaviorConfig {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct PricingConfig {
+    #[serde(default)]
+    pub schema_version: u32,
     model_price: StrictPriceMap,
     model_ratio: StrictPriceMap,
     cache_ratio: StrictPriceMap,
@@ -172,13 +225,144 @@ pub struct PricingConfig {
     #[serde(default)]
     pub video_capabilities: Vec<VideoCapabilityPolicy>,
     #[serde(default)]
+    pub account_purchase: AccountPurchase,
+    #[serde(default)]
     #[serde(rename = "public_status_url")]
     _public_status_url: String,
 }
 
 impl PricingConfig {
     pub fn from_value(value: Value) -> std::result::Result<Self, String> {
-        serde_json::from_value(value).map_err(|error| error.to_string())
+        let schema_version = value
+            .get("schema_version")
+            .and_then(Value::as_u64)
+            .unwrap_or(1) as u32;
+        if schema_version >= 2 {
+            let mut terminal = value.get("terminal_pricing").cloned().ok_or_else(|| {
+                "schema_version=2 response is missing terminal_pricing".to_owned()
+            })?;
+            let terminal_object = terminal
+                .as_object_mut()
+                .ok_or_else(|| "schema_version=2 terminal_pricing must be an object".to_owned())?;
+            if let Some(capabilities) = value.get("capabilities").and_then(Value::as_object) {
+                for key in ["video_setting", "video_capabilities"] {
+                    if let Some(field) = capabilities.get(key) {
+                        terminal_object.insert(key.to_owned(), field.clone());
+                    }
+                }
+            }
+            if let Some(site_defaults) = value.get("site_defaults").and_then(Value::as_object) {
+                for key in ["home_pricing", "marketplace", "public_status_url"] {
+                    if let Some(field) = site_defaults.get(key) {
+                        terminal_object.insert(key.to_owned(), field.clone());
+                    }
+                }
+            }
+            let mut config: Self =
+                serde_json::from_value(terminal).map_err(|error| error.to_string())?;
+            config.schema_version = schema_version;
+            // v2 exposes this account's MeowAI purchase policy separately. Source-side
+            // supplier costs are private implementation details and must never be propagated.
+            config.video_cost_policies.clear();
+            config.account_purchase = value
+                .get("account_purchase")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|error| error.to_string())?
+                .unwrap_or_default();
+            return Ok(config);
+        }
+        let mut config: Self = serde_json::from_value(value).map_err(|error| error.to_string())?;
+        config.schema_version = 1;
+        Ok(config)
+    }
+
+    pub fn group_margin_previews(&self, catalog: &GroupCatalog) -> Vec<MarginPreview> {
+        catalog
+            .groups
+            .iter()
+            .map(|group| {
+                let sales = json_number(&group.ratio).unwrap_or_default();
+                let purchase = group.purchase_ratio.as_ref().and_then(json_number);
+                margin_preview(group.group_name.clone(), purchase, sales)
+            })
+            .collect()
+    }
+
+    pub fn group_margin_previews_with_downstream_sales(
+        &self,
+        catalog: &GroupCatalog,
+        downstream_sales: &Value,
+    ) -> Vec<MarginPreview> {
+        let ratios = downstream_sales.as_object();
+        catalog
+            .groups
+            .iter()
+            .map(|group| {
+                let sales = ratios
+                    .and_then(|ratios| ratios.get(&group.group_name))
+                    .and_then(json_number)
+                    .unwrap_or_default();
+                let purchase = group.purchase_ratio.as_ref().and_then(json_number);
+                margin_preview(group.group_name.clone(), purchase, sales)
+            })
+            .collect()
+    }
+
+    pub fn seedance_margin_previews(&self) -> Vec<MarginPreview> {
+        let purchases = self
+            .account_purchase
+            .seedance
+            .iter()
+            .map(|policy| (policy.public_model.as_str(), policy.purchase_rate_bps))
+            .collect::<BTreeMap<_, _>>();
+        self.video_sales_policies
+            .iter()
+            .map(|policy| {
+                let purchase = purchases
+                    .get(policy.public_model.as_str())
+                    .map(|value| *value as f64 / 10_000.0);
+                margin_preview(
+                    policy.public_model.clone(),
+                    purchase,
+                    policy.customer_rate_bps as f64 / 10_000.0,
+                )
+            })
+            .collect()
+    }
+
+    pub fn seedance_margin_previews_with_downstream_sales(
+        &self,
+        downstream_sales: &Value,
+    ) -> Vec<MarginPreview> {
+        let purchases = self
+            .account_purchase
+            .seedance
+            .iter()
+            .map(|policy| (policy.public_model.as_str(), policy.purchase_rate_bps))
+            .collect::<BTreeMap<_, _>>();
+        let sales = downstream_sales.as_array();
+        self.video_sales_policies
+            .iter()
+            .map(|policy| {
+                let purchase = purchases
+                    .get(policy.public_model.as_str())
+                    .map(|value| *value as f64 / 10_000.0);
+                let sales = sales
+                    .and_then(|policies| {
+                        policies.iter().find(|candidate| {
+                            candidate.get("public_model").and_then(Value::as_str)
+                                == Some(policy.public_model.as_str())
+                        })
+                    })
+                    .and_then(|policy| policy.get("customer_rate_bps"))
+                    .and_then(json_number)
+                    .map(|value| value / 10_000.0)
+                    .unwrap_or_default();
+                margin_preview(policy.public_model.clone(), purchase, sales)
+            })
+            .collect()
     }
 
     pub fn options(&self) -> Result<Vec<PricingOption>> {
@@ -271,11 +455,13 @@ impl PricingConfig {
             &serde_json::to_value(&self.tool_prices)
                 .map_err(|error| AppError::State(error.to_string()))?,
         )?;
+        let mut terminal_group_group_ratio = self.group_behavior.group_group_ratio.clone();
+        terminal_group_group_ratio.remove("下游");
         add_json(
             &mut options,
             "GroupGroupRatio",
             "group_behavior.group_group_ratio",
-            &serde_json::to_value(&self.group_behavior.group_group_ratio)
+            &serde_json::to_value(&terminal_group_group_ratio)
                 .map_err(|error| AppError::State(error.to_string()))?,
         )?;
         add_json(
@@ -582,6 +768,38 @@ fn ensure_home_pricing_has_no_notes(value: &Value) -> Result<()> {
     Ok(())
 }
 
+fn json_number(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+        .filter(|value| value.is_finite())
+}
+
+fn margin_preview(name: String, purchase: Option<f64>, sales: f64) -> MarginPreview {
+    let (margin_percent, risk) = match purchase {
+        None => (None, MarginRisk::Unknown),
+        Some(purchase) if purchase > sales => (
+            (sales > 0.0).then_some((sales - purchase) / sales * 100.0),
+            MarginRisk::Loss,
+        ),
+        Some(purchase) if (purchase - sales).abs() < f64::EPSILON => {
+            (Some(0.0), MarginRisk::ZeroMargin)
+        }
+        Some(purchase) if sales > 0.0 => (
+            Some((sales - purchase) / sales * 100.0),
+            MarginRisk::Profitable,
+        ),
+        Some(_) => (None, MarginRisk::Unknown),
+    };
+    MarginPreview {
+        name,
+        purchase,
+        sales,
+        margin_percent,
+        risk,
+    }
+}
+
 pub fn canonical_price_json(source: &str) -> std::result::Result<String, String> {
     let mut deserializer = serde_json::Deserializer::from_str(source);
     let parsed =
@@ -742,6 +960,141 @@ mod tests {
             canonical_price_json(r#"{"z":2,"a":1}"#).expect("canonicalize"),
             r#"{"a":1.0,"z":2.0}"#
         );
+    }
+
+    #[test]
+    fn group_margin_uses_purchase_price_without_changing_terminal_sales_price() {
+        let pricing = PricingConfig::from_value(minimal_pricing()).expect("parse pricing");
+        let catalog = GroupCatalog {
+            groups: vec![
+                source_group("profitable", 0.4, Some(0.3)),
+                source_group("zero", 0.4, Some(0.4)),
+                source_group("loss", 0.4, Some(0.45)),
+                source_group("legacy", 0.4, None),
+            ],
+            fetched_at: 0,
+            response_sha256: String::new(),
+        };
+
+        let margins = pricing.group_margin_previews(&catalog);
+        assert_eq!(margins[0].sales, 0.4);
+        assert_eq!(margins[0].purchase, Some(0.3));
+        assert!(
+            margins[0]
+                .margin_percent
+                .is_some_and(|value| (value - 25.0).abs() < 1e-9)
+        );
+        assert_eq!(margins[0].risk, MarginRisk::Profitable);
+        assert_eq!(margins[1].margin_percent, Some(0.0));
+        assert_eq!(margins[1].risk, MarginRisk::ZeroMargin);
+        assert!(margins[2].margin_percent.is_some_and(|value| value < 0.0));
+        assert_eq!(margins[2].risk, MarginRisk::Loss);
+        assert_eq!(margins[3].purchase, None);
+        assert_eq!(margins[3].margin_percent, None);
+        assert_eq!(margins[3].risk, MarginRisk::Unknown);
+
+        let downstream = serde_json::json!({
+            "profitable": 0.44,
+            "zero": 0.39,
+            "loss": 0.46,
+            "legacy": 0.5
+        });
+        let current = pricing.group_margin_previews_with_downstream_sales(&catalog, &downstream);
+        assert_eq!(current[0].sales, 0.44);
+        assert_eq!(current[1].risk, MarginRisk::Loss);
+        assert_eq!(current[2].risk, MarginRisk::Profitable);
+    }
+
+    #[test]
+    fn v2_seedance_keeps_account_purchase_separate_and_discards_supplier_costs() {
+        let mut terminal = minimal_pricing();
+        terminal["video_sales_policies"] = serde_json::json!([{
+            "public_model": "seedance-2.0",
+            "official_no_video_micros": 46000000,
+            "official_with_video_micros": 46000000,
+            "customer_rate_bps": 8300,
+            "effective_from": 100
+        }]);
+        terminal["video_cost_policies"] = serde_json::json!([{
+            "provider": "private-supplier",
+            "public_model": "seedance-2.0",
+            "upstream_group_rate_bps": 4100,
+            "promotion_rate_bps": 10000,
+            "promotion_effective_from": 0,
+            "effective_from": 100,
+            "evidence_status": "private"
+        }]);
+        let pricing = PricingConfig::from_value(serde_json::json!({
+            "schema_version": 2,
+            "terminal_pricing": terminal,
+            "account_purchase": {
+                "user_id": 42,
+                "user_group": "downstream",
+                "seedance": [{
+                    "public_model": "seedance-2.0",
+                    "terminal_rate_bps": 8300,
+                    "purchase_rate_bps": 7000,
+                    "purchase_source": "account_policy",
+                    "policy_version": 3,
+                    "effective_from": 100
+                }]
+            }
+        }))
+        .expect("parse v2 pricing");
+
+        assert_eq!(pricing.schema_version, 2);
+        assert!(pricing.video_cost_policies.is_empty());
+        let margins = pricing.seedance_margin_previews();
+        assert_eq!(margins.len(), 1);
+        assert_eq!(margins[0].purchase, Some(0.7));
+        assert_eq!(margins[0].sales, 0.83);
+        assert_eq!(margins[0].risk, MarginRisk::Profitable);
+
+        let downstream = serde_json::json!([{
+            "public_model": "seedance-2.0",
+            "customer_rate_bps": 6900
+        }]);
+        let current = pricing.seedance_margin_previews_with_downstream_sales(&downstream);
+        assert_eq!(current[0].sales, 0.69);
+        assert_eq!(current[0].risk, MarginRisk::Loss);
+    }
+
+    #[test]
+    fn v2_pricing_requires_terminal_pricing() {
+        let error = PricingConfig::from_value(serde_json::json!({
+            "schema_version": 2,
+            "account_purchase": {}
+        }))
+        .expect_err("missing terminal pricing must fail");
+        assert!(error.contains("missing terminal_pricing"));
+    }
+
+    fn minimal_pricing() -> Value {
+        serde_json::json!({
+            "model_price": {}, "model_ratio": {}, "cache_ratio": {},
+            "create_cache_ratio": {}, "completion_ratio": {}, "image_ratio": {},
+            "audio_ratio": {}, "audio_completion_ratio": {},
+            "marketplace": marketplace_config()
+        })
+    }
+
+    fn source_group(
+        name: &str,
+        terminal: f64,
+        purchase: Option<f64>,
+    ) -> crate::source::SourceGroup {
+        crate::source::SourceGroup {
+            group_id: name.to_owned(),
+            group_name: name.to_owned(),
+            description: String::new(),
+            base_ratio: serde_json::json!(terminal),
+            ratio: serde_json::json!(terminal),
+            purchase_ratio: purchase.map(|value| serde_json::json!(value)),
+            purchase_source: purchase.map_or("unknown", |_| "special_ratio").to_owned(),
+            topup_ratio: None,
+            user_selectable: true,
+            models: Vec::new(),
+        }
     }
 
     fn marketplace_config() -> Value {

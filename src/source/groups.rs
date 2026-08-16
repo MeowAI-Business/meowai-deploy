@@ -19,7 +19,10 @@ pub struct SourceGroup {
     pub group_id: String,
     pub group_name: String,
     pub description: String,
+    pub base_ratio: serde_json::Value,
     pub ratio: serde_json::Value,
+    pub purchase_ratio: Option<serde_json::Value>,
+    pub purchase_source: String,
     pub topup_ratio: Option<serde_json::Value>,
     pub user_selectable: bool,
     pub models: Vec<String>,
@@ -69,11 +72,44 @@ pub struct TokenSync {
     pub updated: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct GroupTokenPlanEntry {
+    pub group_id: String,
+    pub group_name: String,
+    pub token_name: String,
+    pub token_id: Option<i64>,
+    pub needs_create: bool,
+    pub needs_update: bool,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct GroupTokenPlan {
+    pub entries: Vec<GroupTokenPlanEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RemovedGroupTokenPlan {
+    pub token_id: i64,
+    pub token_name: String,
+    pub group_name: String,
+    pub enabled: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct RawGroup {
     #[serde(default)]
     description: String,
-    ratio: serde_json::Value,
+    #[serde(default)]
+    base_ratio: Option<serde_json::Value>,
+    #[serde(default)]
+    terminal_ratio: Option<serde_json::Value>,
+    #[serde(default)]
+    purchase_ratio: Option<serde_json::Value>,
+    #[serde(default)]
+    purchase_source: Option<String>,
+    #[serde(default)]
+    ratio: Option<serde_json::Value>,
     #[serde(default)]
     topup_ratio: Option<serde_json::Value>,
     #[serde(default)]
@@ -138,9 +174,10 @@ impl SourceClient {
     pub async fn groups(&mut self) -> SourceResult<GroupCatalog> {
         const ENDPOINT: &str = "/api/onboard/groups";
         let envelope = self
-            .authenticated_request::<BTreeMap<String, RawGroup>>(Method::GET, ENDPOINT, None)
+            .authenticated_request::<serde_json::Value>(Method::GET, ENDPOINT, None)
             .await?;
-        let raw_groups = require_data(envelope, ENDPOINT)?;
+        let data = require_data(envelope, ENDPOINT)?;
+        let (raw_groups, schema_version) = parse_groups_response(data, ENDPOINT)?;
         if raw_groups.is_empty() {
             return Err(SourceError::EmptyGroups);
         }
@@ -158,9 +195,49 @@ impl SourceClient {
             models.dedup();
             groups.push(SourceGroup {
                 group_id: name.clone(),
-                group_name: name,
+                group_name: name.clone(),
                 description: group.description,
-                ratio: group.ratio,
+                base_ratio: group
+                    .base_ratio
+                    .clone()
+                    .or_else(|| group.ratio.clone())
+                    .ok_or_else(|| SourceError::InvalidResponse {
+                        endpoint: ENDPOINT.to_owned(),
+                        message: format!("group {name} is missing base ratio"),
+                    })?,
+                ratio: group
+                    .terminal_ratio
+                    .clone()
+                    .or_else(|| group.base_ratio.clone())
+                    .or_else(|| group.ratio.clone())
+                    .ok_or_else(|| SourceError::InvalidResponse {
+                        endpoint: ENDPOINT.to_owned(),
+                        message: format!("group {name} is missing terminal ratio"),
+                    })?,
+                purchase_ratio: if schema_version >= 2 {
+                    Some(
+                        group
+                            .purchase_ratio
+                            .clone()
+                            .or_else(|| group.terminal_ratio.clone())
+                            .or_else(|| group.base_ratio.clone())
+                            .or_else(|| group.ratio.clone())
+                            .ok_or_else(|| SourceError::InvalidResponse {
+                                endpoint: ENDPOINT.to_owned(),
+                                message: format!("group {name} is missing purchase ratio"),
+                            })?,
+                    )
+                } else {
+                    None
+                },
+                purchase_source: group.purchase_source.unwrap_or_else(|| {
+                    if schema_version >= 2 {
+                        "base_ratio"
+                    } else {
+                        "unknown"
+                    }
+                    .to_owned()
+                }),
                 topup_ratio: group.topup_ratio,
                 user_selectable: group.user_selectable,
                 models,
@@ -182,45 +259,96 @@ impl SourceClient {
         })
     }
 
-    pub async fn ensure_group_tokens(&mut self, catalog: &GroupCatalog) -> SourceResult<TokenSync> {
+    pub async fn plan_group_tokens(
+        &mut self,
+        catalog: &GroupCatalog,
+    ) -> SourceResult<GroupTokenPlan> {
         if catalog.groups.is_empty() {
             return Err(SourceError::EmptyGroups);
         }
 
         let desired = desired_token_names(&catalog.groups)?;
-        let initial_tokens = self.list_tokens().await?;
-        let mut created = 0;
-        let mut initially_present = BTreeMap::new();
-
+        let tokens = self.list_tokens().await?;
+        let mut entries = Vec::with_capacity(catalog.groups.len());
         for (group, token_name) in catalog.groups.iter().zip(&desired) {
-            let matches = matching_tokens(&initial_tokens, token_name);
+            let matches = matching_tokens(&tokens, token_name);
             if matches.len() > 1 {
                 return Err(SourceError::AmbiguousToken(format!(
                     "multiple tokens named {token_name} exist for group {}",
                     group.group_name
                 )));
             }
-            if let Some(token) = matches.first() {
-                initially_present.insert(group.group_id.clone(), token.id);
-            } else {
-                self.create_token(token_name, &group.group_name).await?;
+            let token = matches.first().copied();
+            entries.push(GroupTokenPlanEntry {
+                group_id: group.group_id.clone(),
+                group_name: group.group_name.clone(),
+                token_name: token_name.clone(),
+                token_id: token.map(|token| token.id),
+                needs_create: token.is_none(),
+                needs_update: token
+                    .is_some_and(|token| token_needs_update(token, &group.group_name)),
+                enabled: token.is_some_and(|token| token.status == 1),
+            });
+        }
+        Ok(GroupTokenPlan { entries })
+    }
+
+    pub async fn apply_group_tokens(
+        &mut self,
+        catalog: &GroupCatalog,
+        plan: &GroupTokenPlan,
+    ) -> SourceResult<TokenSync> {
+        if catalog.groups.len() != plan.entries.len()
+            || catalog
+                .groups
+                .iter()
+                .zip(&plan.entries)
+                .any(|(group, entry)| group.group_id != entry.group_id)
+        {
+            return Err(SourceError::InvalidDeployment(
+                "group token plan no longer matches the source catalog".to_owned(),
+            ));
+        }
+        let mut created = 0;
+        let mut initially_present = BTreeMap::new();
+        for entry in &plan.entries {
+            if entry.needs_create {
+                self.create_token(&entry.token_name, &entry.group_name)
+                    .await?;
                 created += 1;
+            } else if let Some(token_id) = entry.token_id {
+                initially_present.insert(entry.group_id.clone(), token_id);
             }
         }
 
-        let tokens = if created == 0 {
-            initial_tokens
-        } else {
+        let refresh_tokens = created > 0 || plan.entries.iter().any(|entry| entry.needs_update);
+        let tokens = if refresh_tokens {
             self.list_tokens().await?
+        } else {
+            Vec::new()
         };
         let mut updated = 0;
         let mut selected = Vec::with_capacity(catalog.groups.len());
 
-        for (group, token_name) in catalog.groups.iter().zip(&desired) {
-            let matches = matching_tokens(&tokens, token_name);
+        for (group, entry) in catalog.groups.iter().zip(&plan.entries) {
+            if tokens.is_empty() {
+                let token_id = entry.token_id.ok_or_else(|| SourceError::InvalidResponse {
+                    endpoint: "/api/token/".to_owned(),
+                    message: format!("token {} disappeared after planning", entry.token_name),
+                })?;
+                selected.push((
+                    group.clone(),
+                    entry.token_name.clone(),
+                    token_id,
+                    initially_present.contains_key(&group.group_id),
+                ));
+                continue;
+            }
+            let matches = matching_tokens(&tokens, &entry.token_name);
             if matches.len() != 1 {
                 return Err(SourceError::AmbiguousToken(format!(
-                    "expected one token named {token_name} for group {}, found {}",
+                    "expected one token named {} for group {}, found {}",
+                    entry.token_name,
                     group.group_name,
                     matches.len()
                 )));
@@ -228,7 +356,7 @@ impl SourceClient {
             let token = matches[0];
             if token_needs_update(token, &group.group_name) {
                 let was_disabled = token.status != 1;
-                self.update_token(token.id, token_name, &group.group_name)
+                self.update_token(token.id, &entry.token_name, &group.group_name)
                     .await?;
                 if was_disabled {
                     self.enable_token(token.id).await?;
@@ -237,7 +365,7 @@ impl SourceClient {
             }
             selected.push((
                 group.clone(),
-                token_name.clone(),
+                entry.token_name.clone(),
                 token.id,
                 initially_present.contains_key(&group.group_id),
             ));
@@ -276,25 +404,54 @@ impl SourceClient {
         })
     }
 
-    pub async fn disable_removed_group_tokens(
+    pub async fn plan_removed_group_tokens(
         &mut self,
         active_group_ids: &BTreeSet<String>,
-    ) -> SourceResult<usize> {
+    ) -> SourceResult<Vec<RemovedGroupTokenPlan>> {
         let tokens = self.list_tokens().await?;
+        Ok(tokens
+            .into_iter()
+            .filter(|token| {
+                is_account_group_token(token)
+                    && token
+                        .group
+                        .as_deref()
+                        .is_some_and(|group| !active_group_ids.contains(group))
+            })
+            .map(|token| RemovedGroupTokenPlan {
+                token_id: token.id,
+                token_name: token.name,
+                group_name: token.group.unwrap_or_default(),
+                enabled: token.status == 1,
+            })
+            .collect())
+    }
+
+    pub async fn apply_removed_group_tokens(
+        &mut self,
+        plan: &[RemovedGroupTokenPlan],
+    ) -> SourceResult<usize> {
         let mut disabled = 0;
-        for token in tokens {
-            if is_account_group_token(&token)
-                && token
-                    .group
-                    .as_deref()
-                    .is_some_and(|group| !active_group_ids.contains(group))
-                && token.status != 2
-            {
-                self.update_token_status(token.id, 2).await?;
+        for entry in plan {
+            if entry.enabled {
+                self.update_token_status(entry.token_id, 2).await?;
                 disabled += 1;
             }
         }
         Ok(disabled)
+    }
+
+    pub async fn ensure_group_tokens(&mut self, catalog: &GroupCatalog) -> SourceResult<TokenSync> {
+        let plan = self.plan_group_tokens(catalog).await?;
+        self.apply_group_tokens(catalog, &plan).await
+    }
+
+    pub async fn disable_removed_group_tokens(
+        &mut self,
+        active_group_ids: &BTreeSet<String>,
+    ) -> SourceResult<usize> {
+        let plan = self.plan_removed_group_tokens(active_group_ids).await?;
+        self.apply_removed_group_tokens(&plan).await
     }
 
     pub async fn revoke_account_group_tokens(&mut self) -> SourceResult<usize> {
@@ -430,6 +587,33 @@ impl SourceClient {
     }
 }
 
+fn parse_groups_response(
+    value: serde_json::Value,
+    endpoint: &str,
+) -> SourceResult<(BTreeMap<String, RawGroup>, u32)> {
+    let schema_version = value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(1) as u32;
+    let groups = if schema_version >= 2 {
+        value
+            .get("groups")
+            .cloned()
+            .ok_or_else(|| SourceError::InvalidResponse {
+                endpoint: endpoint.to_owned(),
+                message: "schema_version=2 response is missing groups".to_owned(),
+            })?
+    } else {
+        value
+    };
+    serde_json::from_value(groups)
+        .map(|groups| (groups, schema_version))
+        .map_err(|error| SourceError::InvalidResponse {
+            endpoint: endpoint.to_owned(),
+            message: error.to_string(),
+        })
+}
+
 fn is_exportable_group(name: &str) -> bool {
     let normalized = name.trim();
     !normalized.is_empty() && normalized != "下游" && !normalized.starts_with("official-")
@@ -553,7 +737,10 @@ mod unit_tests {
             group_id: "超长分组".repeat(12),
             group_name: "超长分组".repeat(12),
             description: String::new(),
+            base_ratio: serde_json::json!(1),
             ratio: serde_json::json!(1),
+            purchase_ratio: None,
+            purchase_source: "unknown".to_owned(),
             topup_ratio: None,
             user_selectable: false,
             models: vec!["gpt-test".to_owned()],
@@ -571,7 +758,10 @@ mod unit_tests {
             group_id: "default".to_owned(),
             group_name: "default".to_owned(),
             description: String::new(),
+            base_ratio: serde_json::json!(1),
             ratio: serde_json::json!(1),
+            purchase_ratio: None,
+            purchase_source: "unknown".to_owned(),
             topup_ratio: None,
             user_selectable: false,
             models: vec![],
