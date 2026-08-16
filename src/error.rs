@@ -37,6 +37,9 @@ pub enum AppError {
     #[error("deployment state is invalid: {0}")]
     State(String),
 
+    #[error("sync check found changes in {0} module(s)")]
+    SyncChangesDetected(usize),
+
     #[error(transparent)]
     Source(#[from] crate::source::SourceError),
 }
@@ -44,7 +47,7 @@ pub enum AppError {
 impl AppError {
     pub fn exit_code(&self) -> i32 {
         match self {
-            Self::DoctorFailed => 2,
+            Self::DoctorFailed | Self::SyncChangesDetected(_) => 2,
             Self::Cancelled => 130,
             Self::InvalidConfig(_)
             | Self::InvalidToml(_)

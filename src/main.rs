@@ -10,6 +10,7 @@ pub mod source;
 mod source_key_store;
 mod state;
 mod storage;
+mod sync_plan;
 mod target;
 mod updater;
 

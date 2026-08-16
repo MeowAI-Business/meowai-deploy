@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{
     error::{AppError, Result},
@@ -13,6 +14,7 @@ use crate::{
 
 #[derive(Debug, Serialize)]
 struct KumaInput<'a> {
+    mode: &'a str,
     kuma_username: &'a str,
     kuma_password: &'a str,
     force: bool,
@@ -33,6 +35,8 @@ struct KumaHelperResult {
     page_slug: String,
     #[serde(default)]
     monitors: Vec<KumaMonitorState>,
+    #[serde(default)]
+    snapshot: Value,
 }
 
 #[derive(Debug)]
@@ -69,8 +73,36 @@ pub fn sync_status_page(options: KumaSyncOptions<'_>) -> Result<KumaSyncResult> 
             "source public status manifest reported failure".to_owned(),
         ));
     }
+    let manifest_sha256 = sha256_hex(
+        &serde_json::to_vec(options.manifest)
+            .map_err(|error| AppError::Target(format!("hash Kuma manifest: {error}")))?,
+    );
+    let result = run_helper(&options, "apply")?;
+    let monitors = result
+        .monitors
+        .into_iter()
+        .map(|monitor| (monitor.source_monitor_id.clone(), monitor))
+        .collect();
+    Ok(KumaSyncResult {
+        page_slug: result.page_slug,
+        manifest_sha256,
+        monitors,
+    })
+}
+
+pub fn read_managed_snapshot(options: KumaSyncOptions<'_>) -> Result<Value> {
+    if !options.manifest.success {
+        return Err(AppError::Target(
+            "source public status manifest reported failure".to_owned(),
+        ));
+    }
+    Ok(run_helper(&options, "plan")?.snapshot)
+}
+
+fn run_helper(options: &KumaSyncOptions<'_>, mode: &str) -> Result<KumaHelperResult> {
     let page_slug = status_page_slug(options.deployment_id);
     let input = KumaInput {
+        mode,
         kuma_username: options.kuma_username,
         kuma_password: options.kuma_password.expose_secret(),
         force: options.force,
@@ -108,20 +140,7 @@ pub fn sync_status_page(options: KumaSyncOptions<'_>) -> Result<KumaSyncResult> 
             result.error
         )));
     }
-    let manifest_sha256 = sha256_hex(
-        &serde_json::to_vec(options.manifest)
-            .map_err(|error| AppError::Target(format!("hash Kuma manifest: {error}")))?,
-    );
-    let monitors = result
-        .monitors
-        .into_iter()
-        .map(|monitor| (monitor.source_monitor_id.clone(), monitor))
-        .collect();
-    Ok(KumaSyncResult {
-        page_slug: result.page_slug,
-        manifest_sha256,
-        monitors,
-    })
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -135,5 +154,29 @@ mod tests {
             internal_status_page_url("meowai-abcdef12"),
             "http://uptime-kuma:3001/status/meowai-abcdef12"
         );
+    }
+
+    #[test]
+    fn plan_mode_routes_every_kuma_write_event_through_the_read_only_guard() {
+        let helper = include_str!("kuma_helper.js");
+        assert!(helper.contains("function emitMutation(socket, readOnly, event"));
+        assert!(helper.contains("if (readOnly) throw new Error"));
+        for event in [
+            "setup",
+            "addStatusPage",
+            "editMonitor",
+            "add",
+            "pauseMonitor",
+            "saveStatusPage",
+        ] {
+            assert!(
+                !helper.contains(&format!("emit(socket, \"{event}\"")),
+                "write event {event} bypasses the plan-mode guard"
+            );
+            assert!(
+                helper.contains(&format!("emitMutation(socket, readOnly, \"{event}\"")),
+                "write event {event} is not guarded"
+            );
+        }
     }
 }

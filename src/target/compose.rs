@@ -124,6 +124,27 @@ pub struct DeploymentRuntime {
 }
 
 impl DeploymentRuntime {
+    /// Load an existing deployment for a read-only sync plan. This deliberately does not
+    /// create directories, start containers, or write credentials/state.
+    pub fn load_existing(config: &DeploymentConfig) -> Result<Self> {
+        let executor = TargetExecutor::new(config.target.clone(), config.directory.clone());
+        let state = load_state()?
+            .ok_or_else(|| AppError::State("尚未找到部署状态，请先完成 onboard".to_owned()))?;
+        let target_fingerprint = executor.fingerprint()?;
+        validate_existing_state(config, &target_fingerprint, &state)?;
+        let secrets = storage::read(CREDENTIALS_FILE)?
+            .ok_or_else(|| AppError::State("部署凭证不存在，无法进行只读同步".to_owned()))
+            .and_then(|content| DeploymentSecrets::parse(&content))?;
+        let container_source_url = container_source_url(&config.source_url)?;
+        Ok(Self {
+            executor,
+            state,
+            secrets,
+            container_source_url,
+            credentials_should_display: false,
+        })
+    }
+
     pub fn prepare(
         config: &DeploymentConfig,
         source_user_id: i64,
@@ -169,6 +190,8 @@ impl DeploymentRuntime {
                     phases: BTreeMap::new(),
                     last_sync_at: 0,
                     last_sync_success: false,
+                    snapshot_schema_version: 0,
+                    last_applied_at: BTreeMap::new(),
                 }
             }
         };
@@ -656,6 +679,8 @@ mod tests {
                 phases: BTreeMap::new(),
                 last_sync_at: 0,
                 last_sync_success: false,
+                snapshot_schema_version: 0,
+                last_applied_at: BTreeMap::new(),
             },
             secrets: DeploymentSecrets {
                 postgres_password: SecretString::from("postgres".to_owned()),

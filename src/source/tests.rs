@@ -356,6 +356,65 @@ async fn groups_are_complete_sorted_and_hashed_deterministically() {
     assert_eq!(first.groups[1].models, ["gpt-vip", "shared"]);
     assert_eq!(first.groups[1].topup_ratio, Some(json!(1.2)));
     assert!(first.groups[1].user_selectable);
+    assert_eq!(first.groups[1].base_ratio, json!(1.5));
+    assert_eq!(first.groups[1].ratio, json!(1.5));
+    assert_eq!(first.groups[1].purchase_ratio, None);
+    assert_eq!(first.groups[1].purchase_source, "unknown");
+}
+
+#[tokio::test]
+async fn v2_groups_keep_terminal_and_account_purchase_ratios_separate() {
+    let server = MockServer::start().await;
+    let mut client = authenticated_client(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/onboard/groups"))
+        .and(header("authorization", "Bearer access-one"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "message": "",
+            "data": {
+                "schema_version": 2,
+                "terminal_user_group": "default",
+                "account_user_group": "downstream",
+                "groups": {
+                    "gpt-pro": {
+                        "description": "GPT Pro",
+                        "base_ratio": 0.4,
+                        "terminal_ratio": 0.4,
+                        "purchase_ratio": 0.3,
+                        "purchase_source": "special_ratio",
+                        "user_selectable": true,
+                        "models": ["gpt-5.2"]
+                    },
+                    "zero-margin": {
+                        "base_ratio": 1,
+                        "terminal_ratio": 1,
+                        "models": []
+                    }
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let catalog = client.groups().await.expect("read v2 groups");
+    let group = catalog
+        .groups
+        .iter()
+        .find(|group| group.group_id == "gpt-pro")
+        .expect("gpt-pro group");
+    assert_eq!(group.base_ratio, json!(0.4));
+    assert_eq!(group.ratio, json!(0.4));
+    assert_eq!(group.purchase_ratio, Some(json!(0.3)));
+    assert_eq!(group.purchase_source, "special_ratio");
+    let fallback = catalog
+        .groups
+        .iter()
+        .find(|group| group.group_id == "zero-margin")
+        .expect("fallback group");
+    assert_eq!(fallback.purchase_ratio, Some(json!(1)));
+    assert_eq!(fallback.purchase_source, "base_ratio");
 }
 
 #[derive(Clone)]
@@ -591,6 +650,56 @@ async fn account_group_tokens_are_disabled_and_revoked_without_touching_legacy_t
 
     assert_eq!(disabled, 1);
     assert_eq!(revoked, 2);
+}
+
+#[tokio::test]
+async fn group_token_planning_uses_only_read_requests() {
+    let server = MockServer::start().await;
+    let mut client = authenticated_client(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/token/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "message": "",
+            "data": {
+                "items": [token(10, "meowai-deploy/default", "default")],
+                "total": 1,
+                "page": 1,
+                "page_size": 100
+            }
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let catalog = GroupCatalog {
+        groups: vec![group("default", 1)],
+        fetched_at: 1,
+        response_sha256: "hash".to_owned(),
+    };
+
+    client
+        .plan_group_tokens(&catalog)
+        .await
+        .expect("plan active group tokens");
+    client
+        .plan_removed_group_tokens(&BTreeSet::from(["default".to_owned()]))
+        .await
+        .expect("plan removed group tokens");
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("read recorded requests");
+    let token_requests = requests
+        .iter()
+        .filter(|request| request.url.path().starts_with("/api/token"))
+        .collect::<Vec<_>>();
+    assert_eq!(token_requests.len(), 2);
+    assert!(
+        token_requests
+            .iter()
+            .all(|request| request.method.as_str() == "GET")
+    );
 }
 
 #[tokio::test]
@@ -1026,11 +1135,15 @@ async fn pricing_rejects_missing_or_invalid_source_fields() {
 }
 
 fn group(name: &str, ratio: impl Into<Value>) -> SourceGroup {
+    let ratio = ratio.into();
     SourceGroup {
         group_id: name.to_owned(),
         group_name: name.to_owned(),
         description: name.to_owned(),
-        ratio: ratio.into(),
+        base_ratio: ratio.clone(),
+        ratio,
+        purchase_ratio: None,
+        purchase_source: "unknown".to_owned(),
         topup_ratio: None,
         user_selectable: false,
         models: vec![format!("{name}-model")],
