@@ -493,9 +493,10 @@ export default function App() {
         } else if (status === "failed" || status === "cancelled") {
           setOperationStatus("failed");
           setOperationFailure(snapshot.checkpoint.failure ?? null);
+          const failureCode = snapshot.checkpoint.failure?.code;
           setResumeSourcePasswordRequired(
-            failureNeedsSourcePassword(snapshot.checkpoint.failure?.code)
-              && !credentialMemory.current.sourcePassword,
+            failureNeedsSourcePassword(failureCode)
+              && (failureCode !== "STATUS_KEY_CONTENT_UNAVAILABLE" || !credentialMemory.current.sourcePassword),
           );
           setLastEvent(snapshot.checkpoint.failure?.message ?? (status === "cancelled" ? "操作已取消" : "部署失败"));
         }
@@ -1081,10 +1082,10 @@ export default function App() {
                 ) : operationStatus === "failed" ? (
                   <button className="secondary-action" onClick={() => setActiveStep("review")}><ArrowLeft size={16} />返回修改</button>
                 ) : <span />}
-                {operationStatus === "failed" && operationFailure?.retryable && (
+                {operationStatus === "failed" && operationFailure && (
                   <button
                     className={`primary-action ${resumingOperation ? "is-loading" : ""}`}
-                    disabled={resumingOperation || (resumeSourcePasswordRequired && !draft.sourcePassword)}
+                    disabled={resumingOperation}
                     onClick={() => operationFailure?.code === "STATUS_KEY_CONTENT_UNAVAILABLE"
                       ? setDialog("rotate-status-key")
                       : void resumeOperation()}

@@ -1641,6 +1641,11 @@ async fn resume_operation_handler(
     if let Some(password) = optional_secret(payload.source_password) {
         config.source_password = Some(password);
     }
+    if config.source_password.is_none() {
+        config.source_password = std::env::var("MEOWAI_DEPLOY_SOURCE_PASSWORD")
+            .ok()
+            .map(SecretString::from);
+    }
     if matches!(&config.target, Target::Ssh { .. })
         && let Some(password) = optional_secret(payload.ssh_password)
     {
