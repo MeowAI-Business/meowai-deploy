@@ -8,6 +8,7 @@ import {
   Check,
   CheckCircle2,
   ClipboardCheck,
+  ExternalLink,
   HardDrive,
   KeyRound,
   LoaderCircle,
@@ -17,7 +18,7 @@ import {
   TerminalSquare,
   Wifi,
   X,
-  Upload,
+  Download,
 } from "lucide-react";
 
 type StepKey = "target" | "source" | "site" | "review" | "operation";
@@ -157,6 +158,11 @@ type OperationSnapshot = {
   credentials?: Array<{ kind: string; username: string; password: string }>;
 };
 
+type OperationResult = {
+  newapi_url?: string;
+  kuma_url?: string;
+};
+
 const steps: Array<{ key: StepKey; label: string; icon: typeof Server }> = [
   { key: "target", label: "部署位置", icon: Server },
   { key: "source", label: "源站账号", icon: KeyRound },
@@ -248,6 +254,7 @@ export default function App() {
   const [operationPollGeneration, setOperationPollGeneration] = useState(0);
   const [currentStage, setCurrentStage] = useState<string | null>(null);
   const [credentials, setCredentials] = useState<OperationSnapshot["credentials"]>(undefined);
+  const [operationResult, setOperationResult] = useState<OperationResult | null>(null);
   const [resumingOperation, setResumingOperation] = useState(false);
   const [resumeSourcePasswordRequired, setResumeSourcePasswordRequired] = useState(false);
   const [checkingStep, setCheckingStep] = useState<PreflightStep | null>(null);
@@ -444,6 +451,7 @@ export default function App() {
         const status = snapshot.checkpoint.status;
         setOperationEvents((current) => mergeOperationEvents(current, snapshot.events ?? []));
         setCurrentStage(snapshot.checkpoint.current_stage ?? null);
+        setOperationResult((snapshot.result as OperationResult | undefined) ?? null);
         const completedCount = snapshot.checkpoint.completed_stages?.filter((stage) => operationStages.includes(stage as (typeof operationStages)[number])).length ?? 0;
         const stageInProgress = snapshot.checkpoint.current_stage ? 0.35 : 0;
         setOperationProgress(Math.min(100, Math.round(((completedCount + stageInProgress) / operationStages.length) * 100)));
@@ -720,6 +728,7 @@ export default function App() {
     setOperationFailure(null);
     setOperationProgress(0);
     setCurrentStage(null);
+    setOperationResult(null);
     try {
       const result = await request<{ operation_id: string }>(
         "/api/operations",
@@ -907,6 +916,7 @@ export default function App() {
     setResumeSourcePasswordRequired(!credentialMemory.current.sourcePassword);
     setOperationProgress(0);
     setCredentials(undefined);
+    setOperationResult(null);
     setLastEvent("正在读取上次部署状态");
     setError(null);
     setActiveStep("operation");
@@ -942,7 +952,7 @@ export default function App() {
             <h1>部署 NewAPI</h1>
             <p>填写部署信息，确认后开始安装。</p>
           </div>
-          <label className="secondary-action preset-import"><Upload size={16} />导入 TOML 预设<input type="file" accept=".toml,text/plain" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importPreset(file); event.currentTarget.value = ""; }} /></label>
+          <label className="secondary-action preset-import" title="从 TOML 文件填充部署配置"><Download size={15} />导入预设<input type="file" accept=".toml,text/plain" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importPreset(file); event.currentTarget.value = ""; }} /></label>
           <button className="icon-button" title="关闭部署工具" aria-label="关闭部署工具" onClick={() => void closeWebUi()}>
             <LogOut size={18} />
           </button>
@@ -1005,6 +1015,7 @@ export default function App() {
                 events={operationEvents}
                 failure={operationFailure}
                 credentials={credentials}
+                operationResult={operationResult}
                 showSshPassword={requiresSshPassword(operationFailure, draft.target)}
                 sshPassword={draft.sshPassword}
                 onSshPasswordChange={(value) => update("sshPassword", value)}
@@ -1285,6 +1296,14 @@ function SiteStep({ draft, update, imageCheckState, imageCheckError, imageUpdate
         <Field label="NewAPI 端口"><input inputMode="numeric" value={draft.newapiPort} onChange={(event) => update("newapiPort", event.target.value)} placeholder="3000" /></Field>
         <Field label="Uptime Kuma 端口"><input inputMode="numeric" value={draft.kumaPort} onChange={(event) => update("kumaPort", event.target.value)} placeholder="3001" /></Field>
       </div>
+      <div className="form-row">
+        <Field label="NewAPI 管理员用户名"><input value={draft.newapiAdminUsername} onChange={(event) => update("newapiAdminUsername", event.target.value)} placeholder="admin" autoComplete="username" /></Field>
+        <Field label="NewAPI 管理员密码" hint="留空则自动生成随机密码。"><input type="password" value={draft.newapiAdminPassword} onChange={(event) => update("newapiAdminPassword", event.target.value)} placeholder="部署时自动生成" autoComplete="new-password" /></Field>
+      </div>
+      <div className="form-row">
+        <Field label="Uptime Kuma 管理员用户名"><input value={draft.kumaAdminUsername} onChange={(event) => update("kumaAdminUsername", event.target.value)} placeholder="admin" autoComplete="username" /></Field>
+        <Field label="Uptime Kuma 管理员密码" hint="留空则自动生成随机密码。"><input type="password" value={draft.kumaAdminPassword} onChange={(event) => update("kumaAdminPassword", event.target.value)} placeholder="部署时自动生成" autoComplete="new-password" /></Field>
+      </div>
       <Field label="容器镜像"><input value={draft.image} onChange={(event) => update("image", event.target.value)} placeholder="ghcr.io/moorcorpa/new-api-outgap" /></Field>
       <div className="field">
         <span className="field-label">镜像 digest</span>
@@ -1382,6 +1401,7 @@ function OperationStep({
   events,
   failure,
   credentials,
+  operationResult,
   showSshPassword,
   sshPassword,
   onSshPasswordChange,
@@ -1396,6 +1416,7 @@ function OperationStep({
   events: OperationEvent[];
   failure: OperationFailure | null;
   credentials?: Array<{ kind: string; username: string; password: string }>;
+  operationResult: OperationResult | null;
   showSshPassword: boolean;
   sshPassword: string;
   onSshPasswordChange: (value: string) => void;
@@ -1482,7 +1503,16 @@ function OperationStep({
           </ol>
         )}
       </section>
-      {credentials && credentials.length > 0 && <div className="credential-result" role="status"><strong>管理员账号</strong><p>这些密码只显示一次，请立即保存。</p>{credentials.map((credential) => <div className="credential-row" key={credential.kind}><span>{credential.kind}</span><code>{credential.username} / {credential.password}</code></div>)}</div>}
+      {complete && operationResult && (operationResult.newapi_url || operationResult.kuma_url) && (
+        <div className="service-links" aria-label="已部署服务">
+          <strong>打开已部署服务</strong>
+          <div className="service-link-actions">
+            {operationResult.newapi_url && <a className="secondary-action" href={operationResult.newapi_url} target="_blank" rel="noreferrer"><ExternalLink size={15} />打开 NewAPI</a>}
+            {operationResult.kuma_url && <a className="secondary-action" href={operationResult.kuma_url} target="_blank" rel="noreferrer"><ExternalLink size={15} />打开 Uptime Kuma</a>}
+          </div>
+        </div>
+      )}
+      {credentials && credentials.length > 0 && <div className="credential-result" role="status"><strong>管理员账号</strong><p>这些密码只显示一次，请立即保存。</p>{credentials.map((credential) => <div className="credential-row" key={credential.kind}><span>{credential.kind === "newapi_admin" ? "NewAPI" : credential.kind === "kuma_admin" ? "Uptime Kuma" : credential.kind}</span><code>{credential.username} / {credential.password}</code></div>)}</div>}
     </div>
   );
 }
