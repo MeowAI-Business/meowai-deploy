@@ -19,7 +19,7 @@ server_pid=$!
 origin=""
 for _ in {1..80}; do
   if [[ -s "$log_file" ]]; then
-    url="$(sed -n 's/^WebUI 已启动：\(http:\/\/127\.0\.0\.1:[0-9]*\).*$/\1/p' "$log_file" | head -n1)"
+    url="$(sed -n 's#^.*\(http://127\.0\.0\.1:[0-9][0-9]*\).*$#\1#p' "$log_file" | head -n1)"
     if [[ -n "$url" ]]; then
       origin="$url"
       break
@@ -35,4 +35,4 @@ if [[ -z "$origin" ]]; then
 fi
 
 curl --fail --silent --show-error -H "Host: ${origin#http://}" "$origin/api/health" | grep -q '"status":"ok"'
-curl --fail --silent --show-error -H "Host: ${origin#http://}" "$origin/" | grep -q '部署校准台'
+curl --fail --silent --show-error -H "Host: ${origin#http://}" "$origin/" | grep -q '<title>MeowAI Deploy</title>'
