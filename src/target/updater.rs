@@ -324,10 +324,15 @@ mod tests {
                 }
             }
 
-            let headers_end = request
+            let Some(headers_end) = request
                 .windows(4)
                 .position(|part| part == b"\r\n\r\n")
-                .expect("complete HTTP request");
+            else {
+                // A client may close a probe socket before sending a complete request.
+                // Ignore that connection; the updater test server must not turn it into a
+                // process-wide panic.
+                continue;
+            };
             let request_line = String::from_utf8_lossy(&request[..headers_end])
                 .lines()
                 .next()

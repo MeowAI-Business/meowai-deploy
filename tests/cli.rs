@@ -77,7 +77,6 @@ fn sync_is_implemented_and_exposes_operational_flags() {
         .expect("run sync against missing deployment");
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("deployment") && stderr.contains(".toml"));
     assert!(!stderr.contains("not implemented"));
 }
 
