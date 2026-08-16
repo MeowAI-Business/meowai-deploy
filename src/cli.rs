@@ -18,6 +18,8 @@ pub struct Cli {
 pub enum Command {
     /// Ensure that a supported OpenSSH client is installed.
     Bootstrap(BootstrapArgs),
+    /// Start the local browser deployment workbench.
+    Web(WebArgs),
     /// Check local or target-host prerequisites.
     Doctor(DoctorArgs),
     /// Start the interactive onboard workflow.
@@ -45,6 +47,13 @@ pub struct BootstrapArgs {
     /// Print a machine-readable check without installing or ANSI output.
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct WebArgs {
+    /// Print the loopback URL without opening a browser.
+    #[arg(long)]
+    pub no_open: bool,
 }
 
 #[derive(Debug, Args)]

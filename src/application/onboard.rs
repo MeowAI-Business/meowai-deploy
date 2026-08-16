@@ -81,6 +81,10 @@ impl OperationControl {
     pub fn cancel(&self) {
         self.cancellation.cancel();
     }
+
+    pub fn token(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
 }
 
 pub async fn start_onboard<B, S, P>(

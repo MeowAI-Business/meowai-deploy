@@ -15,6 +15,7 @@ mod state;
 mod storage;
 mod target;
 mod updater;
+mod web;
 
 use std::env;
 

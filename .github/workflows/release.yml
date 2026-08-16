@@ -50,6 +50,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes musl-tools
 
+      - name: Build embedded WebUI
+        run: |
+          npm ci --prefix webui
+          npm run build --prefix webui
+
       - name: Cache Rust build
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
@@ -78,6 +83,7 @@ jobs:
             echo "Linux release binary is dynamically linked" >&2
             exit 1
           fi
+          ./scripts/webui-smoke.sh "$binary"
           mkdir -p dist/package
           install -m 0755 "$binary" dist/package/meowai-deploy
           tar -C dist/package -czf "dist/meowai-deploy-${{ matrix.target }}.tar.gz" meowai-deploy
@@ -99,6 +105,11 @@ jobs:
 
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal
+
+      - name: Build embedded WebUI
+        run: |
+          npm ci --prefix webui
+          npm run build --prefix webui
 
       - name: Cache Rust build
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -124,6 +135,10 @@ jobs:
           New-Item -ItemType Directory -Path dist\package -Force | Out-Null
           Copy-Item target\release\meowai-deploy.exe dist\package\meowai-deploy.exe
           Compress-Archive -Path dist\package\meowai-deploy.exe -DestinationPath dist\meowai-deploy-windows-amd64.zip -CompressionLevel Optimal
+
+      - name: Smoke test embedded WebUI
+        shell: bash
+        run: ./scripts/webui-smoke.sh target/release/meowai-deploy.exe
 
       - name: Upload build artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0

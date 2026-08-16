@@ -26,7 +26,7 @@ use crate::{
     source::{SourceClient, SourceError},
     state::{DOWNSTREAM_CLEANUP_PHASE, DeploymentState, unix_timestamp},
     storage::{self, CONFIG_FILE, CREDENTIALS_FILE, OPERATION_FILE, SESSION_FILE, STATE_FILE},
-    updater,
+    updater, web,
 };
 
 struct CliEventSink;
@@ -54,12 +54,13 @@ impl EventSink for CliEventSink {
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
-    if !matches!(cli.command, Some(Command::Update(_))) {
+    if !matches!(cli.command, Some(Command::Update(_) | Command::Web(_))) {
         updater::check_periodically().await;
     }
     match cli.command {
         None => print_help(),
         Some(Command::Bootstrap(args)) => bootstrap::run(&args),
+        Some(Command::Web(args)) => web::run(&args).await,
         Some(Command::Doctor(args)) => doctor::run(&args).await,
         Some(Command::Onboard(args)) => run_onboard(&args).await,
         Some(Command::Sync(args)) => run_sync(&args).await,
@@ -458,7 +459,7 @@ async fn clear_current_deployment_before_onboard() -> Result<()> {
     Ok(())
 }
 
-fn load_deployment_config() -> Result<DeploymentConfig> {
+pub(crate) fn load_deployment_config() -> Result<DeploymentConfig> {
     let path = storage::directory()?.join(CONFIG_FILE);
     let mut config = DeploymentConfig::from_file(&path)?;
     config.normalize();
@@ -466,13 +467,13 @@ fn load_deployment_config() -> Result<DeploymentConfig> {
     Ok(config)
 }
 
-fn persist_deployment_config(config: &DeploymentConfig) -> Result<()> {
+pub(crate) fn persist_deployment_config(config: &DeploymentConfig) -> Result<()> {
     let content = toml::to_string_pretty(config)
         .map_err(|error| AppError::State(format!("serialize deployment.toml: {error}")))?;
     storage::write(CONFIG_FILE, content.as_bytes())
 }
 
-fn ensure_compatible_current_deployment(config: &DeploymentConfig) -> Result<()> {
+pub(crate) fn ensure_compatible_current_deployment(config: &DeploymentConfig) -> Result<()> {
     if !storage::exists(CONFIG_FILE)? {
         return Ok(());
     }
@@ -488,7 +489,7 @@ fn ensure_compatible_current_deployment(config: &DeploymentConfig) -> Result<()>
     Ok(())
 }
 
-async fn source_for_operation(config: &DeploymentConfig) -> Result<SourceClient> {
+pub(crate) async fn source_for_operation(config: &DeploymentConfig) -> Result<SourceClient> {
     if let Some(content) = storage::read(SESSION_FILE)? {
         let persisted = serde_json::from_slice(&content)
             .map_err(|error| AppError::State(format!("parse session.json: {error}")))?;
@@ -523,7 +524,7 @@ fn is_source_authentication_error(error: &SourceError) -> bool {
     }
 }
 
-fn persist_source_session(source: &SourceClient) -> Result<()> {
+pub(crate) fn persist_source_session(source: &SourceClient) -> Result<()> {
     let session = source.export_session()?;
     let content = serde_json::to_vec_pretty(&session)
         .map_err(|error| AppError::State(format!("serialize session.json: {error}")))?;
