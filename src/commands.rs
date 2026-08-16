@@ -1874,7 +1874,15 @@ mod tests {
         let path = config.directory.join("downstream-credentials.env");
         let metadata = fs::metadata(&path).expect("target credentials metadata");
         assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
-        let content = fs::read_to_string(path).expect("read target credentials");
+        let executor =
+            crate::target::TargetExecutor::new(config.target.clone(), config.directory.clone());
+        let content = String::from_utf8(
+            executor
+                .run_in_directory("cat downstream-credentials.env")
+                .expect("read target credentials through target executor")
+                .stdout,
+        )
+        .expect("target credentials are UTF-8");
         for key in [
             "MEOWAI_DEPLOYMENT_ID",
             "MEOWAI_INSTALLATION_GENERATION",
