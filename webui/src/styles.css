@@ -122,8 +122,6 @@ button:focus-visible, input:focus-visible { outline: 3px solid color-mix(in srgb
 .review-row { min-height: 48px; padding-block: 8px; display: grid; grid-template-columns: 145px minmax(0, 1fr); gap: 20px; align-items: center; }
 .review-row dt { color: var(--text-secondary); font-size: 12px; }
 .review-row dd { min-width: 0; margin: 0; overflow-wrap: anywhere; color: var(--text); font-size: 13px; font-weight: 570; }
-.review-credentials { max-width: 760px; margin-top: 26px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 18px; }
-.review-credentials.has-ssh { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 
 .sync-plan { display: flex; flex-direction: column; gap: 20px; }
 .sync-plan-loading { min-height: 240px; display: flex; align-items: center; justify-content: center; gap: 10px; color: var(--text-secondary); font-size: 13px; }
@@ -242,7 +240,6 @@ button:focus-visible, input:focus-visible { outline: 3px solid color-mix(in srgb
   .workflow-content { padding: 25px 18px 30px; }
   .form-row, .target-switch { grid-template-columns: 1fr; }
   .review-row { grid-template-columns: 100px minmax(0, 1fr); gap: 12px; }
-  .review-credentials.has-ssh { grid-template-columns: 1fr; }
   .sync-plan-heading { align-items: stretch; flex-direction: column; }
   .sync-plan-heading .secondary-action { align-self: flex-start; }
   .sync-module-list { grid-template-columns: 1fr; }

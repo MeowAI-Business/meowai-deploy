@@ -132,8 +132,8 @@ describe("deployment workbench", () => {
             completed_stages: ["input_validation", "source_connectivity"],
             failure: {
               stage: "target_validation",
-              code: "TEST_FAILURE",
-              message: "部署测试失败",
+              code: "STATUS_KEY_CONTENT_UNAVAILABLE",
+              message: "源站公共状态密钥已存在，但当前控制端没有保存密钥内容",
               retryable: true,
               diagnostic: "ssh exited with status 255",
             },
@@ -144,8 +144,8 @@ describe("deployment workbench", () => {
             timestamp: 1_700_000_000,
             stage: "target_validation",
             severity: "error",
-            kind: { type: "recoverable_failure", code: "TEST_FAILURE" },
-            message: "部署测试失败",
+            kind: { type: "recoverable_failure", code: "STATUS_KEY_CONTENT_UNAVAILABLE" },
+            message: "源站公共状态密钥已存在，但当前控制端没有保存密钥内容",
             diagnostic: "ssh exited with status 255",
           }],
         });
@@ -172,6 +172,8 @@ describe("deployment workbench", () => {
 
     await screen.findByRole("heading", { name: "确认信息" });
     expect(screen.getByText(`${bootstrap.defaults.image}@${digest}`)).toBeInTheDocument();
+    expect(screen.queryByLabelText("源站密码")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("SSH 密码")).not.toBeInTheDocument();
     const startDeployment = screen
       .getAllByRole("button", { name: /开始部署/ })
       .find((button) => !button.hasAttribute("disabled"));
@@ -185,11 +187,13 @@ describe("deployment workbench", () => {
     expect(operationRequests).toHaveLength(2);
     expect(operationRequests[0]).toMatchObject({ replace_existing: false });
     expect(operationRequests[1]).toMatchObject({ replace_existing: true });
-    expect(await screen.findByRole("button", { name: "继续部署" })).toBeInTheDocument();
+    expect(operationRequests[0]).toMatchObject({ source_password: "source-password" });
+    expect(await screen.findByRole("button", { name: "重新生成密钥并继续" })).toBeEnabled();
+    expect(screen.queryByPlaceholderText("源站登录密码")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "返回修改" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "返回确认" })).not.toBeInTheDocument();
     expect(screen.getByRole("progressbar", { name: "部署进度" })).toHaveAttribute("aria-valuenow", "20");
-    expect(screen.getByText("TEST_FAILURE")).toBeInTheDocument();
+    expect(screen.getByText("STATUS_KEY_CONTENT_UNAVAILABLE")).toBeInTheDocument();
     expect(screen.getAllByText("ssh exited with status 255")).toHaveLength(2);
     expect(screen.getByRole("region", { name: "执行记录" })).toHaveTextContent("检查部署目标");
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/preflight/source", expect.anything()));

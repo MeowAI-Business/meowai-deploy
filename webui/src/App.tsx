@@ -944,7 +944,7 @@ export default function App() {
             )}
             {activeStep === "review" && (usingSavedConfig
               ? <SyncPlanStep plan={syncPlan} loading={syncPlanLoading} draft={draft} update={update} sourceAuthRequired={syncSourceAuthRequired} sshAuthRequired={syncSshAuthRequired} selected={selectedSyncModules} onSelectedChange={setSelectedSyncModules} forceConflicts={forceSyncConflicts} onForceConflictsChange={setForceSyncConflicts} onReload={() => void loadSyncPlan()} />
-              : <ReviewStep draft={draft} update={update} />)}
+              : <ReviewStep draft={draft} />)}
             {activeStep === "operation" && (
               <OperationStep
                 status={operationStatus}
@@ -957,7 +957,7 @@ export default function App() {
                 showSshPassword={requiresSshPassword(operationFailure, draft.target)}
                 sshPassword={draft.sshPassword}
                 onSshPasswordChange={(value) => update("sshPassword", value)}
-                showSourcePassword={requiresSourcePassword(operationFailure)}
+                showSourcePassword={requiresSourcePassword(operationFailure, draft.sourcePassword)}
                 sourcePassword={draft.sourcePassword}
                 onSourcePasswordChange={(value) => update("sourcePassword", value)}
               />
@@ -982,7 +982,7 @@ export default function App() {
                 {operationStatus === "failed" && operationFailure?.retryable && (
                   <button
                     className={`primary-action ${resumingOperation ? "is-loading" : ""}`}
-                    disabled={resumingOperation || !draft.sourcePassword}
+                    disabled={resumingOperation || (requiresSourcePassword(operationFailure, draft.sourcePassword) && !draft.sourcePassword)}
                     onClick={() => operationFailure?.code === "STATUS_KEY_CONTENT_UNAVAILABLE"
                       ? setDialog("rotate-status-key")
                       : void resumeOperation()}
@@ -1248,9 +1248,8 @@ function SiteStep({ draft, update, imageCheckState, imageCheckError, imageUpdate
   );
 }
 
-function ReviewStep({ draft, update }: {
+function ReviewStep({ draft }: {
   draft: Draft;
-  update: <K extends keyof Draft>(key: K, value: Draft[K]) => void;
 }) {
   const destination = draft.target === "local" ? "当前服务器" : draft.sshDestination;
   const rows = [
@@ -1263,31 +1262,7 @@ function ReviewStep({ draft, update }: {
     ["容器镜像", draft.imageRef ? `${draft.image}@${draft.imageRef}` : draft.image],
   ];
   return (
-    <>
-      <dl className="review-list">{rows.map(([label, value]) => <div className="review-row" key={label}><dt>{label}</dt><dd>{value || "未填写"}</dd></div>)}</dl>
-      <div className={`review-credentials ${draft.target === "ssh" ? "has-ssh" : ""}`}>
-        <Field label="源站密码" hint="已保存配置不会保存密码，请在开始部署前重新输入。">
-          <input
-            type="password"
-            value={draft.sourcePassword}
-            onChange={(event) => update("sourcePassword", event.target.value)}
-            placeholder="源站登录密码"
-            autoComplete="current-password"
-          />
-        </Field>
-        {draft.target === "ssh" && (
-          <Field label="SSH 密码" hint="服务器使用密码登录时输入；使用 SSH 密钥可留空。">
-            <input
-              type="password"
-              value={draft.sshPassword}
-              onChange={(event) => update("sshPassword", event.target.value)}
-              placeholder="服务器登录密码"
-              autoComplete="current-password"
-            />
-          </Field>
-        )}
-      </div>
-    </>
+    <dl className="review-list">{rows.map(([label, value]) => <div className="review-row" key={label}><dt>{label}</dt><dd>{value || "未填写"}</dd></div>)}</dl>
   );
 }
 
@@ -1529,12 +1504,10 @@ function validateStep(step: StepKey, draft: Draft): string | null {
   return null;
 }
 
-function requiresSourcePassword(failure: OperationFailure | null): boolean {
-  return failure?.retryable === true && [
-    "SOURCE_PASSWORD_REQUIRED",
-    "SOURCE_AUTHENTICATION_FAILED",
-    "STATUS_KEY_CONTENT_UNAVAILABLE",
-  ].includes(failure.code);
+function requiresSourcePassword(failure: OperationFailure | null, sourcePassword: string): boolean {
+  if (failure?.retryable !== true) return false;
+  if (["SOURCE_PASSWORD_REQUIRED", "SOURCE_AUTHENTICATION_FAILED"].includes(failure.code)) return true;
+  return failure.code === "STATUS_KEY_CONTENT_UNAVAILABLE" && !sourcePassword;
 }
 
 function requiresSshPassword(failure: OperationFailure | null, target: DeploymentTarget): boolean {
