@@ -8,15 +8,50 @@ permissions:
   contents: read
 
 jobs:
+  prepare:
+    name: Select test platforms
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+
+      - name: Build test matrix
+        id: matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          matrix='["ubuntu-latest","macos-latest","windows-latest"]'
+          enabled="$(git show -s --format='%(trailers:key=Canary-Build,valueonly)' HEAD | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+          if [ "$enabled" = true ]; then
+            platforms="$(git show -s --format='%(trailers:key=Canary-Platforms,valueonly)' HEAD | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+            [ -n "$platforms" ] && [ "$platforms" != all ] || platforms='linux-amd64,linux-arm64,macos-amd64,macos-arm64,windows-amd64'
+            case "$platforms" in
+              *[^a-z0-9,-]*|,*|*,|*,,*) echo 'Invalid Canary-Platforms trailer' >&2; exit 1 ;;
+            esac
+            IFS=',' read -r -a selected <<< "$platforms"
+            matrix="$(printf '%s\n' "${selected[@]}" | jq -Rsc '
+              split("\n") | map(select(length > 0)) | map(
+                if . == "linux-amd64" or . == "linux-arm64" then "ubuntu-latest"
+                elif . == "macos-amd64" or . == "macos-arm64" then "macos-latest"
+                elif . == "windows-amd64" then "windows-latest"
+                else error("Unsupported Canary platform: " + .)
+                end
+              ) | unique
+            ')"
+          fi
+          printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
+
   test:
     name: Test ${{ matrix.os }}
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
+        os: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
