@@ -1,6 +1,6 @@
 use std::{net::IpAddr, path::PathBuf};
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -84,6 +84,10 @@ pub struct CleanArgs {
 
 #[derive(Debug, Args)]
 pub struct UpdateArgs {
+    /// Select the stable release or opt in to commit-based Canary builds.
+    #[arg(long, value_enum, default_value_t = UpdateChannel::Stable)]
+    pub channel: UpdateChannel,
+
     /// Check the latest release without replacing the current binary.
     #[arg(long)]
     pub check: bool,
@@ -91,6 +95,12 @@ pub struct UpdateArgs {
     /// Install an available update without asking for confirmation.
     #[arg(long)]
     pub yes: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum UpdateChannel {
+    Stable,
+    Canary,
 }
 
 #[derive(Debug, Args)]

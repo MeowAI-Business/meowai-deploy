@@ -1,0 +1,163 @@
+name: Canary CLI
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: canary-main
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    name: Read Canary trailers
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.trailers.outputs.enabled }}
+      platforms: ${{ steps.trailers.outputs.platforms }}
+      matrix: ${{ steps.trailers.outputs.matrix }}
+      source_sha: ${{ steps.trailers.outputs.source_sha }}
+      version: ${{ steps.trailers.outputs.version }}
+    steps:
+      - name: Checkout tested commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 1
+
+      - name: Parse commit trailers
+        id: trailers
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          enabled="$(git show -s --format='%(trailers:key=Canary-Build,valueonly)' "$SOURCE_SHA" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+          if [ "$enabled" != true ]; then
+            echo 'enabled=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          raw="$(git show -s --format='%(trailers:key=Canary-Platforms,valueonly)' "$SOURCE_SHA" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+          [ -n "$raw" ] && [ "$raw" != all ] || raw='linux-amd64,linux-arm64,macos-amd64,macos-arm64,windows-amd64'
+          case "$raw" in
+            *[^a-z0-9,-]*|,*|*,|*,,*) echo 'Invalid Canary-Platforms trailer' >&2; exit 1 ;;
+          esac
+          IFS=',' read -r -a selected <<< "$raw"
+          for target in "${selected[@]}"; do
+            case "$target" in
+              linux-amd64|linux-arm64|macos-amd64|macos-arm64|windows-amd64) ;;
+              *) echo "Unsupported Canary platform: $target" >&2; exit 1 ;;
+            esac
+          done
+          matrix="$(jq -cn --arg selected "$raw" '
+            ($selected | split(",")) as $targets |
+            {include: [
+              {target:"linux-amd64",runner:"ubuntu-latest",rust_target:"x86_64-unknown-linux-musl",binary:"target/x86_64-unknown-linux-musl/release/meowai-deploy"},
+              {target:"linux-arm64",runner:"ubuntu-24.04-arm",rust_target:"aarch64-unknown-linux-musl",binary:"target/aarch64-unknown-linux-musl/release/meowai-deploy"},
+              {target:"macos-amd64",runner:"macos-15-intel",rust_target:"x86_64-apple-darwin",binary:"target/x86_64-apple-darwin/release/meowai-deploy"},
+              {target:"macos-arm64",runner:"macos-15",rust_target:"aarch64-apple-darwin",binary:"target/aarch64-apple-darwin/release/meowai-deploy"},
+              {target:"windows-amd64",runner:"windows-latest",rust_target:"",binary:"target/release/meowai-deploy.exe"}
+            ] | map(. as $entry | select($targets | index($entry.target)))}
+          ')"
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+          printf 'enabled=true\nplatforms=%s\nmatrix=%s\nsource_sha=%s\nversion=%s\n' "$raw" "$matrix" "$SOURCE_SHA" "$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: prepare
+    if: needs.prepare.outputs.enabled == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout tested commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
+
+      - name: Install stable Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          if [ -n "${{ matrix.rust_target }}" ]; then rustup target add --toolchain stable "${{ matrix.rust_target }}"; fi
+
+      - name: Install musl build tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+
+      - name: Build embedded WebUI
+        shell: bash
+        run: npm ci --prefix webui && npm run build --prefix webui
+
+      - name: Build Canary archive
+        shell: bash
+        env:
+          MEOWAI_DEPLOY_BUILD_CHANNEL: canary
+          MEOWAI_DEPLOY_BUILD_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.target }}" = windows-amd64 ]; then
+            cargo +stable build --release --locked
+            ./scripts/webui-smoke.sh target/release/meowai-deploy.exe
+            mkdir -p dist/package
+            cp target/release/meowai-deploy.exe dist/package/meowai-deploy.exe
+            (cd dist/package && 7z a -tzip "../meowai-deploy-${{ matrix.target }}.zip" meowai-deploy.exe)
+          else
+            cargo +stable build --release --locked --target "${{ matrix.rust_target }}"
+            binary="${{ matrix.binary }}"
+            if [ "${{ runner.os }}" = Linux ] && readelf -l "$binary" | grep -q 'Requesting program interpreter'; then exit 1; fi
+            ./scripts/webui-smoke.sh "$binary"
+            mkdir -p dist/package
+            install -m 0755 "$binary" dist/package/meowai-deploy
+            tar -C dist/package -czf "dist/meowai-deploy-${{ matrix.target }}.tar.gz" meowai-deploy
+          fi
+
+      - name: Upload Canary archive
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: canary-${{ matrix.target }}
+          path: dist/meowai-deploy-${{ matrix.target }}.*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish Canary prerelease
+    needs: [prepare, build]
+    if: needs.prepare.outputs.enabled == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Canary archives
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: canary-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create manifest and checksum list
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+          BASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+          short_sha="${SOURCE_SHA:0:12}"
+          tag="v${BASE_VERSION}-canary.${timestamp}.${short_sha}"
+          (cd dist && sha256sum meowai-deploy-* > checksums-sha256.txt)
+          jq -n --arg channel canary --arg version "$BASE_VERSION" --arg tag "$tag" --arg commit "$SOURCE_SHA" --arg built_at "$timestamp" --arg platforms "${{ needs.prepare.outputs.platforms }}" '{channel:$channel,version:$version,tag:$tag,commit:$commit,built_at:$built_at,platforms:($platforms|split(","))}' > dist/canary-manifest.json
+          echo "tag=$tag" >> "$GITHUB_ENV"
+
+      - name: Create Canary tag and prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: |
+          gh release create "$tag" dist/meowai-deploy-* dist/checksums-sha256.txt dist/canary-manifest.json --target "$SOURCE_SHA" --prerelease --generate-notes --title "$tag"

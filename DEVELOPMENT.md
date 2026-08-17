@@ -41,3 +41,5 @@ Use `MEOWAI_DEPLOY_RELEASE_BASE_URL` to test another release host and `MEOWAI_DE
 ## Release process
 
 Release tags use `v<version>` and must match the version in `Cargo.toml`. Pushing a tag builds Linux and macOS archives for amd64 and arm64, creates a combined SHA256 checksum file, and publishes a GitHub Release. Publishing a Release manually runs the same build and uploads or replaces its assets.
+
+To publish a commit-based Canary build, add `Canary-Build: true` to the commit trailers. `Canary-Platforms` is optional and defaults to `all`; otherwise use a comma-separated subset of the supported release targets. The Canary workflow starts only after the ordinary `CI` workflow succeeds, builds the selected platforms, and creates the prerelease tag only after all selected archives pass.

@@ -102,10 +102,11 @@ It verifies `meowai-deploy-windows-amd64.zip`, installs to `%LOCALAPPDATA%\\Prog
 meowai-deploy --version
 meowai-deploy update --check
 meowai-deploy update
-meowai-deploy update --yes
+meowai-deploy update --channel canary --check
+meowai-deploy update --channel canary --yes
 ```
 
-Installed release builds check GitHub Releases at most once every 24 hours in an interactive terminal. A failed check never blocks `doctor`, `onboard`, `sync`, or `status`. The check timestamp is stored in `~/.meowai-deploy/update-check.json`; set `MEOWAI_DEPLOY_DISABLE_UPDATE_CHECK=1` to disable periodic checks.
+Installed release builds check stable GitHub Releases at most once every 24 hours in an interactive terminal. Canary is opt-in and never used by the periodic check. A failed check never blocks `doctor`, `onboard`, `sync`, or `status`. The check timestamp is stored in `~/.meowai-deploy/update-check.json`; set `MEOWAI_DEPLOY_DISABLE_UPDATE_CHECK=1` to disable periodic checks.
 
 ## Common commands
 
@@ -171,5 +172,16 @@ meowai-deploy doctor --json
 Detailed logs are written to `~/.meowai-deploy/meowai-deploy.log`. Set `MEOWAI_DEPLOY_LOG` to change the log filter. An update check failure never blocks deployment or synchronization.
 
 Release tags use `v<version>` and must match the version in `Cargo.toml`. Pushing such a tag creates a GitHub Release with Linux and macOS archives for amd64 and arm64, a Windows amd64 ZIP containing `meowai-deploy.exe`, and a combined SHA256 checksum file. Publishing a Release manually runs the same build and uploads or replaces those assets. Windows self-update selects the `windows-amd64` asset and handles the `.exe` archive path.
+
+### Canary builds
+
+Add these Git trailers to a commit on `main` when it should produce an opt-in commit build after the normal CI passes:
+
+```text
+Canary-Build: true
+Canary-Platforms: all
+```
+
+`Canary-Platforms` defaults to `all` and accepts a comma-separated subset of `linux-amd64`, `linux-arm64`, `macos-amd64`, `macos-arm64`, and `windows-amd64`. The Canary workflow publishes a prerelease tag containing the base version, UTC timestamp, and source commit SHA, plus platform archives, checksums, and a manifest. Canary updates are never selected unless `--channel canary` is passed.
 
 For local development, registry overrides, installer customization, and the release process, see [DEVELOPMENT.md](DEVELOPMENT.md).

@@ -40,6 +40,18 @@ fn help_lists_supported_commands() {
 }
 
 #[test]
+fn update_help_exposes_stable_and_canary_channels() {
+    let output = binary()
+        .args(["update", "--help"])
+        .output()
+        .expect("run update help");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--channel <CHANNEL>"));
+    assert!(stdout.contains("stable, canary"));
+}
+
+#[test]
 fn no_args_prints_help_without_starting_onboard() {
     let output = binary().output().expect("run without arguments");
     assert!(output.status.success());

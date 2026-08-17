@@ -6,7 +6,7 @@ use self_update::{backends::github, update::ReleaseUpdate};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    cli::UpdateArgs,
+    cli::{UpdateArgs, UpdateChannel},
     error::{AppError, Result},
     state::unix_timestamp,
     storage::{self, UPDATE_CHECK_FILE},
@@ -24,13 +24,24 @@ struct UpdateCheckState {
 
 struct LatestRelease {
     version: String,
+    tag: String,
+    commit: Option<String>,
 }
 
+const BUILD_CHANNEL: &str = match option_env!("MEOWAI_DEPLOY_BUILD_CHANNEL") {
+    Some(value) => value,
+    None => "stable",
+};
+const BUILD_SHA: &str = match option_env!("MEOWAI_DEPLOY_BUILD_SHA") {
+    Some(value) => value,
+    None => "",
+};
+
 pub async fn run(args: &UpdateArgs) -> Result<()> {
-    let latest = fetch_latest_release().await?;
+    let latest = fetch_latest_release(args.channel).await?;
     let current = env!("CARGO_PKG_VERSION");
-    let available = is_newer(current, &latest.version)?;
-    print_versions(current, &latest.version, available);
+    let available = update_is_available(args.channel, current, &latest)?;
+    print_versions(args.channel, current, &latest, available);
     persist_check(Some(latest.version.clone()))?;
 
     if args.check || !available {
@@ -44,7 +55,7 @@ pub async fn run(args: &UpdateArgs) -> Result<()> {
     }
     release_target(env::consts::OS, env::consts::ARCH)?;
     if !args.yes {
-        let confirmed = confirm(format!("更新到 v{}？", latest.version))
+        let confirmed = confirm(format!("更新到 {}？", release_label(args.channel, &latest)))
             .initial_value(true)
             .interact()
             .map_err(AppError::from_prompt)?;
@@ -53,15 +64,15 @@ pub async fn run(args: &UpdateArgs) -> Result<()> {
         }
     }
 
-    let version = latest.version.clone();
-    tokio::task::spawn_blocking(move || install_release(&version))
+    let tag = latest.tag.clone();
+    tokio::task::spawn_blocking(move || install_release(&tag))
         .await
         .map_err(|error| AppError::Message(format!("update task failed: {error}")))??;
     println!();
     println!(
         "{} {}",
         style("✓").green(),
-        style(format!("已更新到 v{}", latest.version)).bold()
+        style(format!("已更新到 {}", release_label(args.channel, &latest))).bold()
     );
     println!();
     Ok(())
@@ -75,7 +86,7 @@ pub async fn check_periodically() {
     {
         return;
     }
-    match fetch_latest_release().await {
+    match fetch_latest_release(UpdateChannel::Stable).await {
         Ok(latest) => {
             let current = env!("CARGO_PKG_VERSION");
             if is_newer(current, &latest.version).unwrap_or(false) {
@@ -98,25 +109,64 @@ pub async fn check_periodically() {
     }
 }
 
-async fn fetch_latest_release() -> Result<LatestRelease> {
-    tokio::task::spawn_blocking(|| {
-        let updater = update_builder(false)?;
-        let release = updater
-            .get_latest_release()
-            .map_err(|error| AppError::Message(format!("check GitHub release: {error}")))?;
-        Ok(LatestRelease {
-            version: release.version,
-        })
+async fn fetch_latest_release(channel: UpdateChannel) -> Result<LatestRelease> {
+    tokio::task::spawn_blocking(move || match channel {
+        UpdateChannel::Stable => {
+            let updater = update_builder(false)?;
+            let release = updater
+                .get_latest_release()
+                .map_err(|error| AppError::Message(format!("check GitHub release: {error}")))?;
+            Ok(LatestRelease {
+                tag: format!("v{}", release.version),
+                version: release.version,
+                commit: None,
+            })
+        }
+        UpdateChannel::Canary => fetch_latest_canary(),
     })
     .await
     .map_err(|error| AppError::Message(format!("release check task failed: {error}")))?
 }
 
-fn install_release(version: &str) -> Result<()> {
+fn fetch_latest_canary() -> Result<LatestRelease> {
+    let target = release_target(env::consts::OS, env::consts::ARCH)?;
+    let mut builder = github::ReleaseList::configure();
+    builder
+        .repo_owner(REPOSITORY_OWNER)
+        .repo_name(REPOSITORY_NAME)
+        .with_target(target);
+    if let Ok(url) = env::var("MEOWAI_DEPLOY_GITHUB_API_URL") {
+        builder.with_url(url.trim_end_matches('/'));
+    }
+    if let Ok(token) = env::var("GITHUB_TOKEN") {
+        builder.auth_token(&token);
+    }
+    let releases = builder
+        .build()
+        .map_err(|error| AppError::Message(format!("configure Canary release check: {error}")))?
+        .fetch()
+        .map_err(|error| AppError::Message(format!("check GitHub Canary releases: {error}")))?;
+    releases
+        .into_iter()
+        .find_map(|release| {
+            parse_canary_version(&release.version).map(|commit| LatestRelease {
+                tag: format!("v{}", release.version),
+                version: release.version,
+                commit: Some(commit),
+            })
+        })
+        .ok_or_else(|| {
+            AppError::Message(format!(
+                "no Canary release is available for {target}; use `meowai-deploy update --channel stable`"
+            ))
+        })
+}
+
+fn install_release(tag: &str) -> Result<()> {
     let mut builder = github::Update::configure();
     configure_builder(&mut builder)?;
     let updater = builder
-        .target_version_tag(&format!("v{version}"))
+        .target_version_tag(tag)
         .show_download_progress(true)
         .show_output(false)
         .no_confirm(true)
@@ -188,6 +238,34 @@ fn is_newer(current: &str, latest: &str) -> Result<bool> {
         .map_err(|error| AppError::Message(format!("compare release versions: {error}")))
 }
 
+fn parse_canary_version(version: &str) -> Option<String> {
+    let (_, suffix) = version.split_once("-canary.")?;
+    let commit = suffix.rsplit('.').next()?;
+    if (7..=40).contains(&commit.len()) && commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Some(commit.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+fn update_is_available(
+    channel: UpdateChannel,
+    current: &str,
+    latest: &LatestRelease,
+) -> Result<bool> {
+    match channel {
+        UpdateChannel::Stable => is_newer(current, &latest.version),
+        UpdateChannel::Canary => {
+            let latest_commit = latest.commit.as_deref().ok_or_else(|| {
+                AppError::Message("Canary release is missing its commit identity".to_owned())
+            })?;
+            Ok(BUILD_CHANNEL != "canary"
+                || BUILD_SHA.is_empty()
+                || !BUILD_SHA.to_ascii_lowercase().starts_with(latest_commit))
+        }
+    }
+}
+
 fn check_is_due() -> bool {
     let Some(content) = storage::read(UPDATE_CHECK_FILE).ok().flatten() else {
         return true;
@@ -207,11 +285,33 @@ fn persist_check(latest_version: Option<String>) -> Result<()> {
     storage::write(UPDATE_CHECK_FILE, &content)
 }
 
-fn print_versions(current: &str, latest: &str, available: bool) {
+fn release_label(channel: UpdateChannel, latest: &LatestRelease) -> String {
+    match channel {
+        UpdateChannel::Stable => format!("v{}", latest.version),
+        UpdateChannel::Canary => latest.tag.clone(),
+    }
+}
+
+fn print_versions(channel: UpdateChannel, current: &str, latest: &LatestRelease, available: bool) {
     println!();
     println!("{}", style("CLI 版本").bold());
-    println!("  当前版本  v{current}");
-    println!("  最新版本  v{latest}");
+    println!(
+        "  更新通道  {}",
+        match channel {
+            UpdateChannel::Stable => "stable",
+            UpdateChannel::Canary => "canary",
+        }
+    );
+    let current_label = if BUILD_CHANNEL == "canary" && !BUILD_SHA.is_empty() {
+        format!(
+            "v{current} canary {}",
+            &BUILD_SHA[..BUILD_SHA.len().min(12)]
+        )
+    } else {
+        format!("v{current} stable")
+    };
+    println!("  当前版本  {current_label}");
+    println!("  最新版本  {}", release_label(channel, latest));
     println!(
         "  状态      {}",
         if available {
@@ -232,6 +332,29 @@ mod tests {
         assert!(is_newer("0.9.0", "0.10.0").expect("compare versions"));
         assert!(!is_newer("1.2.0", "1.2.0").expect("compare versions"));
         assert!(!is_newer("2.0.0", "1.9.9").expect("compare versions"));
+    }
+
+    #[test]
+    fn canary_versions_carry_a_commit_identity() {
+        assert_eq!(
+            parse_canary_version("1.2.1-canary.20260817T093012Z.e7717f9").as_deref(),
+            Some("e7717f9")
+        );
+        assert!(parse_canary_version("1.2.1").is_none());
+        assert!(parse_canary_version("1.2.1-canary.now.not-a-sha").is_none());
+    }
+
+    #[test]
+    fn stable_builds_can_opt_in_to_the_latest_canary() {
+        let latest = LatestRelease {
+            version: "1.2.1-canary.20260817T093012Z.e7717f9".to_owned(),
+            tag: "v1.2.1-canary.20260817T093012Z.e7717f9".to_owned(),
+            commit: Some("e7717f9".to_owned()),
+        };
+        assert!(
+            update_is_available(UpdateChannel::Canary, "1.2.1", &latest)
+                .expect("compare Canary commit")
+        );
     }
 
     #[test]

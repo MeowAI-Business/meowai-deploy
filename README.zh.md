@@ -51,9 +51,12 @@ New API 默认监听 `3000` 端口，Uptime Kuma 默认监听 `3001` 端口；�
 | `meowai-deploy sync --pricing` | 额外重新导入价格、Seedance 和市场配置 |
 | `meowai-deploy update --check` | 检查 CLI 新版本 |
 | `meowai-deploy update` | 更新到最新 CLI 版本 |
+| `meowai-deploy update --channel canary` | 更新到当前平台最新的 Canary commit 构建 |
 | `meowai-deploy logout` | 仅删除本地保存的源站登录会话 |
 
 使用 `meowai-deploy <命令> --help` 查看完整参数。
+
+默认更新通道为 `stable`，后台周期检查也只检查正式版本。Canary 必须通过 `--channel canary` 明确选择，不会自动安装。维护者可以在 `main` commit 末尾添加 `Canary-Build: true` trailer 生成 Canary prerelease；`Canary-Platforms` 省略或设为 `all` 时构建所有平台，也可以填写逗号分隔的平台子集。
 
 ## 自动化部署
 
