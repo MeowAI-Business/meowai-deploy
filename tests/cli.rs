@@ -52,6 +52,16 @@ fn update_help_exposes_stable_and_canary_channels() {
 }
 
 #[test]
+fn version_reports_the_embedded_build_version() {
+    let output = binary().arg("--version").output().expect("run version");
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        format!("meowai-deploy {}", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
 fn no_args_prints_help_without_starting_onboard() {
     let output = binary().output().expect("run without arguments");
     assert!(output.status.success());

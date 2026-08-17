@@ -32,6 +32,10 @@ const BUILD_CHANNEL: &str = match option_env!("MEOWAI_DEPLOY_BUILD_CHANNEL") {
     Some(value) => value,
     None => "stable",
 };
+pub(crate) const BUILD_VERSION: &str = match option_env!("MEOWAI_DEPLOY_BUILD_VERSION") {
+    Some(value) => value,
+    None => env!("CARGO_PKG_VERSION"),
+};
 const BUILD_SHA: &str = match option_env!("MEOWAI_DEPLOY_BUILD_SHA") {
     Some(value) => value,
     None => "",
@@ -41,7 +45,7 @@ pub async fn run(args: &UpdateArgs) -> Result<()> {
     let latest = fetch_latest_release(args.channel).await?;
     let current = env!("CARGO_PKG_VERSION");
     let available = update_is_available(args.channel, current, &latest)?;
-    print_versions(args.channel, current, &latest, available);
+    print_versions(args.channel, &latest, available);
     persist_check(Some(latest.version.clone()))?;
 
     if args.check || !available {
@@ -292,7 +296,7 @@ fn release_label(channel: UpdateChannel, latest: &LatestRelease) -> String {
     }
 }
 
-fn print_versions(channel: UpdateChannel, current: &str, latest: &LatestRelease, available: bool) {
+fn print_versions(channel: UpdateChannel, latest: &LatestRelease, available: bool) {
     println!();
     println!("{}", style("CLI 版本").bold());
     println!(
@@ -302,13 +306,10 @@ fn print_versions(channel: UpdateChannel, current: &str, latest: &LatestRelease,
             UpdateChannel::Canary => "canary",
         }
     );
-    let current_label = if BUILD_CHANNEL == "canary" && !BUILD_SHA.is_empty() {
-        format!(
-            "v{current} canary {}",
-            &BUILD_SHA[..BUILD_SHA.len().min(12)]
-        )
+    let current_label = if BUILD_CHANNEL == "canary" {
+        format!("v{BUILD_VERSION}")
     } else {
-        format!("v{current} stable")
+        format!("v{BUILD_VERSION} stable")
     };
     println!("  当前版本  {current_label}");
     println!("  最新版本  {}", release_label(channel, latest));

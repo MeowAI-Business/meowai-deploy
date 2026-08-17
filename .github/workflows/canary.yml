@@ -24,6 +24,9 @@ jobs:
       matrix: ${{ steps.trailers.outputs.matrix }}
       source_sha: ${{ steps.trailers.outputs.source_sha }}
       version: ${{ steps.trailers.outputs.version }}
+      canary_version: ${{ steps.trailers.outputs.canary_version }}
+      tag: ${{ steps.trailers.outputs.tag }}
+      built_at: ${{ steps.trailers.outputs.built_at }}
     steps:
       - name: Checkout tested commit
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -66,7 +69,12 @@ jobs:
             ] | map(. as $entry | select($targets | index($entry.target)))}
           ')"
           version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
-          printf 'enabled=true\nplatforms=%s\nmatrix=%s\nsource_sha=%s\nversion=%s\n' "$raw" "$matrix" "$SOURCE_SHA" "$version" >> "$GITHUB_OUTPUT"
+          built_at="$(date -u +%Y%m%dT%H%M%SZ)"
+          short_sha="${SOURCE_SHA:0:12}"
+          canary_version="${version}-canary.${built_at}.${short_sha}"
+          tag="v${canary_version}"
+          printf 'enabled=true\nplatforms=%s\nmatrix=%s\nsource_sha=%s\nversion=%s\ncanary_version=%s\ntag=%s\nbuilt_at=%s\n' \
+            "$raw" "$matrix" "$SOURCE_SHA" "$version" "$canary_version" "$tag" "$built_at" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ matrix.target }}
@@ -100,6 +108,7 @@ jobs:
         shell: bash
         env:
           MEOWAI_DEPLOY_BUILD_CHANNEL: canary
+          MEOWAI_DEPLOY_BUILD_VERSION: ${{ needs.prepare.outputs.canary_version }}
           MEOWAI_DEPLOY_BUILD_SHA: ${{ needs.prepare.outputs.source_sha }}
         run: |
           set -euo pipefail
@@ -145,19 +154,18 @@ jobs:
         env:
           SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
           BASE_VERSION: ${{ needs.prepare.outputs.version }}
+          CANARY_TAG: ${{ needs.prepare.outputs.tag }}
+          BUILT_AT: ${{ needs.prepare.outputs.built_at }}
         run: |
           set -euo pipefail
-          timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-          short_sha="${SOURCE_SHA:0:12}"
-          tag="v${BASE_VERSION}-canary.${timestamp}.${short_sha}"
           (cd dist && sha256sum meowai-deploy-* > checksums-sha256.txt)
-          jq -n --arg channel canary --arg version "$BASE_VERSION" --arg tag "$tag" --arg commit "$SOURCE_SHA" --arg built_at "$timestamp" --arg platforms "${{ needs.prepare.outputs.platforms }}" '{channel:$channel,version:$version,tag:$tag,commit:$commit,built_at:$built_at,platforms:($platforms|split(","))}' > dist/canary-manifest.json
-          echo "tag=$tag" >> "$GITHUB_ENV"
+          jq -n --arg channel canary --arg version "$BASE_VERSION" --arg tag "$CANARY_TAG" --arg commit "$SOURCE_SHA" --arg built_at "$BUILT_AT" --arg platforms "${{ needs.prepare.outputs.platforms }}" '{channel:$channel,version:$version,tag:$tag,commit:$commit,built_at:$built_at,platforms:($platforms|split(","))}' > dist/canary-manifest.json
 
       - name: Create Canary tag and prerelease
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+          CANARY_TAG: ${{ needs.prepare.outputs.tag }}
         run: |
-          gh release create "$tag" dist/meowai-deploy-* dist/checksums-sha256.txt dist/canary-manifest.json --target "$SOURCE_SHA" --prerelease --generate-notes --title "$tag"
+          gh release create "$CANARY_TAG" dist/meowai-deploy-* dist/checksums-sha256.txt dist/canary-manifest.json --target "$SOURCE_SHA" --prerelease --generate-notes --title "$CANARY_TAG"

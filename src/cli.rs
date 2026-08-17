@@ -5,7 +5,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 #[derive(Debug, Parser)]
 #[command(
     name = "meowai-deploy",
-    version,
+    version = crate::updater::BUILD_VERSION,
     about = "Deploy and operate a downstream New API site",
     long_about = "meowai-deploy is the Rust CLI for the MeowAI onboard workflow."
 )]
