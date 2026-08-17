@@ -94,7 +94,7 @@ From `cmd.exe`, invoke the same user-scoped installer with:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%TEMP%\\meowai-deploy-install.ps1"
 ```
 
-It detects amd64 or arm64 Windows, verifies the matching `meowai-deploy-windows-<arch>.zip`, installs to `%LOCALAPPDATA%\\Programs\\meowai-deploy`, and updates the user-level `PATH` without requiring administrator rights. Set `MEOWAI_DEPLOY_RELEASE_BASE_URL` or `MEOWAI_DEPLOY_INSTALL_DIR` before running it to use a mirror or another user-owned directory.
+It detects amd64 or arm64 Windows, verifies the matching `meowai-deploy-windows-<arch>.zip`, and installs a self-contained executable that does not require `VCRUNTIME140.dll`. It installs to `%LOCALAPPDATA%\\Programs\\meowai-deploy` and updates the user-level `PATH` without requiring administrator rights. Set `MEOWAI_DEPLOY_RELEASE_BASE_URL` or `MEOWAI_DEPLOY_INSTALL_DIR` before running it to use a mirror or another user-owned directory.
 
 ## Version updates
 

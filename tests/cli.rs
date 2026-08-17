@@ -224,6 +224,13 @@ fn windows_release_binaries_cover_amd64_and_arm64() {
             );
         }
     }
+    let cargo_config =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(".cargo/config.toml"))
+            .expect("read Cargo target configuration");
+    for target in ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"] {
+        assert!(cargo_config.contains(&format!("[target.{target}]")));
+        assert!(cargo_config.contains("target-feature=+crt-static"));
+    }
 }
 
 #[test]
