@@ -223,6 +223,7 @@ fn release_target(operating_system: &str, architecture: &str) -> Result<&'static
         ("macos", "x86_64") => Ok("macos-amd64"),
         ("macos", "aarch64") => Ok("macos-arm64"),
         ("windows", "x86_64") => Ok("windows-amd64"),
+        ("windows", "aarch64") => Ok("windows-arm64"),
         _ => Err(AppError::Message(format!(
             "automatic updates do not support {operating_system}/{architecture}"
         ))),
@@ -368,11 +369,15 @@ mod tests {
             release_target("windows", "x86_64").unwrap(),
             "windows-amd64"
         );
+        assert_eq!(
+            release_target("windows", "aarch64").unwrap(),
+            "windows-arm64"
+        );
     }
 
     #[test]
     fn unsupported_release_targets_are_rejected() {
-        assert!(release_target("windows", "aarch64").is_err());
+        assert!(release_target("windows", "riscv64").is_err());
         assert!(release_target("freebsd", "x86_64").is_err());
     }
 }

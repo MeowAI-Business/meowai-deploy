@@ -9,7 +9,7 @@ English | [简体中文](README.zh.md)
 The machine running the CLI must have:
 
 - Linux or macOS on amd64 or arm64
-- Windows 10/11 on amd64 when controlling a Linux target over OpenSSH
+- Windows 10/11 on amd64 or arm64 when controlling a Linux target over OpenSSH
 - `curl`
 - Docker with the Compose plugin for local deployments
 - `ssh` and `scp` for remote deployments
@@ -94,7 +94,7 @@ From `cmd.exe`, invoke the same user-scoped installer with:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%TEMP%\\meowai-deploy-install.ps1"
 ```
 
-It verifies `meowai-deploy-windows-amd64.zip`, installs to `%LOCALAPPDATA%\\Programs\\meowai-deploy`, and updates the user-level `PATH` without requiring administrator rights. Set `MEOWAI_DEPLOY_RELEASE_BASE_URL` or `MEOWAI_DEPLOY_INSTALL_DIR` before running it to use a mirror or another user-owned directory.
+It detects amd64 or arm64 Windows, verifies the matching `meowai-deploy-windows-<arch>.zip`, installs to `%LOCALAPPDATA%\\Programs\\meowai-deploy`, and updates the user-level `PATH` without requiring administrator rights. Set `MEOWAI_DEPLOY_RELEASE_BASE_URL` or `MEOWAI_DEPLOY_INSTALL_DIR` before running it to use a mirror or another user-owned directory.
 
 ## Version updates
 
@@ -171,7 +171,7 @@ meowai-deploy doctor --json
 
 Detailed logs are written to `~/.meowai-deploy/meowai-deploy.log`. Set `MEOWAI_DEPLOY_LOG` to change the log filter. An update check failure never blocks deployment or synchronization.
 
-Release tags use `v<version>` and must match the version in `Cargo.toml`. Pushing such a tag creates a GitHub Release with Linux and macOS archives for amd64 and arm64, a Windows amd64 ZIP containing `meowai-deploy.exe`, and a combined SHA256 checksum file. Publishing a Release manually runs the same build and uploads or replaces those assets. Windows self-update selects the `windows-amd64` asset and handles the `.exe` archive path.
+Release tags use `v<version>` and must match the version in `Cargo.toml`. Pushing such a tag creates a GitHub Release with Linux, macOS, and Windows archives for amd64 and arm64 plus a combined SHA256 checksum file. Publishing a Release manually runs the same build and uploads or replaces those assets. Windows self-update selects the native `windows-amd64` or `windows-arm64` asset and handles the `.exe` archive path.
 
 ### Canary builds
 
@@ -182,6 +182,6 @@ Canary-Build: true
 Canary-Platforms: all
 ```
 
-`Canary-Platforms` defaults to `all` and accepts a comma-separated subset of `linux-amd64`, `linux-arm64`, `macos-amd64`, `macos-arm64`, and `windows-amd64`. The Canary workflow publishes a prerelease tag containing the base version, UTC timestamp, and source commit SHA, plus platform archives, checksums, and a manifest. Canary updates are never selected unless `--channel canary` is passed.
+`Canary-Platforms` defaults to `all` and accepts a comma-separated subset of `linux-amd64`, `linux-arm64`, `macos-amd64`, `macos-arm64`, `windows-amd64`, and `windows-arm64`. The Canary workflow publishes a prerelease tag containing the base version, UTC timestamp, and source commit SHA, plus platform archives, checksums, and a manifest. Canary updates are never selected unless `--channel canary` is passed.
 
 For local development, registry overrides, installer customization, and the release process, see [DEVELOPMENT.md](DEVELOPMENT.md).

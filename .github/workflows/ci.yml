@@ -28,7 +28,7 @@ jobs:
           enabled="$(git show -s --format='%(trailers:key=Canary-Build,valueonly)' HEAD | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
           if [ "$enabled" = true ]; then
             platforms="$(git show -s --format='%(trailers:key=Canary-Platforms,valueonly)' HEAD | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
-            [ -n "$platforms" ] && [ "$platforms" != all ] || platforms='linux-amd64,linux-arm64,macos-amd64,macos-arm64,windows-amd64'
+            [ -n "$platforms" ] && [ "$platforms" != all ] || platforms='linux-amd64,linux-arm64,macos-amd64,macos-arm64,windows-amd64,windows-arm64'
             case "$platforms" in
               *[^a-z0-9,-]*|,*|*,|*,,*) echo 'Invalid Canary-Platforms trailer' >&2; exit 1 ;;
             esac
@@ -38,6 +38,7 @@ jobs:
                 if . == "linux-amd64" or . == "linux-arm64" then "ubuntu-latest"
                 elif . == "macos-amd64" or . == "macos-arm64" then "macos-latest"
                 elif . == "windows-amd64" then "windows-latest"
+                elif . == "windows-arm64" then "windows-11-arm"
                 else error("Unsupported Canary platform: " + .)
                 end
               ) | unique
@@ -105,21 +106,34 @@ jobs:
           New-Item -ItemType Directory -Path $mirror -Force | Out-Null
           $package = Join-Path $env:RUNNER_TEMP 'package'
           New-Item -ItemType Directory -Path $package -Force | Out-Null
+          $targetArch = if ($env:RUNNER_ARCH -eq 'ARM64') { 'arm64' } else { 'amd64' }
+          $artifactName = "meowai-deploy-windows-$targetArch.zip"
           Set-Content -LiteralPath (Join-Path $package 'meowai-deploy.exe') -Value 'smoke-binary' -NoNewline
-          Compress-Archive -Path (Join-Path $package 'meowai-deploy.exe') -DestinationPath (Join-Path $mirror 'meowai-deploy-windows-amd64.zip') -Force
-          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $mirror 'meowai-deploy-windows-amd64.zip')).Hash.ToLowerInvariant()
-          Set-Content -LiteralPath (Join-Path $mirror 'checksums-sha256.txt') -Value "$hash  meowai-deploy-windows-amd64.zip" -NoNewline
+          Compress-Archive -Path (Join-Path $package 'meowai-deploy.exe') -DestinationPath (Join-Path $mirror $artifactName) -Force
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $mirror $artifactName)).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath (Join-Path $mirror 'checksums-sha256.txt') -Value "$hash  $artifactName" -NoNewline
           $port = 18765
           $server = Start-Process -FilePath python -ArgumentList @('-m','http.server',$port,'--directory',$mirror) -PassThru -WindowStyle Hidden
           try {
             $env:MEOWAI_DEPLOY_RELEASE_BASE_URL = "http://127.0.0.1:$port"
             $env:MEOWAI_DEPLOY_INSTALL_DIR = $install
+            $serverReady = $false
+            for ($attempt = 0; $attempt -lt 20; $attempt++) {
+              try {
+                Invoke-WebRequest -UseBasicParsing -Uri "$env:MEOWAI_DEPLOY_RELEASE_BASE_URL/checksums-sha256.txt" | Out-Null
+                $serverReady = $true
+                break
+              } catch {
+                Start-Sleep -Milliseconds 250
+              }
+            }
+            if (-not $serverReady) { throw 'installer mirror did not become ready' }
             & (Join-Path $env:GITHUB_WORKSPACE 'install.ps1')
             if (-not (Test-Path (Join-Path $install 'meowai-deploy.exe'))) { throw 'installer did not write the executable' }
             & (Join-Path $env:GITHUB_WORKSPACE 'install.ps1')
             $userPath = [Environment]::GetEnvironmentVariable('Path','User') -split ';'
             if (($userPath | Where-Object { $_ -ieq $install }).Count -ne 1) { throw 'installer did not keep PATH idempotent' }
-            Set-Content -LiteralPath (Join-Path $mirror 'checksums-sha256.txt') -Value ('0' * 64 + '  meowai-deploy-windows-amd64.zip') -NoNewline
+            Set-Content -LiteralPath (Join-Path $mirror 'checksums-sha256.txt') -Value ('0' * 64 + "  $artifactName") -NoNewline
             $failed = $false
             try { & (Join-Path $env:GITHUB_WORKSPACE 'install.ps1') } catch { $failed = $true }
             if (-not $failed) { throw 'installer accepted an invalid checksum' }

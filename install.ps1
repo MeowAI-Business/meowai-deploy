@@ -11,7 +11,6 @@ $installDir = if ($env:MEOWAI_DEPLOY_INSTALL_DIR) {
 } else {
     Join-Path $env:LOCALAPPDATA 'Programs\meowai-deploy'
 }
-$artifactName = 'meowai-deploy-windows-amd64.zip'
 $checksumName = 'checksums-sha256.txt'
 $temporaryDir = Join-Path ([IO.Path]::GetTempPath()) ('meowai-deploy.' + [Guid]::NewGuid().ToString('N'))
 
@@ -37,9 +36,18 @@ try {
     } else {
         $env:PROCESSOR_ARCHITECTURE
     }
-    if (-not [Environment]::Is64BitOperatingSystem -or $effectiveArchitecture -notin @('AMD64', 'x86_64')) {
-        throw 'meowai-deploy Windows installer supports amd64 only.'
+    if (-not [Environment]::Is64BitOperatingSystem) {
+        throw 'meowai-deploy Windows installer supports 64-bit Windows only.'
     }
+    $normalizedArchitecture = $effectiveArchitecture.ToUpperInvariant()
+    if ($normalizedArchitecture -in @('AMD64', 'X86_64')) {
+        $targetArch = 'amd64'
+    } elseif ($normalizedArchitecture -in @('ARM64', 'AARCH64')) {
+        $targetArch = 'arm64'
+    } else {
+        throw "meowai-deploy Windows installer does not support architecture $effectiveArchitecture."
+    }
+    $artifactName = "meowai-deploy-windows-$targetArch.zip"
 
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     New-Item -ItemType Directory -Path $temporaryDir -Force | Out-Null

@@ -97,14 +97,28 @@ jobs:
           retention-days: 1
 
   build-windows:
-    name: Build windows-amd64
-    runs-on: windows-latest
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: windows-amd64
+            runner: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            binary: target/x86_64-pc-windows-msvc/release/meowai-deploy.exe
+          - target: windows-arm64
+            runner: windows-11-arm
+            rust_target: aarch64-pc-windows-msvc
+            binary: target/aarch64-pc-windows-msvc/release/meowai-deploy.exe
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install stable Rust
-        run: rustup toolchain install stable --profile minimal
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add --toolchain stable "${{ matrix.rust_target }}"
 
       - name: Build embedded WebUI
         run: |
@@ -118,9 +132,9 @@ jobs:
             ~\.cargo\registry
             ~\.cargo\git
             target
-          key: ${{ runner.os }}-windows-amd64-cargo-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-windows-amd64-cargo-
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
 
       - name: Verify tag matches Cargo version
         shell: pwsh
@@ -131,20 +145,20 @@ jobs:
       - name: Build release archive
         shell: pwsh
         run: |
-          cargo +stable build --release --locked
+          cargo +stable build --release --locked --target "${{ matrix.rust_target }}"
           New-Item -ItemType Directory -Path dist\package -Force | Out-Null
-          Copy-Item target\release\meowai-deploy.exe dist\package\meowai-deploy.exe
-          Compress-Archive -Path dist\package\meowai-deploy.exe -DestinationPath dist\meowai-deploy-windows-amd64.zip -CompressionLevel Optimal
+          Copy-Item "${{ matrix.binary }}" dist\package\meowai-deploy.exe
+          Compress-Archive -Path dist\package\meowai-deploy.exe -DestinationPath "dist\meowai-deploy-${{ matrix.target }}.zip" -CompressionLevel Optimal
 
       - name: Smoke test embedded WebUI
         shell: bash
-        run: ./scripts/webui-smoke.sh target/release/meowai-deploy.exe
+        run: ./scripts/webui-smoke.sh "${{ matrix.binary }}"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: meowai-deploy-windows-amd64
-          path: dist/meowai-deploy-windows-amd64.zip
+          name: meowai-deploy-${{ matrix.target }}
+          path: dist/meowai-deploy-${{ matrix.target }}.zip
           if-no-files-found: error
           retention-days: 1
 

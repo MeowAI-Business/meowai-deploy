@@ -34,12 +34,12 @@ Set `MEOWAI_DEPLOY_HOME` to an absolute path to use an isolated CLI state direct
 
 ## Installer overrides
 
-The installer supports Linux and macOS on amd64 and arm64. Linux release binaries are statically linked with musl and do not depend on the target server's glibc version. It verifies the selected release archive against `checksums-sha256.txt` before installing it to `~/.local/bin`.
+The installers support Linux, macOS, and Windows on amd64 and arm64. Linux release binaries are statically linked with musl and do not depend on the target server's glibc version. Each installer verifies the selected release archive against `checksums-sha256.txt`; Unix installs to `~/.local/bin`, while Windows installs to the current user's local programs directory.
 
 Use `MEOWAI_DEPLOY_RELEASE_BASE_URL` to test another release host and `MEOWAI_DEPLOY_INSTALL_DIR` to change the installation directory.
 
 ## Release process
 
-Release tags use `v<version>` and must match the version in `Cargo.toml`. Pushing a tag builds Linux and macOS archives for amd64 and arm64, creates a combined SHA256 checksum file, and publishes a GitHub Release. Publishing a Release manually runs the same build and uploads or replaces its assets.
+Release tags use `v<version>` and must match the version in `Cargo.toml`. Pushing a tag builds Linux, macOS, and Windows archives for amd64 and arm64, creates a combined SHA256 checksum file, and publishes a GitHub Release. Publishing a Release manually runs the same build and uploads or replaces its assets.
 
 To publish a commit-based Canary build, add `Canary-Build: true` to the commit trailers. `Canary-Platforms` is optional and defaults to `all`; otherwise use a comma-separated subset of the supported release targets. The Canary workflow starts only after the ordinary `CI` workflow succeeds, builds the selected platforms, and creates the prerelease tag only after all selected archives pass.

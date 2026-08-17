@@ -129,9 +129,7 @@ fn check_architecture_for(operating_system: &str, architecture: &str) -> Check {
         "aarch64" => Some("arm64"),
         _ => None,
     };
-    if (matches!(operating_system, "linux" | "macos") && architecture_name.is_some())
-        || (operating_system == "windows" && architecture == "x86_64")
-    {
+    if matches!(operating_system, "linux" | "macos" | "windows") && architecture_name.is_some() {
         Check {
             name: "architecture".to_owned(),
             status: CheckStatus::Pass,
@@ -146,7 +144,7 @@ fn check_architecture_for(operating_system: &str, architecture: &str) -> Check {
             name: "architecture".to_owned(),
             status: CheckStatus::Fail,
             detail: format!(
-                "{operating_system}/{architecture} detected; supported targets are Linux/macOS amd64 or arm64 and Windows amd64"
+                "{operating_system}/{architecture} detected; supported targets are Linux, macOS, and Windows on amd64 or arm64"
             ),
             blocking: true,
         }
@@ -496,12 +494,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn architecture_check_accepts_linux_and_macos_on_amd64_and_arm64() {
+    fn architecture_check_accepts_supported_operating_systems_on_amd64_and_arm64() {
         for (operating_system, architecture) in [
             ("linux", "x86_64"),
             ("linux", "aarch64"),
             ("macos", "x86_64"),
             ("macos", "aarch64"),
+            ("windows", "x86_64"),
+            ("windows", "aarch64"),
         ] {
             let check = check_architecture_for(operating_system, architecture);
             assert!(matches!(check.status, CheckStatus::Pass));

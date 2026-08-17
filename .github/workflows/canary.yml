@@ -47,14 +47,14 @@ jobs:
             exit 0
           fi
           raw="$(git show -s --format='%(trailers:key=Canary-Platforms,valueonly)' "$SOURCE_SHA" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
-          [ -n "$raw" ] && [ "$raw" != all ] || raw='linux-amd64,linux-arm64,macos-amd64,macos-arm64,windows-amd64'
+          [ -n "$raw" ] && [ "$raw" != all ] || raw='linux-amd64,linux-arm64,macos-amd64,macos-arm64,windows-amd64,windows-arm64'
           case "$raw" in
             *[^a-z0-9,-]*|,*|*,|*,,*) echo 'Invalid Canary-Platforms trailer' >&2; exit 1 ;;
           esac
           IFS=',' read -r -a selected <<< "$raw"
           for target in "${selected[@]}"; do
             case "$target" in
-              linux-amd64|linux-arm64|macos-amd64|macos-arm64|windows-amd64) ;;
+              linux-amd64|linux-arm64|macos-amd64|macos-arm64|windows-amd64|windows-arm64) ;;
               *) echo "Unsupported Canary platform: $target" >&2; exit 1 ;;
             esac
           done
@@ -65,7 +65,8 @@ jobs:
               {target:"linux-arm64",runner:"ubuntu-24.04-arm",rust_target:"aarch64-unknown-linux-musl",binary:"target/aarch64-unknown-linux-musl/release/meowai-deploy"},
               {target:"macos-amd64",runner:"macos-15-intel",rust_target:"x86_64-apple-darwin",binary:"target/x86_64-apple-darwin/release/meowai-deploy"},
               {target:"macos-arm64",runner:"macos-15",rust_target:"aarch64-apple-darwin",binary:"target/aarch64-apple-darwin/release/meowai-deploy"},
-              {target:"windows-amd64",runner:"windows-latest",rust_target:"",binary:"target/release/meowai-deploy.exe"}
+              {target:"windows-amd64",runner:"windows-latest",rust_target:"x86_64-pc-windows-msvc",binary:"target/x86_64-pc-windows-msvc/release/meowai-deploy.exe"},
+              {target:"windows-arm64",runner:"windows-11-arm",rust_target:"aarch64-pc-windows-msvc",binary:"target/aarch64-pc-windows-msvc/release/meowai-deploy.exe"}
             ] | map(. as $entry | select($targets | index($entry.target)))}
           ')"
           version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
@@ -112,11 +113,11 @@ jobs:
           MEOWAI_DEPLOY_BUILD_SHA: ${{ needs.prepare.outputs.source_sha }}
         run: |
           set -euo pipefail
-          if [ "${{ matrix.target }}" = windows-amd64 ]; then
-            cargo +stable build --release --locked
-            ./scripts/webui-smoke.sh target/release/meowai-deploy.exe
+          if [[ "${{ matrix.target }}" == windows-* ]]; then
+            cargo +stable build --release --locked --target "${{ matrix.rust_target }}"
+            ./scripts/webui-smoke.sh "${{ matrix.binary }}"
             mkdir -p dist/package
-            cp target/release/meowai-deploy.exe dist/package/meowai-deploy.exe
+            cp "${{ matrix.binary }}" dist/package/meowai-deploy.exe
             (cd dist/package && 7z a -tzip "../meowai-deploy-${{ matrix.target }}.zip" meowai-deploy.exe)
           else
             cargo +stable build --release --locked --target "${{ matrix.rust_target }}"

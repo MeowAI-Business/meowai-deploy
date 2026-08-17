@@ -201,6 +201,32 @@ fn linux_release_binaries_are_built_with_musl() {
 }
 
 #[test]
+fn windows_release_binaries_cover_amd64_and_arm64() {
+    let release = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/release.yml"),
+    )
+    .expect("read release workflow");
+    let canary = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/canary.yml"),
+    )
+    .expect("read Canary workflow");
+    for workflow in [release, canary] {
+        for marker in [
+            "windows-amd64",
+            "windows-arm64",
+            "x86_64-pc-windows-msvc",
+            "aarch64-pc-windows-msvc",
+            "windows-11-arm",
+        ] {
+            assert!(
+                workflow.contains(marker),
+                "missing Windows marker: {marker}"
+            );
+        }
+    }
+}
+
+#[test]
 fn installer_is_a_verified_powershell_script_for_windows_users() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("install.ps1");
     let script = std::fs::read_to_string(path).expect("read PowerShell installer");
@@ -208,7 +234,8 @@ fn installer_is_a_verified_powershell_script_for_windows_users() {
         "Invoke-WebRequest",
         "Get-FileHash -Algorithm SHA256",
         "Expand-Archive",
-        "meowai-deploy-windows-amd64.zip",
+        "@('ARM64', 'AARCH64')",
+        "meowai-deploy-windows-$targetArch.zip",
         "meowai-deploy.exe",
         "GetEnvironmentVariable('Path', 'User')",
         "SetEnvironmentVariable('Path', $updatedPath, 'User')",

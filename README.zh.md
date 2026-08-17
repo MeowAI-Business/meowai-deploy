@@ -9,6 +9,7 @@
 运行 CLI 的机器需要：
 
 - amd64 或 arm64 架构的 Linux / macOS
+- amd64 或 arm64 架构的 Windows 10/11；Windows CLI 通过 OpenSSH 控制 Linux 目标
 - `curl`
 - 本机部署时需要 Docker 和 Docker Compose 插件
 - 远程部署时需要 `ssh` 和 `scp`
@@ -56,7 +57,7 @@ New API 默认监听 `3000` 端口，Uptime Kuma 默认监听 `3001` 端口；�
 
 使用 `meowai-deploy <命令> --help` 查看完整参数。
 
-默认更新通道为 `stable`，后台周期检查也只检查正式版本。Canary 必须通过 `--channel canary` 明确选择，不会自动安装。维护者可以在 `main` commit 末尾添加 `Canary-Build: true` trailer 生成 Canary prerelease；`Canary-Platforms` 省略或设为 `all` 时构建所有平台，也可以填写逗号分隔的平台子集。
+默认更新通道为 `stable`，后台周期检查也只检查正式版本。Canary 必须通过 `--channel canary` 明确选择，不会自动安装。维护者可以在 `main` commit 末尾添加 `Canary-Build: true` trailer 生成 Canary prerelease；`Canary-Platforms` 省略或设为 `all` 时构建所有平台，也可以填写逗号分隔的平台子集。支持的平台值为 `linux-amd64`、`linux-arm64`、`macos-amd64`、`macos-arm64`、`windows-amd64` 和 `windows-arm64`。
 
 ## 自动化部署
 
