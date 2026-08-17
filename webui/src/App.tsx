@@ -1606,7 +1606,7 @@ function validateStep(step: StepKey, draft: Draft, presetLoaded = false): string
     if (draft.target === "ssh" && !/^[A-Za-z0-9._-]+@(?:[A-Za-z0-9][A-Za-z0-9._-]*|\[[0-9A-Fa-f:]+\])$/.test(draft.sshDestination)) return "SSH 地址必须使用 user@host 格式。";
   }
   if (step === "source") {
-    if (!/^https:\/\//.test(draft.sourceUrl) && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?/.test(draft.sourceUrl)) return "源站地址需要使用 HTTPS。";
+    if (!/^https?:\/\//.test(draft.sourceUrl)) return "源站地址需要使用 HTTP 或 HTTPS。";
     if (!draft.sourceUsername.trim() || (!draft.sourcePassword && !presetLoaded)) return "请填写源站用户名和密码。";
   }
   if (step === "site") {

@@ -223,13 +223,6 @@ pub fn validate_source_url(value: &str) -> ValidationResult<()> {
             "source_url must use http or https",
         ));
     }
-    if parsed.scheme() != "https" && !is_loopback(&parsed) {
-        return Err(ValidationError::new(
-            ValidationCode::InvalidSourceUrl,
-            InputField::SourceUrl,
-            "source_url must use HTTPS unless it points to loopback",
-        ));
-    }
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(ValidationError::new(
             ValidationCode::InvalidSourceUrl,
@@ -417,14 +410,6 @@ pub fn validate_ssh_destination(value: &str) -> ValidationResult<()> {
     Ok(())
 }
 
-fn is_loopback(url: &Url) -> bool {
-    match url.host_str() {
-        Some("localhost") => true,
-        Some(host) => host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback()),
-        None => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,10 +447,10 @@ mod tests {
     }
 
     #[test]
-    fn remote_plain_http_source_is_rejected_but_loopback_is_allowed() {
+    fn plain_http_sources_are_allowed() {
         assert!(validate_source_url("http://127.0.0.1:8080").is_ok());
-        let error = validate_source_url("http://example.com").expect_err("HTTPS is required");
-        assert_eq!(error.code, ValidationCode::InvalidSourceUrl);
+        assert!(validate_source_url("http://source.example.test:3001").is_ok());
+        assert!(validate_source_url("http://example.com").is_ok());
     }
 
     #[test]

@@ -15,8 +15,30 @@ use wiremock::{
 
 use super::{
     SourceAccountMode, SourceClient, SourceCredentials, SourceError, SourceGroup,
-    groups::GroupCatalog,
+    control_plane_endpoint, groups::GroupCatalog,
 };
+
+#[test]
+fn remote_plain_http_source_and_control_plane_are_allowed() {
+    SourceClient::new("http://source.example.test:3001")
+        .expect("plain HTTP source should be accepted");
+
+    let endpoint = control_plane_endpoint(
+        "http://control.example.test:3001/api",
+        "/api/onboard/deployments/example/heartbeat",
+    )
+    .expect("plain HTTP control plane should be accepted");
+    assert_eq!(
+        endpoint.as_str(),
+        "http://control.example.test:3001/api/onboard/deployments/example/heartbeat"
+    );
+}
+
+#[test]
+fn non_http_source_and_control_plane_are_rejected() {
+    assert!(SourceClient::new("ftp://source.example.test").is_err());
+    assert!(control_plane_endpoint("ftp://control.example.test", "/heartbeat").is_err());
+}
 
 fn credentials() -> SourceCredentials {
     SourceCredentials::new(

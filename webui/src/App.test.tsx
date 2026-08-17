@@ -101,6 +101,47 @@ describe("deployment workbench", () => {
     expect(JSON.parse(String(preflightCall?.[1]?.body))).toMatchObject({ ssh_password: sshPassword, check_site: false });
   });
 
+  it("allows a plain HTTP source on a remote host", async () => {
+    vi.stubGlobal("EventSource", TestEventSource);
+    const fetchMock = sessionFetch((path) => {
+      if (path.endsWith("/api/preflight/target")) {
+        return json({ fingerprint: "target-1", newapi_port: 3000, kuma_port: 3001 });
+      }
+      if (path.endsWith("/api/preflight/source")) {
+        return json({ username: "source-user", user_id: 42 });
+      }
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+    await screen.findByRole("heading", { name: "部署位置" });
+    fireEvent.click(screen.getByRole("button", { name: /下一步/ }));
+
+    await screen.findByRole("heading", { name: "源站账号" });
+    fireEvent.change(screen.getByLabelText("源站地址"), {
+      target: { value: "http://source.example.test:3001" },
+    });
+    fireEvent.change(screen.getByLabelText("用户名"), {
+      target: { value: "source-user" },
+    });
+    fireEvent.change(screen.getByLabelText("密码"), {
+      target: { value: "source-password" },
+    });
+
+    const next = screen.getByRole("button", { name: /下一步/ });
+    expect(next).toBeEnabled();
+    fireEvent.click(next);
+
+    await screen.findByRole("heading", { name: "站点设置" });
+    const sourceCall = fetchMock.mock.calls.find(([path]) =>
+      String(path).endsWith("/api/preflight/source")
+    );
+    expect(JSON.parse(String(sourceCall?.[1]?.body))).toMatchObject({
+      source_url: "http://source.example.test:3001",
+      source_username: "source-user",
+    });
+  });
+
   it("requires source authentication and resolves the image digest before review", async () => {
     vi.stubGlobal("EventSource", TestEventSource);
     const digest = `sha256:${"a".repeat(64)}`;

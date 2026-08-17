@@ -17,7 +17,7 @@ pub use onboard_status::{
     StatusMonitorResponse, StatusMonitorSnapshot, StatusPage, StatusSnapshot,
 };
 
-use std::{fmt, net::IpAddr, sync::Arc, time::Duration};
+use std::{fmt, sync::Arc, time::Duration};
 
 use hmac::{Hmac, Mac};
 use reqwest::{
@@ -148,11 +148,6 @@ impl SourceClient {
         if !matches!(base_url.scheme(), "http" | "https") {
             return Err(SourceError::InvalidUrl(
                 "only http and https URLs are supported".to_owned(),
-            ));
-        }
-        if base_url.scheme() != "https" && !is_loopback(&base_url) {
-            return Err(SourceError::InvalidUrl(
-                "HTTPS is required for non-loopback sources".to_owned(),
             ));
         }
         if !base_url.username().is_empty() || base_url.password().is_some() {
@@ -600,16 +595,6 @@ fn encode_hex(bytes: &[u8]) -> String {
     encoded
 }
 
-fn is_loopback(url: &Url) -> bool {
-    match url.host_str() {
-        Some("localhost") => true,
-        Some(host) => host
-            .parse::<IpAddr>()
-            .is_ok_and(|address| address.is_loopback()),
-        None => false,
-    }
-}
-
 fn control_plane_endpoint(control_plane_url: &str, path: &str) -> SourceResult<Url> {
     let mut endpoint = Url::parse(control_plane_url)
         .map_err(|error| SourceError::InvalidUrl(error.to_string()))?;
@@ -622,9 +607,9 @@ fn control_plane_endpoint(control_plane_url: &str, path: &str) -> SourceResult<U
             "control plane URL must not contain credentials, query, or fragment".to_owned(),
         ));
     }
-    if endpoint.scheme() != "https" && !(endpoint.scheme() == "http" && is_loopback(&endpoint)) {
+    if !matches!(endpoint.scheme(), "http" | "https") {
         return Err(SourceError::InvalidUrl(
-            "HTTPS is required for non-loopback control planes".to_owned(),
+            "control plane URL must use http or https".to_owned(),
         ));
     }
     endpoint.set_path(path);
