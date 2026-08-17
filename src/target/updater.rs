@@ -94,7 +94,7 @@ report backup_succeeded "$current" "$approved" "$backup_id" '' 'backup completed
 
 docker pull "$REPOSITORY@$approved" >/dev/null || { report update_failed "$current" "$approved" "$backup_id" IMAGE_PULL_FAILED 'approved image pull failed'; exit 1; }
 temporary_override="$ROOT/.docker-compose.updater.yml.tmp"
-printf 'services:\n  new-api:\n    image: %s@%s\n' "$REPOSITORY" "$approved" > "$temporary_override"
+printf 'services:\n  new-api:\n    image: %s@%s\n    environment:\n      MEOWAI_CURRENT_IMAGE_DIGEST: %s\n' "$REPOSITORY" "$approved" "$approved" > "$temporary_override"
 chmod 600 "$temporary_override"
 docker compose --env-file "$ROOT/secrets.env" -p "$PROJECT" -f "$COMPOSE_BASE" -f "$temporary_override" config >/dev/null || { rm -f "$temporary_override"; report update_failed "$current" "$approved" "$backup_id" COMPOSE_VALIDATION_FAILED 'approved Compose override is invalid'; exit 1; }
 mv "$temporary_override" "$COMPOSE_OVERRIDE"
@@ -611,6 +611,11 @@ esac
         assert_eq!(
             fs::read_to_string(result.root.join("current-digest")).expect("read final digest"),
             APPROVED_DIGEST
+        );
+        let compose_override = fs::read_to_string(result.root.join("docker-compose.updater.yml"))
+            .expect("read updater Compose override");
+        assert!(
+            compose_override.contains(&format!("MEOWAI_CURRENT_IMAGE_DIGEST: {APPROVED_DIGEST}\n"))
         );
         let updater_state: Value = serde_json::from_slice(
             &fs::read(result.root.join("run/updater-status.json")).expect("read updater status"),
