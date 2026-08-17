@@ -537,7 +537,6 @@ impl PricingConfig {
             let table: Value = serde_json::from_str(&self.home_pricing.table).map_err(|error| {
                 AppError::State(format!("invalid source home pricing table: {error}"))
             })?;
-            ensure_home_pricing_has_no_notes(&table)?;
             add_json(
                 &mut options,
                 "home_setting.pricing_table",
@@ -756,18 +755,6 @@ fn canonical_json_value_raw(value: &Value) -> std::result::Result<String, String
     serde_json::to_string(value).map_err(|error| error.to_string())
 }
 
-fn ensure_home_pricing_has_no_notes(value: &Value) -> Result<()> {
-    let rows = value
-        .as_array()
-        .ok_or_else(|| AppError::State("source home pricing table must be an array".to_owned()))?;
-    if rows.iter().any(|row| row.get("note").is_some()) {
-        return Err(AppError::State(
-            "source home pricing table still contains note fields".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
 fn json_number(value: &Value) -> Option<f64> {
     value
         .as_f64()
@@ -903,19 +890,27 @@ mod tests {
     }
 
     #[test]
-    fn home_pricing_notes_are_rejected_if_the_source_did_not_remove_them() {
+    fn home_pricing_notes_are_preserved_in_the_downstream_option() {
         let config = PricingConfig::from_value(serde_json::json!({
             "model_price": {}, "model_ratio": {}, "cache_ratio": {},
             "create_cache_ratio": {}, "completion_ratio": {}, "image_ratio": {},
             "audio_ratio": {}, "audio_completion_ratio": {},
             "marketplace": marketplace_config(),
             "home_pricing": {
-                "table": "[{\"model\":\"seedance-2.0\",\"note\":\"private\"}]",
+                "table": "[{\"model\":\"seedance-2.0\",\"note\":\"public pricing note\"}]",
                 "title": "", "description": "", "enabled": true
             }
         }))
         .expect("parse source pricing");
-        assert!(config.options().is_err());
+        let option = config
+            .options()
+            .expect("build downstream options")
+            .into_iter()
+            .find(|option| option.key == "home_setting.pricing_table")
+            .expect("home pricing table option");
+        let table: Value = serde_json::from_str(&option.canonical_json)
+            .expect("decode canonical home pricing table");
+        assert_eq!(table[0]["note"], serde_json::json!("public pricing note"));
     }
 
     #[test]

@@ -112,6 +112,12 @@ fn pricing_data() -> Value {
             "max_token_auto_groups": 5,
             "default_use_auto_group": true
         },
+        "home_pricing": {
+            "table": "[{\"model\":\"seedance-2.0\",\"note\":\"public pricing note\"}]",
+            "title": "Pricing",
+            "description": "Public prices",
+            "enabled": true
+        },
         "marketplace": marketplace_data()
     })
 }
@@ -1049,6 +1055,13 @@ async fn pricing_reads_all_authenticated_source_fields() {
     let pricing = client.pricing().await.expect("read source pricing");
     let options = pricing.options().expect("build downstream options");
     assert_eq!(options.len(), 53);
+    let home_pricing_table = options
+        .iter()
+        .find(|option| option.key == "home_setting.pricing_table")
+        .expect("home pricing table option");
+    let home_pricing_table: Value = serde_json::from_str(&home_pricing_table.canonical_json)
+        .expect("decode home pricing table option");
+    assert_eq!(home_pricing_table[0]["note"], json!("public pricing note"));
     assert_eq!(
         options
             .iter()
