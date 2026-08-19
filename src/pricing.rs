@@ -1001,15 +1001,24 @@ mod tests {
     }
 
     #[test]
-    fn v2_seedance_keeps_account_purchase_separate_and_discards_supplier_costs() {
+    fn v2_seedance_keeps_domestic_and_international_group_purchase_prices() {
         let mut terminal = minimal_pricing();
-        terminal["video_sales_policies"] = serde_json::json!([{
-            "public_model": "seedance-2.0",
-            "official_no_video_micros": 46000000,
-            "official_with_video_micros": 46000000,
-            "customer_rate_bps": 8300,
-            "effective_from": 100
-        }]);
+        terminal["video_sales_policies"] = serde_json::json!([
+            {
+                "public_model": "seedance-2.0",
+                "official_no_video_micros": 46000000,
+                "official_with_video_micros": 46000000,
+                "customer_rate_bps": 8300,
+                "effective_from": 100
+            },
+            {
+                "public_model": "seedance-2.0-intl",
+                "official_no_video_micros": 46000000,
+                "official_with_video_micros": 46000000,
+                "customer_rate_bps": 8700,
+                "effective_from": 100
+            }
+        ]);
         terminal["video_cost_policies"] = serde_json::json!([{
             "provider": "private-supplier",
             "public_model": "seedance-2.0",
@@ -1025,14 +1034,24 @@ mod tests {
             "account_purchase": {
                 "user_id": 42,
                 "user_group": "downstream",
-                "seedance": [{
-                    "public_model": "seedance-2.0",
-                    "terminal_rate_bps": 8300,
-                    "purchase_rate_bps": 7000,
-                    "purchase_source": "account_policy",
-                    "policy_version": 3,
-                    "effective_from": 100
-                }]
+                "seedance": [
+                    {
+                        "public_model": "seedance-2.0",
+                        "terminal_rate_bps": 8300,
+                        "purchase_rate_bps": 8000,
+                        "purchase_source": "group_override",
+                        "policy_version": 1,
+                        "effective_from": 100
+                    },
+                    {
+                        "public_model": "seedance-2.0-intl",
+                        "terminal_rate_bps": 8700,
+                        "purchase_rate_bps": 8300,
+                        "purchase_source": "group_override",
+                        "policy_version": 1,
+                        "effective_from": 100
+                    }
+                ]
             }
         }))
         .expect("parse v2 pricing");
@@ -1040,10 +1059,23 @@ mod tests {
         assert_eq!(pricing.schema_version, 2);
         assert!(pricing.video_cost_policies.is_empty());
         let margins = pricing.seedance_margin_previews();
-        assert_eq!(margins.len(), 1);
-        assert_eq!(margins[0].purchase, Some(0.7));
+        assert_eq!(margins.len(), 2);
+        assert_eq!(margins[0].purchase, Some(0.8));
         assert_eq!(margins[0].sales, 0.83);
         assert_eq!(margins[0].risk, MarginRisk::Profitable);
+        assert!(
+            margins[0]
+                .margin_percent
+                .is_some_and(|value| (value - (3.0 / 83.0 * 100.0)).abs() < 1e-9)
+        );
+        assert_eq!(margins[1].purchase, Some(0.83));
+        assert_eq!(margins[1].sales, 0.87);
+        assert_eq!(margins[1].risk, MarginRisk::Profitable);
+        assert!(
+            margins[1]
+                .margin_percent
+                .is_some_and(|value| (value - (4.0 / 87.0 * 100.0)).abs() < 1e-9)
+        );
 
         let downstream = serde_json::json!([{
             "public_model": "seedance-2.0",

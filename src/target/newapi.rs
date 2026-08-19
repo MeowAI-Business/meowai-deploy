@@ -1685,10 +1685,16 @@ mod tests {
         let deployment_id = "0123456789abcdef";
         let expected_purchase = json!({
             "seedance-2.0": {
-                "purchase_rate_bps": 7000,
-                "purchase_source": "account_override",
-                "policy_version": 4,
+                "purchase_rate_bps": 8000,
+                "purchase_source": "group_override",
+                "policy_version": 1,
                 "effective_from": 123,
+            },
+            "seedance-2.0-intl": {
+                "purchase_rate_bps": 8300,
+                "purchase_source": "group_override",
+                "policy_version": 1,
+                "effective_from": 124,
             }
         });
         Mock::given(method("GET"))
@@ -1765,14 +1771,24 @@ mod tests {
             "sales": [],
             "capabilities": [],
             "account_purchase": {
-                "seedance": [{
-                    "public_model": "seedance-2.0",
-                    "terminal_rate_bps": 8300,
-                    "purchase_rate_bps": 7000,
-                    "purchase_source": "account_override",
-                    "policy_version": 4,
-                    "effective_from": 123,
-                }]
+                "seedance": [
+                    {
+                        "public_model": "seedance-2.0",
+                        "terminal_rate_bps": 8300,
+                        "purchase_rate_bps": 8000,
+                        "purchase_source": "group_override",
+                        "policy_version": 1,
+                        "effective_from": 123,
+                    },
+                    {
+                        "public_model": "seedance-2.0-intl",
+                        "terminal_rate_bps": 8700,
+                        "purchase_rate_bps": 8300,
+                        "purchase_source": "group_override",
+                        "policy_version": 1,
+                        "effective_from": 124,
+                    }
+                ]
             }
         });
         client
