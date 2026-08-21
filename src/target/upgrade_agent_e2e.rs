@@ -34,10 +34,15 @@ struct Fixture {
     _socket: UnixListener,
     _server: MockServer,
     _home: PathBuf,
+    _env_guard: std::sync::MutexGuard<'static, ()>,
 }
 
 impl Fixture {
     async fn new() -> Self {
+        let env_guard = crate::target::TEST_ENV_LOCK
+            .get_or_init(Default::default)
+            .lock()
+            .expect("E2E test environment lock");
         let temporary = tempdir().expect("fixture tempdir");
         let root = temporary.path().join("deployment");
         let fake_bin = temporary.path().join("bin");
@@ -104,6 +109,7 @@ impl Fixture {
             _socket: socket,
             _server: server,
             _home: home,
+            _env_guard: env_guard,
         }
     }
 
@@ -871,10 +877,10 @@ fn archive(files: Vec<(&str, u32, Vec<u8>)>) -> Vec<u8> {
 }
 
 fn current_compose() -> Vec<u8> {
-    br#"{"services":{"new-api":{"image":"ghcr.io/example/newapi@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"postgres":{},"redis":{},"uptime-kuma":{}}}"#.to_vec()
+    br#"{"services":{"new-api":{"image":"ghcr.io/example/newapi@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"postgres":{"image":"postgres:16-alpine"},"redis":{"image":"redis:7-alpine"},"uptime-kuma":{"image":"louislam/uptime-kuma:1"}}}"#.to_vec()
 }
 fn staged_compose() -> Vec<u8> {
-    br#"{"services":{"new-api":{"image":"${MEOWAI_IMAGE_REFERENCE}"},"postgres":{},"redis":{},"uptime-kuma":{},"worker":{"image":"worker:v2"}}}"#.to_vec()
+    br#"{"services":{"new-api":{"image":"${MEOWAI_IMAGE_REFERENCE}"},"postgres":{"image":"postgres:16-alpine"},"redis":{"image":"redis:7-alpine"},"uptime-kuma":{"image":"louislam/uptime-kuma:1"},"worker":{"image":"worker:v2"}}}"#.to_vec()
 }
 fn credentials() -> &'static str {
     "MEOWAI_DEPLOYMENT_ID=dep_e2e\nMEOWAI_INSTALLATION_GENERATION=1\nMEOWAI_CONTROL_PLANE_URL=http://control.example\nMEOWAI_REPORT_CREDENTIAL=report\nMEOWAI_PULL_CREDENTIAL=pull\nMEOWAI_HEARTBEAT_INTERVAL_SECONDS=60\nMEOWAI_SNAPSHOT_INTERVAL_SECONDS=300\nMEOWAI_DEPLOYMENT_SCHEMA=1\nMEOWAI_UPDATER_SCHEMA=1\nMEOWAI_CLI_SCHEMA=1\nMEOWAI_DATA_SCHEMA=1\nMEOWAI_CURRENT_IMAGE_DIGEST=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nMEOWAI_ALLOWED_IMAGE_REPOSITORY=ghcr.io/example/newapi\nMEOWAI_CONTAINER_NAME=e2e-newapi\nMEOWAI_NEWAPI_PORT=3100\nMEOWAI_KUMA_PORT=3101\nMEOWAI_RELEASE_SCHEMA_VERSION=2\nMEOWAI_RELEASE_MANIFEST_PUBLIC_KEY=public-key\nMEOWAI_RELEASE_ARTIFACT_ALLOWED_HOSTS=assets.example\nMEOWAI_UPDATER_SOCKET_PATH=/run/meowai/updater.sock\n"
@@ -903,9 +909,9 @@ case "${1:-}" in
     case "$args" in
       *'config --format json'*)
         if printf '%s' "$args" | grep -q '.upgrade/'; then
-          printf '%s\n' '{"services":{"new-api":{"image":"ghcr.io/example/newapi@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},"postgres":{},"redis":{},"uptime-kuma":{},"worker":{"image":"worker:v2"}}}'
+          printf '%s\n' '{"services":{"new-api":{"image":"ghcr.io/example/newapi@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},"postgres":{"image":"postgres:16-alpine"},"redis":{"image":"redis:7-alpine"},"uptime-kuma":{"image":"louislam/uptime-kuma:1"},"worker":{"image":"worker:v2"}}}'
         else
-          printf '%s\n' '{"services":{"new-api":{"image":"ghcr.io/example/newapi@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"postgres":{},"redis":{},"uptime-kuma":{}}}'
+          printf '%s\n' '{"services":{"new-api":{"image":"ghcr.io/example/newapi@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"postgres":{"image":"postgres:16-alpine"},"redis":{"image":"redis:7-alpine"},"uptime-kuma":{"image":"louislam/uptime-kuma:1"}}}'
         fi
         ;;
       *'config --services'*) printf 'new-api\npostgres\nredis\nuptime-kuma\nworker\n' ;;

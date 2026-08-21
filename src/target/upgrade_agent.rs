@@ -2879,6 +2879,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn environment_patch_applies_all_actions_and_preserves_empty_values() {
         let root = tempfile::tempdir().expect("target directory");

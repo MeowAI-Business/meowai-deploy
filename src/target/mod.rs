@@ -17,6 +17,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
+
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
 use secrecy::{ExposeSecret, SecretString};
 use shell_escape::escape;
 
@@ -491,10 +497,11 @@ docker --config "$registry_config" pull {image}"#,
     }
 
     fn spawn_script(&self, script: &str) -> Result<Child> {
+        let runner = self.script_runner()?;
         match &self.target {
             Target::Local => {
                 let mut child = Command::new("sh")
-                    .args(["-c", PRIVILEGED_SCRIPT_RUNNER])
+                    .args(["-c", &runner])
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
@@ -512,9 +519,29 @@ docker --config "$registry_config" pull {image}"#,
             }
             Target::Ssh { destination } => self
                 .ssh_client()?
-                .spawn_exec(destination, PRIVILEGED_SCRIPT_RUNNER, script.as_bytes())
+                .spawn_exec(destination, &runner, script.as_bytes())
                 .map_err(ssh_error),
         }
+    }
+
+    fn script_runner(&self) -> Result<String> {
+        let directory = self.quoted_directory()?;
+        Ok(format!(
+            r#"path={directory}
+while [ ! -e "$path" ] && [ "$path" != / ]; do
+    path=$(dirname "$path")
+done
+if [ "$(id -u)" -eq 0 ]; then
+    exec sh -s
+elif [ -d "$path" ] && [ -r "$path" ] && [ -w "$path" ] && [ -x "$path" ]; then
+    exec sh -s
+elif command -v sudo >/dev/null 2>&1 && sudo -n sh -c true >/dev/null 2>&1; then
+    exec sudo -n sh -s
+else
+    exec sh -s
+fi"#,
+            directory = directory
+        ))
     }
 
     pub fn directory(&self) -> &Path {

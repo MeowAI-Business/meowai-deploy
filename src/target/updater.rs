@@ -419,6 +419,10 @@ mod tests {
     }
 
     fn run_runtime(scenario: RuntimeScenario) -> RuntimeResult {
+        let _env_guard = crate::target::TEST_ENV_LOCK
+            .get_or_init(Default::default)
+            .lock()
+            .expect("runtime test environment lock");
         let temporary = tempfile::tempdir_in("/tmp").expect("create updater runtime directory");
         let root = temporary.path().join("deployment");
         let fake_bin = temporary.path().join("bin");
