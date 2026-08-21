@@ -30,6 +30,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::Sha256;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const CONNECTIVITY_ATTEMPTS: usize = 4;
+const CONNECTIVITY_RETRY_DELAY: Duration = Duration::from_millis(350);
 
 pub type SourceResult<T> = std::result::Result<T, SourceError>;
 
@@ -247,22 +249,35 @@ impl SourceClient {
     /// Check that the configured source responds before collecting credentials.
     pub async fn check_connectivity(&self) -> SourceResult<()> {
         let endpoint = self.endpoint("api/status")?;
-        let response =
-            self.http
-                .get(endpoint)
-                .send()
-                .await
-                .map_err(|source| SourceError::Transport {
-                    endpoint: "/api/status".to_owned(),
-                    source,
-                })?;
-        if !response.status().is_success() {
-            return Err(SourceError::HttpStatus {
-                endpoint: "/api/status".to_owned(),
-                status: response.status(),
-            });
+        for attempt in 0..CONNECTIVITY_ATTEMPTS {
+            match self.http.get(endpoint.clone()).send().await {
+                Ok(response) => {
+                    if !response.status().is_success() {
+                        return Err(SourceError::HttpStatus {
+                            endpoint: "/api/status".to_owned(),
+                            status: response.status(),
+                        });
+                    }
+                    return Ok(());
+                }
+                Err(source) if attempt + 1 < CONNECTIVITY_ATTEMPTS => {
+                    tracing::debug!(
+                        attempt = attempt + 1,
+                        max_attempts = CONNECTIVITY_ATTEMPTS,
+                        error = %source,
+                        "source connectivity request failed; retrying"
+                    );
+                    tokio::time::sleep(CONNECTIVITY_RETRY_DELAY).await;
+                }
+                Err(source) => {
+                    return Err(SourceError::Transport {
+                        endpoint: "/api/status".to_owned(),
+                        source,
+                    });
+                }
+            }
         }
-        Ok(())
+        unreachable!("connectivity attempts must be non-zero")
     }
 
     pub async fn validate_session(&mut self) -> SourceResult<()> {
