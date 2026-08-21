@@ -17,6 +17,7 @@ mod storage;
 mod sync_plan;
 mod target;
 mod updater;
+mod upgrade;
 mod web;
 
 use std::env;
@@ -80,13 +81,22 @@ async fn main() {
 
 async fn run() -> Result<()> {
     cliclack::set_theme(MeowAiTheme);
+    let cli = Cli::parse();
+    let agent_mode = matches!(&cli.command, Some(cli::Command::Agent(_)));
     let log_filter = || {
         tracing_subscriber::EnvFilter::try_new(env::var("MEOWAI_DEPLOY_LOG").unwrap_or_else(|_| {
             "meowai_deploy=debug,reqwest=warn,hyper=warn,h2=warn,rustls=warn".to_owned()
         }))
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("meowai_deploy=debug"))
     };
-    if let Ok(log_file) = storage::open_log_file() {
+    if agent_mode {
+        tracing_subscriber::fmt()
+            .with_env_filter(log_filter())
+            .with_target(false)
+            .with_ansi(false)
+            .try_init()
+            .ok();
+    } else if let Ok(log_file) = storage::open_log_file() {
         tracing_subscriber::fmt()
             .with_env_filter(log_filter())
             .with_writer(log_file)
@@ -102,6 +112,5 @@ async fn run() -> Result<()> {
             .ok();
     }
 
-    let cli = Cli::parse();
     commands::run(cli).await
 }

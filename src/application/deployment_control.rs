@@ -6,7 +6,7 @@ use crate::{
     config::DeploymentConfig,
     lifecycle_outbox,
     security::validate_env_value,
-    source::{DeploymentRegistration, LifecycleReport},
+    source::{DeploymentRegistration, LifecycleReport, UpgradeTransitionReport},
     state::DeploymentState,
     storage::{self, DOWNSTREAM_CREDENTIALS_FILE},
     target::{TargetExecutor, updater},
@@ -27,6 +27,10 @@ struct PersistedDownstreamCredentials {
     snapshot_interval_seconds: u32,
     silent_updates_enabled: bool,
     release_schema_version: String,
+    #[serde(default)]
+    release_manifest_public_key: String,
+    #[serde(default)]
+    release_artifact_allowed_hosts: Vec<String>,
 }
 
 pub fn load_registration() -> ApplicationResult<Option<DeploymentRegistration>> {
@@ -85,6 +89,8 @@ fn load_persisted_registration()
         snapshot_interval_seconds: stored.snapshot_interval_seconds,
         silent_updates_enabled: stored.silent_updates_enabled,
         release_schema_version: stored.release_schema_version.clone(),
+        release_manifest_public_key: stored.release_manifest_public_key.clone(),
+        release_artifact_allowed_hosts: stored.release_artifact_allowed_hosts.clone(),
     };
     Ok(Some((stored, registration)))
 }
@@ -134,8 +140,23 @@ pub fn persist_registration(
     ] {
         validate_env_value(name, value).map_err(app_error)?;
     }
+    if !registration.release_manifest_public_key.is_empty() {
+        validate_env_value(
+            "MEOWAI_RELEASE_MANIFEST_PUBLIC_KEY",
+            &registration.release_manifest_public_key,
+        )
+        .map_err(app_error)?;
+    }
+    for host in &registration.release_artifact_allowed_hosts {
+        validate_env_value("MEOWAI_RELEASE_ARTIFACT_ALLOWED_HOST", host).map_err(app_error)?;
+        if host.contains(',') {
+            return Err(app_error(crate::error::AppError::State(
+                "release artifact host must not contain commas".to_owned(),
+            )));
+        }
+    }
     let target_content = format!(
-        "MEOWAI_DEPLOYMENT_ID={}\nMEOWAI_INSTALLATION_GENERATION={}\nMEOWAI_CONTROL_PLANE_URL={}\nMEOWAI_REPORT_CREDENTIAL={}\nMEOWAI_PULL_CREDENTIAL={}\nMEOWAI_HEARTBEAT_INTERVAL_SECONDS={}\nMEOWAI_SNAPSHOT_INTERVAL_SECONDS={}\nMEOWAI_CURRENT_IMAGE_DIGEST={}\nMEOWAI_ALLOWED_IMAGE_REPOSITORY={}\nMEOWAI_CONTAINER_NAME={}\nMEOWAI_UPDATER_SOCKET_PATH=/run/meowai/updater.sock\n",
+        "MEOWAI_DEPLOYMENT_ID={}\nMEOWAI_INSTALLATION_GENERATION={}\nMEOWAI_CONTROL_PLANE_URL={}\nMEOWAI_REPORT_CREDENTIAL={}\nMEOWAI_PULL_CREDENTIAL={}\nMEOWAI_HEARTBEAT_INTERVAL_SECONDS={}\nMEOWAI_SNAPSHOT_INTERVAL_SECONDS={}\nMEOWAI_CURRENT_IMAGE_DIGEST={}\nMEOWAI_DEPLOYMENT_SCHEMA=1\nMEOWAI_UPDATER_SCHEMA=1\nMEOWAI_DATA_SCHEMA=1\nMEOWAI_CLI_SCHEMA=1\nMEOWAI_ALLOWED_IMAGE_REPOSITORY={}\nMEOWAI_CONTAINER_NAME={}\nMEOWAI_NEWAPI_PORT={}\nMEOWAI_KUMA_PORT={}\nMEOWAI_RELEASE_SCHEMA_VERSION={}\nMEOWAI_RELEASE_MANIFEST_PUBLIC_KEY={}\nMEOWAI_RELEASE_ARTIFACT_ALLOWED_HOSTS={}\nMEOWAI_UPDATER_SOCKET_PATH=/run/meowai/updater.sock\n",
         registration.deployment_id,
         registration.installation_generation,
         registration.control_plane_url,
@@ -145,7 +166,12 @@ pub fn persist_registration(
         registration.snapshot_interval_seconds,
         config.image_ref,
         config.image,
-        config.container_name
+        config.container_name,
+        config.newapi_port,
+        config.kuma_port,
+        registration.release_schema_version,
+        registration.release_manifest_public_key,
+        registration.release_artifact_allowed_hosts.join(",")
     );
     executor
         .write_file(
@@ -159,7 +185,7 @@ file=downstream-credentials.env
 test -s "$file"
 mode=$(stat -c '%a' "$file" 2>/dev/null || stat -f '%Lp' "$file")
 test "$mode" = 600
-for key in MEOWAI_DEPLOYMENT_ID MEOWAI_INSTALLATION_GENERATION MEOWAI_CONTROL_PLANE_URL MEOWAI_REPORT_CREDENTIAL MEOWAI_PULL_CREDENTIAL MEOWAI_HEARTBEAT_INTERVAL_SECONDS MEOWAI_SNAPSHOT_INTERVAL_SECONDS MEOWAI_CURRENT_IMAGE_DIGEST MEOWAI_ALLOWED_IMAGE_REPOSITORY MEOWAI_CONTAINER_NAME MEOWAI_UPDATER_SOCKET_PATH; do
+for key in MEOWAI_DEPLOYMENT_ID MEOWAI_INSTALLATION_GENERATION MEOWAI_CONTROL_PLANE_URL MEOWAI_REPORT_CREDENTIAL MEOWAI_PULL_CREDENTIAL MEOWAI_HEARTBEAT_INTERVAL_SECONDS MEOWAI_SNAPSHOT_INTERVAL_SECONDS MEOWAI_CURRENT_IMAGE_DIGEST MEOWAI_DEPLOYMENT_SCHEMA MEOWAI_UPDATER_SCHEMA MEOWAI_DATA_SCHEMA MEOWAI_CLI_SCHEMA MEOWAI_ALLOWED_IMAGE_REPOSITORY MEOWAI_CONTAINER_NAME MEOWAI_NEWAPI_PORT MEOWAI_KUMA_PORT MEOWAI_RELEASE_SCHEMA_VERSION MEOWAI_UPDATER_SOCKET_PATH; do
   count=$(grep -c "^${key}=..*" "$file" || true)
   test "$count" = 1
 done"#).map_err(app_error)?;
@@ -183,6 +209,8 @@ pub fn persist_registration_locally(
         snapshot_interval_seconds: registration.snapshot_interval_seconds,
         silent_updates_enabled: registration.silent_updates_enabled,
         release_schema_version: registration.release_schema_version.clone(),
+        release_manifest_public_key: registration.release_manifest_public_key.clone(),
+        release_artifact_allowed_hosts: registration.release_artifact_allowed_hosts.clone(),
     };
     let content = serde_json::to_vec_pretty(&stored).map_err(|error| {
         ApplicationError::new(
@@ -216,6 +244,20 @@ pub async fn queue_lifecycle(
     }
 }
 
+pub async fn queue_upgrade_transition(
+    registration: &DeploymentRegistration,
+    report: UpgradeTransitionReport,
+) -> ApplicationResult<bool> {
+    lifecycle_outbox::enqueue_upgrade_transition(registration, report).map_err(app_error)?;
+    match lifecycle_outbox::flush().await {
+        Ok(_) => Ok(true),
+        Err(error) => {
+            tracing::warn!(error = %error, "upgrade transition queued for retry");
+            Ok(false)
+        }
+    }
+}
+
 pub fn remove_registration() -> ApplicationResult<()> {
     storage::remove(DOWNSTREAM_CREDENTIALS_FILE)
         .map(|_| ())
@@ -239,6 +281,8 @@ mod tests {
             snapshot_interval_seconds: 300,
             silent_updates_enabled: true,
             release_schema_version: "1".to_owned(),
+            release_manifest_public_key: String::new(),
+            release_artifact_allowed_hosts: Vec::new(),
         }
     }
 

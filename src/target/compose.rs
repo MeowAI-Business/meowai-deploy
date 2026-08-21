@@ -215,7 +215,18 @@ impl DeploymentRuntime {
                     kuma_port: config.kuma_port,
                     image: config.image.clone(),
                     image_ref: config.image_ref.clone(),
+                    deployment_schema: "1".to_owned(),
+                    updater_schema: "1".to_owned(),
+                    data_schema: "1".to_owned(),
+                    cli_schema: "1".to_owned(),
+                    target_os: String::new(),
+                    target_arch: String::new(),
+                    systemd_available: false,
+                    compose_v2_available: false,
+                    last_upgrade_release_id: String::new(),
+                    last_upgrade_state: String::new(),
                     image_digest: String::new(),
+                    newapi_version: String::new(),
                     source_user_id,
                     source_group_sha256: source_group_sha256.to_owned(),
                     status_key_id,
@@ -534,7 +545,6 @@ fn render_compose(config: &DeploymentConfig, runtime: &DeploymentRuntime) -> Res
     let image = image_reference(&config.image, &config.image_ref);
     let newapi = json!({
         "image": image,
-        "platform": "linux/amd64",
         "pull_policy": "missing",
         "container_name": config.container_name,
         "restart": "unless-stopped",
@@ -710,7 +720,18 @@ mod tests {
                 kuma_port: 3001,
                 image: config.image.clone(),
                 image_ref: config.image_ref.clone(),
+                deployment_schema: "1".to_owned(),
+                updater_schema: "1".to_owned(),
+                data_schema: "1".to_owned(),
+                cli_schema: "1".to_owned(),
+                target_os: String::new(),
+                target_arch: String::new(),
+                systemd_available: false,
+                compose_v2_available: false,
+                last_upgrade_release_id: String::new(),
+                last_upgrade_state: String::new(),
                 image_digest: String::new(),
+                newapi_version: String::new(),
                 source_user_id: 1,
                 source_group_sha256: String::new(),
                 status_key_id: 1,
@@ -746,7 +767,7 @@ mod tests {
         assert!(value["services"]["postgres"].get("ports").is_none());
         assert!(value["services"]["redis"].get("ports").is_none());
         assert_eq!(value["services"]["uptime-kuma"]["image"], KUMA_IMAGE);
-        assert_eq!(value["services"]["new-api"]["platform"], "linux/amd64");
+        assert!(value["services"]["new-api"].get("platform").is_none());
         assert_eq!(value["services"]["new-api"]["pull_policy"], "missing");
         let environment = &value["services"]["new-api"]["environment"];
         assert!(environment.get("PUBLIC_STATUS_MODE").is_none());

@@ -19,12 +19,14 @@ fn help_lists_supported_commands() {
         "rollback",
         "logout",
         "update",
+        "upgrade",
     ] {
         assert!(
             stdout.contains(command),
             "missing {command} in help: {stdout}"
         );
     }
+    assert!(!stdout.contains("\n  agent"));
 
     let doctor_output = binary()
         .args(["doctor", "--help"])
@@ -37,6 +39,43 @@ fn help_lists_supported_commands() {
     assert!(!doctor_help.contains("--source-url"));
     assert!(!doctor_help.contains("--skip-network"));
     assert!(doctor_help.contains("--ssh"));
+}
+
+#[test]
+fn internal_agent_requires_explicit_automatic_mode() {
+    let output = binary()
+        .args(["agent", "--root", "/definitely/missing"])
+        .output()
+        .expect("run internal agent");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("必须使用 --auto"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn upgrade_help_exposes_bootstrap_and_plan_confirmation() {
+    let output = binary()
+        .args(["upgrade", "--help"])
+        .output()
+        .expect("run upgrade help");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for flag in [
+        "--check",
+        "--plan",
+        "--yes",
+        "--plan-fingerprint",
+        "--bootstrap",
+        "--rollback",
+    ] {
+        assert!(
+            stdout.contains(flag),
+            "missing {flag} in upgrade help: {stdout}"
+        );
+    }
 }
 
 #[test]

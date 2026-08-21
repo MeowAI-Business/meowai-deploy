@@ -1,0 +1,349 @@
+name: Build deployment upgrade bundle
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_id:
+        description: Immutable release ID such as rel_20260819_001
+        required: true
+        type: string
+      newapi_version:
+        description: NewAPI version displayed by the control plane
+        required: true
+        type: string
+      image_repository:
+        description: Approved NewAPI image repository
+        required: true
+        default: ghcr.io/moorcorpa/new-api-outgap
+        type: string
+      image_digest:
+        description: Approved multi-arch sha256 image digest
+        required: true
+        type: string
+      upgrade_kind:
+        description: Structural upgrade kind
+        required: true
+        default: deployment_and_image
+        type: choice
+        options:
+          - deployment_and_image
+          - agent_only
+          - data_migration
+      deployment_schema:
+        description: Target deployment schema
+        required: true
+        type: string
+      minimum_deployment_schema:
+        description: Minimum deployment schema accepted by this release
+        required: true
+        type: string
+      minimum_updater_schema:
+        description: Minimum updater schema
+        required: true
+        default: '2'
+        type: string
+      minimum_cli_schema:
+        description: Minimum CLI schema
+        required: true
+        default: '2'
+        type: string
+      minimum_data_schema:
+        description: Minimum data schema
+        required: true
+        type: string
+      migration_from:
+        description: Deployment schema at the start of migration
+        required: true
+        type: string
+      migration_steps:
+        description: JSON string array of migration steps
+        required: true
+        default: '["deployment-1-to-2","data-1-to-1"]'
+        type: string
+      compose_changes:
+        description: JSON array of declared Compose resource changes
+        required: true
+        default: '[{"kind":"service","name":"new-api","action":"modify"}]'
+        type: string
+      env_changes:
+        description: JSON array of managed environment changes
+        required: true
+        default: '[]'
+        type: string
+      validity_days:
+        description: Manifest validity in days, maximum 90
+        required: true
+        default: '30'
+        type: string
+      publish:
+        description: Create the immutable GitHub Release after all validation passes
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deployment-upgrade-${{ inputs.release_id }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release inputs
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.inputs.outputs.release_tag }}
+      created_at: ${{ steps.inputs.outputs.created_at }}
+      expires_at: ${{ steps.inputs.outputs.expires_at }}
+      data_rollback_required: ${{ steps.inputs.outputs.data_rollback_required }}
+    steps:
+      - name: Validate immutable identifiers and policies
+        id: inputs
+        shell: bash
+        env:
+          RELEASE_ID: ${{ inputs.release_id }}
+          IMAGE_REPOSITORY: ${{ inputs.image_repository }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+          DEPLOYMENT_SCHEMA: ${{ inputs.deployment_schema }}
+          MINIMUM_DEPLOYMENT_SCHEMA: ${{ inputs.minimum_deployment_schema }}
+          MINIMUM_UPDATER_SCHEMA: ${{ inputs.minimum_updater_schema }}
+          MINIMUM_CLI_SCHEMA: ${{ inputs.minimum_cli_schema }}
+          MINIMUM_DATA_SCHEMA: ${{ inputs.minimum_data_schema }}
+          MIGRATION_FROM: ${{ inputs.migration_from }}
+          MIGRATION_STEPS: ${{ inputs.migration_steps }}
+          COMPOSE_CHANGES: ${{ inputs.compose_changes }}
+          ENV_CHANGES: ${{ inputs.env_changes }}
+          VALIDITY_DAYS: ${{ inputs.validity_days }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_ID" =~ ^rel_[A-Za-z0-9][A-Za-z0-9_-]{2,91}$ ]]
+          [[ "$IMAGE_REPOSITORY" =~ ^[a-z0-9][a-z0-9._/-]*$ ]]
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          for value in "$DEPLOYMENT_SCHEMA" "$MINIMUM_DEPLOYMENT_SCHEMA" "$MINIMUM_UPDATER_SCHEMA" "$MINIMUM_CLI_SCHEMA" "$MINIMUM_DATA_SCHEMA" "$MIGRATION_FROM"; do
+            [[ "$value" =~ ^[1-9][0-9]*$ ]]
+          done
+          (( DEPLOYMENT_SCHEMA >= MINIMUM_DEPLOYMENT_SCHEMA ))
+          (( DEPLOYMENT_SCHEMA >= MIGRATION_FROM ))
+          (( MINIMUM_UPDATER_SCHEMA >= 2 ))
+          [[ "$VALIDITY_DAYS" =~ ^[1-9][0-9]*$ ]] && (( VALIDITY_DAYS <= 90 ))
+          jq -e 'type == "array" and length <= 32 and all(.[]; type == "string" and length > 0)' <<<"$MIGRATION_STEPS" >/dev/null
+          jq -e 'type == "array"' <<<"$COMPOSE_CHANGES" >/dev/null
+          jq -e 'type == "array"' <<<"$ENV_CHANGES" >/dev/null
+          data_rollback_required=false
+          while IFS= read -r step; do
+            case "$step" in
+              data-*-to-*)
+                from=${step#data-}
+                from=${from%%-to-*}
+                to=${step##*-to-}
+                [[ "$from" =~ ^[1-9][0-9]*$ && "$to" =~ ^[1-9][0-9]*$ ]]
+                if [[ "$from" != "$to" ]]; then data_rollback_required=true; fi
+                ;;
+            esac
+          done < <(jq -r '.[]' <<<"$MIGRATION_STEPS")
+          created_at=$(date +%s)
+          expires_at=$((created_at + VALIDITY_DAYS * 86400))
+          printf 'release_tag=deployment-%s\ncreated_at=%s\nexpires_at=%s\ndata_rollback_required=%s\n' "$RELEASE_ID" "$created_at" "$expires_at" "$data_rollback_required" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.arch }} bundle
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            rust_target: x86_64-unknown-linux-musl
+            binary: target/x86_64-unknown-linux-musl/release/meowai-deploy
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-musl
+            binary: target/aarch64-unknown-linux-musl/release/meowai-deploy
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools zstd jq
+          rustup toolchain install stable --profile minimal
+          rustup target add --toolchain stable "${{ matrix.rust_target }}"
+
+      - name: Build embedded WebUI and static agent
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --prefix webui
+          npm run build --prefix webui
+          cargo +stable build --release --locked --target "${{ matrix.rust_target }}"
+          if readelf -l "${{ matrix.binary }}" | grep -q 'Requesting program interpreter'; then
+            echo 'upgrade agent must be statically linked' >&2
+            exit 1
+          fi
+
+      - name: Build validated bundle
+        shell: bash
+        env:
+          RELEASE_ID: ${{ inputs.release_id }}
+          DEPLOYMENT_SCHEMA: ${{ inputs.deployment_schema }}
+          MIGRATION_STEPS: ${{ inputs.migration_steps }}
+          COMPOSE_CHANGES: ${{ inputs.compose_changes }}
+          ENV_CHANGES: ${{ inputs.env_changes }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/input
+          install -m 0644 upgrade-bundle/docker-compose.yml dist/input/docker-compose.yml
+          install -m 0700 "${{ matrix.binary }}" dist/input/meowai-deploy-upgrade-agent
+          while IFS= read -r step; do
+            case "$step" in
+              data-*-to-*)
+                from=${step#data-}
+                from=${from%%-to-*}
+                to=${step##*-to-}
+                if [[ "$from" != "$to" ]]; then
+                  source="upgrade-bundle/migrations/$step.sh"
+                  [[ -f "$source" ]] || { echo "missing data migration script: $source" >&2; exit 1; }
+                  mkdir -p dist/input/migrations
+                  install -m 0700 "$source" "dist/input/migrations/$step.sh"
+                fi
+                ;;
+            esac
+          done < <(jq -r '.[]' <<<"$MIGRATION_STEPS")
+          scripts/build-upgrade-bundle.sh \
+            --input-dir dist/input \
+            --output "dist/meowai-deploy-upgrade-linux-${{ matrix.arch }}.tar.zst" \
+            --release-id "$RELEASE_ID" \
+            --deployment-schema "$DEPLOYMENT_SCHEMA" \
+            --migration-steps "$MIGRATION_STEPS" \
+            --compose-changes "$COMPOSE_CHANGES" \
+            --env-changes "$ENV_CHANGES"
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: deployment-upgrade-${{ matrix.arch }}
+          path: dist/meowai-deploy-upgrade-linux-${{ matrix.arch }}.tar.zst
+          if-no-files-found: error
+          retention-days: 7
+
+  manifest:
+    name: Sign and optionally publish manifest
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Download bundles
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: deployment-upgrade-*
+          path: dist
+          merge-multiple: true
+
+      - name: Build canonical unsigned manifest
+        shell: bash
+        env:
+          RELEASE_ID: ${{ inputs.release_id }}
+          RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+          NEWAPI_VERSION: ${{ inputs.newapi_version }}
+          IMAGE_REPOSITORY: ${{ inputs.image_repository }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+          UPGRADE_KIND: ${{ inputs.upgrade_kind }}
+          DEPLOYMENT_SCHEMA: ${{ inputs.deployment_schema }}
+          MINIMUM_DEPLOYMENT_SCHEMA: ${{ inputs.minimum_deployment_schema }}
+          MINIMUM_UPDATER_SCHEMA: ${{ inputs.minimum_updater_schema }}
+          MINIMUM_CLI_SCHEMA: ${{ inputs.minimum_cli_schema }}
+          MINIMUM_DATA_SCHEMA: ${{ inputs.minimum_data_schema }}
+          MIGRATION_FROM: ${{ inputs.migration_from }}
+          MIGRATION_STEPS: ${{ inputs.migration_steps }}
+          CREATED_AT: ${{ needs.validate.outputs.created_at }}
+          EXPIRES_AT: ${{ needs.validate.outputs.expires_at }}
+          DATA_ROLLBACK_REQUIRED: ${{ needs.validate.outputs.data_rollback_required }}
+        run: |
+          set -euo pipefail
+          artifacts='[]'
+          for arch in amd64 arm64; do
+            name="meowai-deploy-upgrade-linux-${arch}.tar.zst"
+            test -s "dist/$name"
+            size=$(stat -c '%s' "dist/$name")
+            sha256=$(sha256sum "dist/$name" | awk '{print $1}')
+            url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${name}"
+            artifacts=$(jq -c --arg name "$name" --arg url "$url" --arg sha256 "$sha256" --arg arch "$arch" --argjson size "$size" '. + [{name:$name,url:$url,sha256:$sha256,size:$size,os:"linux",arch:$arch}]' <<<"$artifacts")
+          done
+          jq -cn \
+            --arg release_id "$RELEASE_ID" \
+            --arg newapi_version "$NEWAPI_VERSION" \
+            --arg image_repository "$IMAGE_REPOSITORY" \
+            --arg image_digest "$IMAGE_DIGEST" \
+            --arg upgrade_kind "$UPGRADE_KIND" \
+            --argjson deployment_schema "$DEPLOYMENT_SCHEMA" \
+            --argjson minimum_deployment_schema "$MINIMUM_DEPLOYMENT_SCHEMA" \
+            --argjson minimum_updater_schema "$MINIMUM_UPDATER_SCHEMA" \
+            --argjson minimum_cli_schema "$MINIMUM_CLI_SCHEMA" \
+            --argjson minimum_data_schema "$MINIMUM_DATA_SCHEMA" \
+            --argjson artifacts "$artifacts" \
+            --argjson migration_from "$MIGRATION_FROM" \
+            --argjson migration_steps "$MIGRATION_STEPS" \
+            --argjson created_at "$CREATED_AT" \
+            --argjson expires_at "$EXPIRES_AT" \
+            --argjson data_rollback_required "$DATA_ROLLBACK_REQUIRED" \
+            '{manifest_schema:1,release_id:$release_id,channel:"stable",newapi_version:$newapi_version,image_repository:$image_repository,image_digest:$image_digest,deployment_schema:$deployment_schema,minimum_deployment_schema:$minimum_deployment_schema,minimum_updater_schema:$minimum_updater_schema,minimum_cli_schema:$minimum_cli_schema,minimum_data_schema:$minimum_data_schema,upgrade_kind:$upgrade_kind,required_capabilities:["linux","compose_v2","systemd"],artifacts:$artifacts,migration_plan:{from:$migration_from,to:$deployment_schema,steps:$migration_steps},health_policy:{newapi_timeout_seconds:120,dependency_timeout_seconds:120,updater_heartbeat_max_age_seconds:180},rollback:{supported:true,retained_backup_count:3,data_rollback_required:$data_rollback_required},created_at:$created_at,expires_at:$expires_at,signature:""}' \
+            > dist/upgrade-manifest.unsigned.json
+
+      - name: Sign and self-verify manifest
+        env:
+          MEOWAI_RELEASE_MANIFEST_PRIVATE_KEY: ${{ secrets.MEOWAI_RELEASE_MANIFEST_PRIVATE_KEY }}
+          MEOWAI_RELEASE_MANIFEST_PUBLIC_KEY: ${{ secrets.MEOWAI_RELEASE_MANIFEST_PUBLIC_KEY }}
+        run: node scripts/sign-upgrade-manifest.mjs dist/upgrade-manifest.unsigned.json dist/upgrade-manifest.json
+
+      - name: Create checksums
+        shell: bash
+        run: cd dist && sha256sum meowai-deploy-upgrade-*.tar.zst upgrade-manifest.json > checksums-sha256.txt
+
+      - name: Upload signed release candidate
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: signed-deployment-upgrade-${{ inputs.release_id }}
+          path: |
+            dist/meowai-deploy-upgrade-*.tar.zst
+            dist/upgrade-manifest.json
+            dist/checksums-sha256.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish immutable deployment upgrade release
+    if: inputs.publish
+    needs: [validate, manifest]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download signed release candidate
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: signed-deployment-upgrade-${{ inputs.release_id }}
+          path: dist
+
+      - name: Create immutable deployment upgrade release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" >/dev/null 2>&1 && { echo "release $RELEASE_TAG already exists" >&2; exit 1; }
+          gh release create "$RELEASE_TAG" \
+            dist/meowai-deploy-upgrade-*.tar.zst \
+            dist/upgrade-manifest.json \
+            dist/checksums-sha256.txt \
+            --target "$GITHUB_SHA" \
+            --title "$RELEASE_TAG" \
+            --notes "Signed deployment upgrade bundle for ${{ inputs.release_id }}."

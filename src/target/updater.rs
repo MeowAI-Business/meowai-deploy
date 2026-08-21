@@ -50,11 +50,31 @@ case "$health_attempts" in ''|*[!0-9]*) health_attempts=60 ;; esac
 [ "$health_attempts" -ge 1 ] || health_attempts=60
 
 policy=$(curl --fail --silent --show-error --max-time 10 --unix-socket "$SOCKET" \
-  -H "Authorization: Bearer $MEOWAI_UPDATER_LOCAL_CREDENTIAL" http://localhost/policy) || exit 0
+  -H "Authorization: Bearer $MEOWAI_UPDATER_LOCAL_CREDENTIAL" http://localhost/policy) || {
+  report update_failed "$(current_digest)" '' '' POLICY_FETCH_FAILED 'control plane policy fetch failed; no update was attempted'
+  exit 1
+}
 approved=$(printf '%s' "$policy" | sed -n 's/.*"image_digest":"\(sha256:[0-9a-f]\{64\}\)".*/\1/p')
 repository=$(printf '%s' "$policy" | sed -n 's/.*"image_repository":"\([a-z0-9][a-z0-9._\/-]*\)".*/\1/p')
 silent=$(printf '%s' "$policy" | sed -n 's/.*"silent_updates_enabled":[[:space:]]*true.*/true/p; s/.*"silent_updates_enabled":[[:space:]]*false.*/false/p')
-[ -n "$approved" ] || exit 0
+decision=$(printf '%s' "$policy" | sed -n 's/.*"decision":"\([^"]*\)".*/\1/p')
+execution_authorized=$(printf '%s' "$policy" | sed -n 's/.*"execution_authorized":[[:space:]]*true.*/true/p; s/.*"execution_authorized":[[:space:]]*false.*/false/p')
+if [ "$decision" = upgrade_required ]; then
+  [ "$execution_authorized" = true ] || { report update_check "$(current_digest)" '' '' UPGRADE_AUTHORIZATION_REQUIRED 'structural release is waiting for operator authorization'; exit 0; }
+  report upgrade_started "$(current_digest)" '' '' '' 'structural release requires target deployment agent'
+  if [ ! -x "$ROOT/bin/meowai-deploy-upgrade-agent" ]; then
+    report upgrade_failed "$(current_digest)" '' '' AGENT_MISSING 'target deployment upgrade agent is not installed; run bootstrap'
+    exit 1
+  fi
+  if "$ROOT/bin/meowai-deploy-upgrade-agent" agent --root "$ROOT" --auto >/dev/null 2>&1; then
+    report upgrade_succeeded "$(current_digest)" '' '' '' 'structural deployment upgrade completed'
+    exit 0
+  fi
+  report upgrade_failed "$(current_digest)" '' '' AGENT_EXECUTION_FAILED 'target deployment upgrade agent failed; current deployment was left protected'
+  exit 1
+fi
+[ "$decision" = blocked ] && { report update_check "$(current_digest)" '' '' UPGRADE_BLOCKED 'structural release is blocked pending bootstrap or manual intervention'; exit 0; }
+[ -n "$approved" ] || { report update_check "$(current_digest)" '' '' '' 'no approved image update; current structural release is up to date'; exit 0; }
 [ "$repository" = "$REPOSITORY" ] || exit 0
 [ "$silent" = true ] || { report update_check "$(current_digest)" "$approved" '' '' 'approved update waiting for manual policy'; exit 0; }
 
@@ -157,18 +177,41 @@ fn render_script(config: &DeploymentConfig, newapi_port: u16) -> String {
 }
 
 fn render_service_unit(directory: &Path) -> String {
+    let raw_directory = directory.to_string_lossy();
+    let directory = systemd_quote(&raw_directory);
+    let credentials = systemd_quote(&format!("{raw_directory}/updater-credentials.env"));
+    let state_home = systemd_quote(&format!(
+        "MEOWAI_DEPLOY_HOME={raw_directory}/run/agent-state"
+    ));
+    let executable = systemd_quote(&format!("{raw_directory}/meowai-deploy-updater.sh"));
     format!(
-        "[Unit]\nDescription=MeowAI downstream approved-digest updater\nAfter=docker.service\nRequires=docker.service\n\n[Service]\nType=oneshot\nWorkingDirectory={}\nEnvironmentFile={}/updater-credentials.env\nExecStart={}/meowai-deploy-updater.sh\nUMask=0077\nPrivateTmp=true\nNoNewPrivileges=true\nReadWritePaths={}\n",
-        directory.display(),
-        directory.display(),
-        directory.display(),
-        directory.display(),
+        "[Unit]\nDescription=MeowAI downstream approved-digest updater\nAfter=docker.service\nRequires=docker.service\n\n[Service]\nType=oneshot\nWorkingDirectory={directory}\nEnvironmentFile={credentials}\nEnvironment={state_home}\nExecStart={executable}\nUMask=0077\nPrivateTmp=true\nNoNewPrivileges=true\nProtectSystem=strict\nProtectHome=true\nProtectKernelTunables=true\nProtectKernelModules=true\nProtectControlGroups=true\nRestrictSUIDSGID=true\nLockPersonality=true\nReadWritePaths={directory} /etc/systemd/system /run/systemd/system\n",
     )
+}
+
+fn systemd_quote(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace(' ', "\\x20")
+        .replace('"', "\\\"")
+        .replace('%', "%%")
 }
 
 const TIMER_UNIT: &[u8] = b"[Unit]\nDescription=Periodic MeowAI approved-digest check\n\n[Timer]\nOnBootSec=5min\nOnUnitActiveSec=15min\nRandomizedDelaySec=2min\nPersistent=true\nUnit=meowai-deploy-updater.service\n\n[Install]\nWantedBy=timers.target\n";
 
 pub fn install(
+    executor: &TargetExecutor,
+    config: &DeploymentConfig,
+    newapi_port: u16,
+) -> Result<()> {
+    install_paused(executor, config, newapi_port)?;
+    executor.run_in_directory(
+        "set -eu\nsystemctl daemon-reload\nsystemctl enable --now meowai-deploy-updater.timer",
+    )?;
+    Ok(())
+}
+
+pub fn install_paused(
     executor: &TargetExecutor,
     config: &DeploymentConfig,
     newapi_port: u16,
@@ -180,7 +223,7 @@ pub fn install(
     executor.write_file("meowai-deploy-updater.service", unit.as_bytes(), false)?;
     executor.write_file("meowai-deploy-updater.timer", TIMER_UNIT, false)?;
     executor.run_in_directory(
-        "set -eu\nchmod 700 meowai-deploy-updater.sh\nmkdir -p run backups\nchmod 700 run backups\nnow=$(date +%s)\nprintf '{\"status\":\"installed\",\"updated_at\":%s}\\n' \"$now\" > run/updater-status.json\nchmod 600 run/updater-status.json\ninstall -m 0644 meowai-deploy-updater.service /etc/systemd/system/meowai-deploy-updater.service\ninstall -m 0644 meowai-deploy-updater.timer /etc/systemd/system/meowai-deploy-updater.timer\nsystemctl daemon-reload\nsystemctl enable --now meowai-deploy-updater.timer",
+        "set -eu\nchmod 700 meowai-deploy-updater.sh\nmkdir -p run backups\nchmod 700 run backups\nnow=$(date +%s)\nprintf '{\"status\":\"installed\",\"updated_at\":%s}\\n' \"$now\" > run/updater-status.json\nchmod 600 run/updater-status.json\ninstall -m 0644 meowai-deploy-updater.service /etc/systemd/system/meowai-deploy-updater.service\ninstall -m 0644 meowai-deploy-updater.timer /etc/systemd/system/meowai-deploy-updater.timer\nsystemctl daemon-reload",
     )?;
     Ok(())
 }
@@ -231,6 +274,10 @@ mod tests {
     struct RuntimeScenario {
         current_is_approved: bool,
         silent_updates: bool,
+        decision: &'static str,
+        execution_authorized: bool,
+        agent_installed: bool,
+        agent_fails: bool,
         policy_unavailable: bool,
         postgres_backup_fails: bool,
         redis_backup_fails: bool,
@@ -246,6 +293,10 @@ mod tests {
             Self {
                 current_is_approved: false,
                 silent_updates: true,
+                decision: "image_only",
+                execution_authorized: true,
+                agent_installed: false,
+                agent_fails: false,
                 policy_unavailable: false,
                 postgres_backup_fails: false,
                 redis_backup_fails: false,
@@ -271,6 +322,8 @@ mod tests {
         listener: UnixListener,
         repository: String,
         silent_updates: bool,
+        decision: &'static str,
+        execution_authorized: bool,
         policy_unavailable: bool,
         events: Arc<Mutex<Vec<Value>>>,
         stop: Arc<AtomicBool>,
@@ -340,6 +393,8 @@ mod tests {
                     "image_digest": APPROVED_DIGEST,
                     "image_repository": repository,
                     "silent_updates_enabled": silent_updates,
+                    "decision": decision,
+                    "execution_authorized": execution_authorized,
                 })
                 .to_string()
             } else {
@@ -406,6 +461,13 @@ mod tests {
         let script = render_script(&config, 43127);
         let script_path = root.join("meowai-deploy-updater.sh");
         write_executable(&script_path, &script);
+        if scenario.agent_installed {
+            fs::create_dir_all(root.join("bin")).expect("create agent directory");
+            write_executable(
+                &root.join("bin/meowai-deploy-upgrade-agent"),
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$FAKE_ROOT/agent-invocation\"\n[ \"$FAKE_AGENT_FAIL\" != 1 ]\n",
+            );
+        }
 
         let docker = format!(
             r#"#!/bin/sh
@@ -483,12 +545,16 @@ esac
             let stop = Arc::clone(&stop);
             let repository = config.image.clone();
             let silent_updates = scenario.silent_updates;
+            let decision = scenario.decision;
+            let execution_authorized = scenario.execution_authorized;
             let policy_unavailable = scenario.policy_unavailable;
             thread::spawn(move || {
                 serve_control_socket(
                     listener,
                     repository,
                     silent_updates,
+                    decision,
+                    execution_authorized,
                     policy_unavailable,
                     events,
                     stop,
@@ -515,6 +581,7 @@ esac
             .env("FAKE_HEALTH_FAIL", flag(scenario.health_fails))
             .env("FAKE_SETUP_FAIL", flag(scenario.setup_fails))
             .env("FAKE_ROLLBACK_FAIL", flag(scenario.rollback_fails))
+            .env("FAKE_AGENT_FAIL", flag(scenario.agent_fails))
             .env("MEOWAI_UPDATER_HEALTH_ATTEMPTS", "1")
             .env("MEOWAI_UPDATER_LOCAL_CREDENTIAL", "runtime-test-token")
             .output()
@@ -579,10 +646,27 @@ esac
         assert!(
             service.contains("EnvironmentFile=/srv/meowai/downstream/updater-credentials.env\n")
         );
+        assert!(
+            service.contains(
+                "Environment=MEOWAI_DEPLOY_HOME=/srv/meowai/downstream/run/agent-state\n"
+            )
+        );
         assert!(service.contains("ExecStart=/srv/meowai/downstream/meowai-deploy-updater.sh\n"));
+        assert!(service.contains("ProtectSystem=strict\n"));
+        assert!(service.contains("NoNewPrivileges=true\n"));
         assert!(!service.contains("ssh"));
         assert!(timer.contains("Persistent=true\n"));
         assert!(timer.contains("WantedBy=timers.target\n"));
+    }
+
+    #[test]
+    fn updater_systemd_unit_quotes_remote_paths_and_specifiers() {
+        let service = render_service_unit(Path::new("/srv/Meow AI/tenant%20"));
+        assert!(service.contains("WorkingDirectory=/srv/Meow\\x20AI/tenant%%20\n"));
+        assert!(
+            service.contains("ExecStart=/srv/Meow\\x20AI/tenant%%20/meowai-deploy-updater.sh\n")
+        );
+        assert!(!service.contains("tenant%20/meowai"));
     }
 
     #[test]
@@ -645,6 +729,68 @@ esac
     }
 
     #[test]
+    fn updater_runtime_delegates_structural_release_to_installed_agent() {
+        let result = run_runtime(RuntimeScenario {
+            decision: "upgrade_required",
+            agent_installed: true,
+            ..RuntimeScenario::default()
+        });
+
+        assert!(result.output.status.success());
+        assert_eq!(
+            event_types(&result),
+            ["upgrade_started", "upgrade_succeeded"]
+        );
+        assert_eq!(
+            fs::read_to_string(result.root.join("agent-invocation"))
+                .expect("read agent invocation")
+                .trim(),
+            format!("agent --root {} --auto", result.root.display())
+        );
+        assert!(!result.root.join("update-attempted").exists());
+        assert_eq!(
+            fs::read_to_string(result.root.join("current-digest")).expect("read current digest"),
+            CURRENT_DIGEST
+        );
+    }
+
+    #[test]
+    fn updater_runtime_waits_cleanly_for_structural_authorization() {
+        let result = run_runtime(RuntimeScenario {
+            decision: "upgrade_required",
+            execution_authorized: false,
+            agent_installed: true,
+            ..RuntimeScenario::default()
+        });
+
+        assert!(result.output.status.success());
+        assert_eq!(event_types(&result), ["update_check"]);
+        assert_eq!(
+            result.events[0]["error_code"],
+            "UPGRADE_AUTHORIZATION_REQUIRED"
+        );
+        assert!(!result.root.join("agent-invocation").exists());
+        assert!(!result.root.join("update-attempted").exists());
+    }
+
+    #[test]
+    fn updater_runtime_blocks_structural_release_when_agent_is_missing() {
+        let result = run_runtime(RuntimeScenario {
+            decision: "upgrade_required",
+            ..RuntimeScenario::default()
+        });
+
+        assert!(!result.output.status.success());
+        assert_eq!(event_types(&result), ["upgrade_started", "upgrade_failed"]);
+        assert_eq!(result.events[1]["error_code"], "AGENT_MISSING");
+        assert!(!result.root.join("update-attempted").exists());
+        assert_eq!(
+            fs::read_to_string(result.root.join("current-digest")).expect("read current digest"),
+            CURRENT_DIGEST
+        );
+    }
+
+    #[test]
     fn updater_runtime_stops_before_update_when_postgres_backup_fails() {
         let result = run_runtime(RuntimeScenario {
             postgres_backup_fails: true,
@@ -698,15 +844,30 @@ esac
                     policy_unavailable: true,
                     ..RuntimeScenario::default()
                 },
-                vec![],
+                vec!["update_failed"],
             ),
         ] {
             let result = run_runtime(scenario);
-            assert!(
-                result.output.status.success(),
-                "{name}: {:?}",
-                result.events
-            );
+            if scenario.policy_unavailable {
+                assert!(
+                    !result.output.status.success(),
+                    "{name}: {:?}",
+                    result.events
+                );
+                assert_eq!(result.events[0]["error_code"], "POLICY_FETCH_FAILED");
+                let updater_state: Value = serde_json::from_slice(
+                    &fs::read(result.root.join("run/updater-status.json"))
+                        .expect("read updater status"),
+                )
+                .expect("parse updater status");
+                assert_eq!(updater_state["status"], "update_failed");
+            } else {
+                assert!(
+                    result.output.status.success(),
+                    "{name}: {:?}",
+                    result.events
+                );
+            }
             assert_eq!(event_types(&result), expected_events, "{name}");
             assert!(
                 fs::read_dir(result.root.join("backups"))

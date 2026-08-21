@@ -36,6 +36,11 @@ pub enum Command {
     Logout(DeploymentArgs),
     /// Check for or install a newer meowai-deploy release.
     Update(UpdateArgs),
+    /// Plan or apply a complete target deployment upgrade.
+    Upgrade(UpgradeArgs),
+    /// Internal target-host entrypoint used by the installed systemd updater.
+    #[command(hide = true)]
+    Agent(AgentArgs),
 }
 
 #[derive(Debug, Args)]
@@ -95,6 +100,52 @@ pub struct UpdateArgs {
     /// Install an available update without asking for confirmation.
     #[arg(long)]
     pub yes: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct UpgradeArgs {
+    /// Read the control-plane release decision without changing the target.
+    #[arg(long)]
+    pub check: bool,
+
+    /// Print the complete upgrade plan without applying it.
+    #[arg(long)]
+    pub plan: bool,
+
+    /// Apply only a previously reviewed, unchanged plan.
+    #[arg(long)]
+    pub yes: bool,
+
+    /// Fingerprint returned by `upgrade --plan`.
+    #[arg(long)]
+    pub plan_fingerprint: Option<String>,
+
+    /// Reinstall the target upgrade agent before planning.
+    #[arg(long)]
+    pub repair_updater: bool,
+
+    /// Bootstrap a legacy target into the managed deployment-upgrade path.
+    #[arg(long)]
+    pub bootstrap: bool,
+
+    /// Upgrade to a specific approved release instead of the current release.
+    #[arg(long, value_name = "RELEASE_ID")]
+    pub release: Option<String>,
+
+    /// Roll back a prior deployment upgrade operation.
+    #[arg(long, value_name = "OPERATION_ID", conflicts_with_all = ["check", "plan", "release", "repair_updater", "bootstrap"])]
+    pub rollback: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct AgentArgs {
+    /// Target deployment root containing downstream-credentials.env.
+    #[arg(long, value_name = "DIRECTORY")]
+    pub root: PathBuf,
+
+    /// Required for the non-interactive systemd execution path.
+    #[arg(long)]
+    pub auto: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]

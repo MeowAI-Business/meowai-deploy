@@ -6,7 +6,8 @@ mod pricing;
 
 pub use auth::{SourceAccountMode, SourceCredentials, SourceIdentity};
 pub use deployments::{
-    DeploymentMetadata, DeploymentRegistration, LifecycleReport, send_lifecycle_report,
+    DeploymentMetadata, DeploymentRegistration, LifecycleReport, ReleaseTrustMetadata,
+    UpgradeTransitionReport, control_plane_client, send_lifecycle_report, send_upgrade_transition,
 };
 pub use groups::{
     GroupCatalog, GroupTokenPlan, GroupTokenPlanEntry, RemovedGroupTokenPlan, SourceGroup,

@@ -1,0 +1,77 @@
+{
+  "name": "${MEOWAI_CONTAINER_NAME}",
+  "services": {
+    "new-api": {
+      "image": "${MEOWAI_IMAGE_REFERENCE}",
+      "pull_policy": "missing",
+      "container_name": "${MEOWAI_CONTAINER_NAME}",
+      "restart": "unless-stopped",
+      "ports": ["${MEOWAI_NEWAPI_BIND}:${MEOWAI_NEWAPI_PORT}:3000"],
+      "volumes": ["./data/newapi:/data", "./run:/run/meowai"],
+      "environment": {
+        "SQL_DSN": "postgresql://meowai:${POSTGRES_PASSWORD}@postgres:5432/newapi",
+        "REDIS_CONN_STRING": "redis://:${REDIS_PASSWORD}@redis:6379",
+        "SESSION_SECRET": "${SESSION_SECRET}",
+        "TZ": "Asia/Shanghai",
+        "SESSION_COOKIE_SECURE": "false",
+        "MEOWAI_DOWNSTREAM_KUMA_HEALTH_URL": "http://uptime-kuma:3001/api/entry-page"
+      },
+      "env_file": ["downstream-credentials.env", "updater-credentials.env"],
+      "extra_hosts": ["host.docker.internal:host-gateway"],
+      "depends_on": {
+        "postgres": {"condition": "service_healthy"},
+        "redis": {"condition": "service_healthy"}
+      },
+      "healthcheck": {
+        "test": ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/status"],
+        "interval": "5s",
+        "timeout": "3s",
+        "retries": 30
+      }
+    },
+    "postgres": {
+      "image": "postgres:15-alpine",
+      "container_name": "${MEOWAI_CONTAINER_NAME}-postgres",
+      "restart": "unless-stopped",
+      "environment": {
+        "POSTGRES_USER": "meowai",
+        "POSTGRES_PASSWORD": "${POSTGRES_PASSWORD}",
+        "POSTGRES_DB": "newapi"
+      },
+      "volumes": ["./data/postgres:/var/lib/postgresql/data"],
+      "healthcheck": {
+        "test": ["CMD-SHELL", "pg_isready -U meowai -d newapi"],
+        "interval": "5s",
+        "timeout": "3s",
+        "retries": 30
+      }
+    },
+    "redis": {
+      "image": "redis:7-alpine",
+      "container_name": "${MEOWAI_CONTAINER_NAME}-redis",
+      "restart": "unless-stopped",
+      "command": ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD}"],
+      "environment": {"REDIS_PASSWORD": "${REDIS_PASSWORD}"},
+      "volumes": ["./data/redis:/data"],
+      "healthcheck": {
+        "test": ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"],
+        "interval": "5s",
+        "timeout": "3s",
+        "retries": 30
+      }
+    },
+    "uptime-kuma": {
+      "image": "louislam/uptime-kuma:2.5.0",
+      "container_name": "${MEOWAI_CONTAINER_NAME}-uptime-kuma",
+      "restart": "unless-stopped",
+      "ports": ["${MEOWAI_KUMA_BIND}:${MEOWAI_KUMA_PORT}:3001"],
+      "volumes": ["./data/uptime-kuma:/app/data"],
+      "healthcheck": {
+        "test": ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/api/entry-page').then(response => { if (!response.ok) process.exit(1); }).catch(() => process.exit(1))"],
+        "interval": "5s",
+        "timeout": "3s",
+        "retries": 30
+      }
+    }
+  }
+}

@@ -46,7 +46,7 @@ use crate::{
     target::compose::DeploymentRuntime,
     target::kuma,
     target::newapi::NewApiClient,
-    updater, web,
+    updater, upgrade, web,
 };
 
 #[cfg(test)]
@@ -77,6 +77,9 @@ impl EventSink for CliEventSink {
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
+    if let Some(Command::Agent(args)) = cli.command {
+        return upgrade::run_agent(&args).await;
+    }
     match lifecycle_outbox::flush().await {
         Ok(sent) if sent > 0 => print_done(&format!("已补送 {sent} 条待处理生命周期事件")),
         Err(error) => eprintln!(
@@ -85,7 +88,10 @@ pub async fn run(cli: Cli) -> Result<()> {
         ),
         _ => {}
     }
-    if !matches!(cli.command, Some(Command::Update(_) | Command::Web(_))) {
+    if !matches!(
+        cli.command,
+        Some(Command::Update(_) | Command::Upgrade(_) | Command::Agent(_) | Command::Web(_))
+    ) {
         updater::check_periodically().await;
     }
     match cli.command {
@@ -109,6 +115,8 @@ pub async fn run(cli: Cli) -> Result<()> {
         Some(Command::Rollback(args)) => run_rollback(&args).await,
         Some(Command::Logout(args)) => run_logout(&args).await,
         Some(Command::Update(args)) => updater::run(&args).await,
+        Some(Command::Upgrade(args)) => upgrade::run(&args).await,
+        Some(Command::Agent(_)) => unreachable!("agent command handled before lifecycle setup"),
     }
 }
 
@@ -1874,6 +1882,8 @@ mod tests {
             snapshot_interval_seconds: 300,
             silent_updates_enabled: true,
             release_schema_version: "1".to_owned(),
+            release_manifest_public_key: String::new(),
+            release_artifact_allowed_hosts: Vec::new(),
         }
     }
 
@@ -1945,7 +1955,18 @@ mod tests {
             kuma_port: 0,
             image: String::new(),
             image_ref: String::new(),
+            deployment_schema: "1".to_owned(),
+            updater_schema: "1".to_owned(),
+            data_schema: "1".to_owned(),
+            cli_schema: "1".to_owned(),
+            target_os: String::new(),
+            target_arch: String::new(),
+            systemd_available: false,
+            compose_v2_available: false,
+            last_upgrade_release_id: String::new(),
+            last_upgrade_state: String::new(),
             image_digest: String::new(),
+            newapi_version: String::new(),
             source_user_id: 0,
             source_group_sha256: String::new(),
             status_key_id: 0,
@@ -1989,7 +2010,18 @@ mod tests {
             kuma_port: 0,
             image: String::new(),
             image_ref: String::new(),
+            deployment_schema: "1".to_owned(),
+            updater_schema: "1".to_owned(),
+            data_schema: "1".to_owned(),
+            cli_schema: "1".to_owned(),
+            target_os: String::new(),
+            target_arch: String::new(),
+            systemd_available: false,
+            compose_v2_available: false,
+            last_upgrade_release_id: String::new(),
+            last_upgrade_state: String::new(),
             image_digest: String::new(),
+            newapi_version: String::new(),
             source_user_id: 0,
             source_group_sha256: String::new(),
             status_key_id: 0,

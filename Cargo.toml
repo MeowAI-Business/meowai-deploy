@@ -1,6 +1,6 @@
 [package]
 name = "meowai-deploy"
-version = "1.2.2"
+version = "1.2.3"
 edition = "2024"
 description = "Interactive deployment CLI for MeowAI downstream New API sites"
 license = "MIT"
@@ -15,6 +15,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 cliclack = "0.5.6"
 comfy-table = "7.1"
 console = "0.16"
+ed25519-dalek = "2.1"
 fs2 = "0.4"
 futures-util = "0.3"
 hmac = "0.12"
@@ -27,7 +28,9 @@ serde_json = "1.0"
 sha2 = "0.10"
 shell-escape = "0.1"
 tempfile = "3.15"
+tar = "0.4"
 thiserror = "2.0"
+zstd = "0.13"
 include_dir = "0.7"
 tokio = { version = "1.44", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["sync"] }

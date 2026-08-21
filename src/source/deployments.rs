@@ -18,6 +18,10 @@ pub struct DeploymentRegistration {
     pub snapshot_interval_seconds: u32,
     pub silent_updates_enabled: bool,
     pub release_schema_version: String,
+    #[serde(default)]
+    pub release_manifest_public_key: String,
+    #[serde(default)]
+    pub release_artifact_allowed_hosts: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -31,6 +35,39 @@ struct RegistrationData {
     snapshot_interval_seconds: u32,
     silent_updates_enabled: bool,
     release_schema_version: String,
+    #[serde(default)]
+    release_manifest_public_key: String,
+    #[serde(default)]
+    release_artifact_allowed_hosts: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ReleaseTrustMetadata {
+    pub release_manifest_public_key: String,
+    pub release_artifact_allowed_hosts: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct CapabilityReadback {
+    #[serde(default)]
+    pub newapi_version: String,
+    pub image_repository: String,
+    pub image_digest: String,
+    pub deployment_schema: String,
+    pub updater_schema: String,
+    pub cli_schema: String,
+    pub data_schema: String,
+    pub last_upgrade_release_id: String,
+    pub last_upgrade_state: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct CapabilityReceipt {
+    pub accepted: bool,
+    pub deployment_id: String,
+    pub installation_generation: u32,
+    pub observed_at: i64,
+    pub capability: CapabilityReadback,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -48,6 +85,28 @@ pub struct LifecycleReport {
     pub state: String,
     pub reason: String,
     pub occurred_at: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct UpgradeTransitionReport {
+    pub operation_id: String,
+    pub release_id: String,
+    pub state: String,
+    pub phase: String,
+    pub backup_id: String,
+    pub error_code: String,
+    pub error_summary: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct UpgradePlanReceipt {
+    pub accepted: bool,
+    pub operation_id: String,
+    pub release_id: String,
+    pub state: String,
+    pub plan_fingerprint: String,
+    pub execution_mode: String,
+    pub authorization_id: String,
 }
 
 impl LifecycleReport {
@@ -114,6 +173,8 @@ impl SourceClient {
             snapshot_interval_seconds: data.snapshot_interval_seconds,
             silent_updates_enabled: data.silent_updates_enabled,
             release_schema_version: data.release_schema_version,
+            release_manifest_public_key: data.release_manifest_public_key,
+            release_artifact_allowed_hosts: data.release_artifact_allowed_hosts,
         })
     }
 
@@ -199,16 +260,150 @@ impl SourceClient {
         let _ = require_data(envelope, path)?;
         Ok(())
     }
+
+    pub async fn report_upgrade_plan(
+        &self,
+        registration: &DeploymentRegistration,
+        operation_id: &str,
+        release_id: &str,
+        decision: &str,
+        plan_fingerprint: &str,
+        current_capability: serde_json::Value,
+        target_capability: serde_json::Value,
+        execution_mode: &str,
+        authorization_id: &str,
+    ) -> SourceResult<UpgradePlanReceipt> {
+        let path = format!(
+            "/api/onboard/deployments/{}/upgrades/plan",
+            registration.deployment_id
+        );
+        let envelope = self
+            .signed_request_with_credential(
+                Method::POST,
+                &path,
+                &registration.control_plane_url,
+                Some(json!({
+                "schema_version": "1",
+                "deployment_id": registration.deployment_id,
+                "installation_generation": registration.installation_generation,
+                "operation_id": operation_id,
+                "release_id": release_id,
+                "decision": decision,
+                "plan_fingerprint": plan_fingerprint,
+                "current_capability": current_capability,
+                "target_capability": target_capability,
+                "execution_mode": execution_mode,
+                "authorization_id": authorization_id,
+                })),
+                &registration.report_credential,
+                registration.installation_generation,
+            )
+            .await?;
+        require_data(envelope, &path)
+    }
+
+    pub async fn report_capability(
+        &self,
+        registration: &DeploymentRegistration,
+        capability: serde_json::Value,
+    ) -> SourceResult<CapabilityReceipt> {
+        let path = format!(
+            "/api/onboard/deployments/{}/capabilities",
+            registration.deployment_id
+        );
+        let envelope = self
+            .signed_request_with_credential(
+                Method::POST,
+                &path,
+                &registration.control_plane_url,
+                Some(json!({
+                "schema_version": "1",
+                "deployment_id": registration.deployment_id,
+                "installation_generation": registration.installation_generation,
+                "capability": capability,
+                })),
+                &registration.report_credential,
+                registration.installation_generation,
+            )
+            .await?;
+        require_data(envelope, &path)
+    }
+
+    pub async fn release_trust_metadata(
+        &self,
+        registration: &DeploymentRegistration,
+    ) -> SourceResult<ReleaseTrustMetadata> {
+        let path = format!(
+            "/api/onboard/deployments/{}/release-trust",
+            registration.deployment_id
+        );
+        let envelope = self
+            .signed_request_with_credential(
+                Method::GET,
+                &path,
+                &registration.control_plane_url,
+                Some(json!({
+                    "schema_version": "1",
+                    "deployment_id": registration.deployment_id,
+                    "installation_generation": registration.installation_generation,
+                })),
+                &registration.report_credential,
+                registration.installation_generation,
+            )
+            .await?;
+        require_data(envelope, &path)
+    }
+
+    pub async fn report_upgrade_transition(
+        &self,
+        registration: &DeploymentRegistration,
+        report: &UpgradeTransitionReport,
+    ) -> SourceResult<()> {
+        let path = format!(
+            "/api/onboard/deployments/{}/upgrades/{}/transition",
+            registration.deployment_id, report.operation_id
+        );
+        self.report_request(
+            Method::POST,
+            &path,
+            Some(json!({
+                "schema_version": "1",
+                "deployment_id": registration.deployment_id,
+                "installation_generation": registration.installation_generation,
+                "operation_id": report.operation_id,
+                "release_id": report.release_id,
+                "state": report.state,
+                "phase": report.phase,
+                "backup_id": report.backup_id,
+                "error_code": report.error_code,
+                "error_summary": report.error_summary,
+            })),
+            registration,
+        )
+        .await
+    }
+}
+
+pub fn control_plane_client(registration: &DeploymentRegistration) -> SourceResult<SourceClient> {
+    let mut root = super::control_plane_endpoint(&registration.control_plane_url, "/")?;
+    root.set_path("/");
+    SourceClient::new(root.as_str())
 }
 
 pub async fn send_lifecycle_report(
     registration: &DeploymentRegistration,
     report: &LifecycleReport,
 ) -> SourceResult<()> {
-    let mut root = super::control_plane_endpoint(&registration.control_plane_url, "/")?;
-    root.set_path("/");
-    let client = SourceClient::new(root.as_str())?;
+    let client = control_plane_client(registration)?;
     client.report_lifecycle_event(registration, report).await
+}
+
+pub async fn send_upgrade_transition(
+    registration: &DeploymentRegistration,
+    report: &UpgradeTransitionReport,
+) -> SourceResult<()> {
+    let client = control_plane_client(registration)?;
+    client.report_upgrade_transition(registration, report).await
 }
 
 #[cfg(test)]
@@ -249,6 +444,8 @@ mod tests {
             snapshot_interval_seconds: 300,
             silent_updates_enabled: true,
             release_schema_version: "1".to_owned(),
+            release_manifest_public_key: String::new(),
+            release_artifact_allowed_hosts: Vec::new(),
         };
         client
             .update_deployment_metadata(

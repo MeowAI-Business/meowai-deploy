@@ -112,8 +112,30 @@ pub struct DeploymentState {
     pub kuma_port: u16,
     pub image: String,
     pub image_ref: String,
+    #[serde(default = "default_schema_version")]
+    pub deployment_schema: String,
+    #[serde(default = "default_schema_version")]
+    pub updater_schema: String,
+    #[serde(default = "default_schema_version")]
+    pub data_schema: String,
+    #[serde(default = "default_schema_version")]
+    pub cli_schema: String,
+    #[serde(default)]
+    pub target_os: String,
+    #[serde(default)]
+    pub target_arch: String,
+    #[serde(default)]
+    pub systemd_available: bool,
+    #[serde(default)]
+    pub compose_v2_available: bool,
+    #[serde(default)]
+    pub last_upgrade_release_id: String,
+    #[serde(default)]
+    pub last_upgrade_state: String,
     #[serde(default)]
     pub image_digest: String,
+    #[serde(default)]
+    pub newapi_version: String,
     #[serde(default)]
     pub source_user_id: i64,
     #[serde(default)]
@@ -140,6 +162,10 @@ pub struct DeploymentState {
     pub snapshot_schema_version: u32,
     #[serde(default)]
     pub last_applied_at: BTreeMap<String, i64>,
+}
+
+fn default_schema_version() -> String {
+    "1".to_owned()
 }
 
 impl DeploymentState {

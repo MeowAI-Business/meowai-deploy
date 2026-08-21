@@ -4,6 +4,7 @@ pub mod newapi;
 pub mod remote_path;
 pub mod ssh;
 pub mod updater;
+pub mod upgrade_agent;
 
 use std::{
     borrow::Cow,
@@ -167,11 +168,13 @@ if command -v docker >/dev/null 2>&1; then docker_cli=pass; else docker_cli=fail
 if docker info >/dev/null 2>&1; then docker_daemon=pass; else docker_daemon=fail; fi
 if docker compose version >/dev/null 2>&1; then compose=pass; else compose=fail; fi
 if command -v curl >/dev/null 2>&1; then curl=pass; else curl=fail; fi
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then systemd=pass; else systemd=fail; fi
 if mkdir -p {root} 2>/dev/null && test -w {root}; then directory=pass; else directory=fail; fi
 printf 'docker_cli=%s\n' "$docker_cli"
 printf 'docker_daemon=%s\n' "$docker_daemon"
 printf 'compose=%s\n' "$compose"
 printf 'curl=%s\n' "$curl"
+printf 'systemd=%s\n' "$systemd"
 printf 'directory=%s\n' "$directory"
 disk_bytes=$(df -Pk {root} 2>/dev/null | awk 'NR==2 {{print $4 * 1024}}')
 printf 'disk_bytes=%s\n' "${{disk_bytes:-unknown}}"
@@ -332,7 +335,7 @@ fi"#,
 registry_config=$(mktemp -d)
 trap 'rm -rf "$registry_config"' EXIT HUP INT TERM
 printf '%s' {password} | docker --config "$registry_config" login {registry} --username {username} --password-stdin >/dev/null
-docker --config "$registry_config" pull --platform linux/amd64 {image}"#,
+docker --config "$registry_config" pull {image}"#,
             password = quote(credentials.password()),
             registry = quote(registry),
             username = quote(credentials.username()),
@@ -465,6 +468,22 @@ docker --config "$registry_config" pull --platform linux/amd64 {image}"#,
         ))
     }
 
+    /// Read the public NewAPI status endpoint from the target network namespace.
+    pub fn newapi_version(&self, port: u16) -> Result<String> {
+        let output = self.run_script(&format!(
+            "set -eu\nresponse=$(curl --fail --silent --show-error --max-time 5 http://127.0.0.1:{port}/api/status)\nprintf '%s' \"$response\"",
+        ))?;
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+            AppError::State(format!("NewAPI /api/status 返回无效 JSON：{error}"))
+        })?;
+        if value.get("success").and_then(serde_json::Value::as_bool) == Some(false) {
+            return Err(AppError::State(
+                "NewAPI /api/status 返回失败状态".to_owned(),
+            ));
+        }
+        Ok(public_newapi_version(&value).unwrap_or_else(|| "unreported".to_owned()))
+    }
+
     fn run_script_raw(&self, script: &str) -> Result<Output> {
         self.spawn_script(script)?
             .wait_with_output()
@@ -549,6 +568,16 @@ fn validate_relative_name(relative: &str) -> Result<()> {
     Ok(())
 }
 
+fn public_newapi_version(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("version")
+        .or_else(|| value.get("data").and_then(|data| data.get("version")))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 64)
+        .map(ToOwned::to_owned)
+}
+
 fn quote_path(path: &Path) -> String {
     quote(&path.to_string_lossy())
 }
@@ -627,6 +656,18 @@ mod tests {
             .allocate_port(occupied, &[])
             .expect("find the next available port");
         assert_ne!(selected, occupied);
+    }
+
+    #[test]
+    fn newapi_version_supports_current_envelope_and_unreported_builds() {
+        assert_eq!(
+            public_newapi_version(&serde_json::json!({"data": {"version": "1.2.3"}})),
+            Some("1.2.3".to_owned())
+        );
+        assert_eq!(
+            public_newapi_version(&serde_json::json!({"data": {"version": ""}})),
+            None
+        );
     }
 
     #[test]
