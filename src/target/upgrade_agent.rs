@@ -2796,7 +2796,11 @@ mod tests {
         assert!(validate_data_migration_policy(&value, true).is_err());
     }
 
-    #[cfg(unix)]
+    // The production data-migration runner intentionally uses GNU timeout,
+    // which is part of the Linux target contract. Keep this integration test
+    // on Linux so macOS's incompatible BSD timeout is not mistaken for a
+    // migration failure.
+    #[cfg(target_os = "linux")]
     #[test]
     fn data_migration_runtime_writes_marker_only_after_success() {
         use std::os::unix::fs::PermissionsExt;

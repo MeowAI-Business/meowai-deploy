@@ -55,6 +55,7 @@ impl Fixture {
         ] {
             fs::create_dir_all(root.join(dir)).expect("fixture directory");
         }
+        fs::create_dir_all(root.join("systemd")).expect("fixture systemd directory");
         fs::create_dir_all(&fake_bin).expect("fake bin");
         fs::create_dir_all(&home).expect("agent home");
         fs::write(root.join("data/postgres/business"), "postgres-original\n").unwrap();
@@ -76,6 +77,7 @@ impl Fixture {
         fs::write(root.join("meowai-deploy-updater.timer"), "old-timer\n").unwrap();
         let socket = UnixListener::bind(root.join("run/updater.sock")).expect("updater socket");
         write_executable(&fake_bin.join("docker"), &docker_script());
+        write_executable(&fake_bin.join("install"), &install_script());
         write_executable(&fake_bin.join("systemctl"), &systemctl_script());
         write_executable(&fake_bin.join("curl"), &curl_script());
         let path = format!(
@@ -948,6 +950,38 @@ case "$*" in
   *'is-active'*) test -f "$root/timer-active" ;;
   *) exit 0 ;;
 esac
+"#
+    .to_owned()
+}
+
+fn install_script() -> String {
+    r#"#!/bin/sh
+set -eu
+root=${FAKE_ROOT:?}
+mode=644
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -m)
+      mode=$2
+      shift 2
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+source=${1:?}
+destination=${2:?}
+case "$destination" in
+  /etc/systemd/system/*)
+    destination="$root/systemd/${destination##*/}"
+    ;;
+esac
+exec /usr/bin/install -m "$mode" "$source" "$destination"
 "#
     .to_owned()
 }
