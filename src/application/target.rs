@@ -43,7 +43,7 @@ pub fn probe_deployment_connection(
     TargetExecutor::new(target, PathBuf::new())
         .with_ssh_password(ssh_password)
         .fingerprint()
-        .map_err(target_error)
+        .map_err(connection_error)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -254,7 +254,7 @@ fn validation_error(error: input::ValidationError) -> ApplicationError {
 }
 
 fn target_error(error: AppError) -> ApplicationError {
-    if matches!(&error, AppError::Target(message) if message.starts_with("SSH 认证失败")) {
+    if error.to_string().contains("SSH_AUTHENTICATION_FAILED") {
         return ApplicationError::new(
             ErrorCategory::Authentication,
             "SSH_AUTHENTICATION_FAILED",
@@ -269,6 +269,41 @@ fn target_error(error: AppError) -> ApplicationError {
         true,
     )
     .with_diagnostic(error.to_string())
+}
+
+fn connection_error(error: AppError) -> ApplicationError {
+    let detail = error.to_string();
+    if detail.contains("SSH_AUTHENTICATION_FAILED") {
+        return ApplicationError::new(
+            ErrorCategory::Authentication,
+            "SSH_AUTHENTICATION_FAILED",
+            "SSH 认证失败，请检查密码、密钥或 ssh-agent。",
+            true,
+        )
+        .with_diagnostic(detail);
+    }
+    let (code, message) = if detail.contains("SSH_HOST_KEY_UNKNOWN") {
+        (
+            "SSH_HOST_KEY_UNKNOWN",
+            "SSH 主机密钥未知，请先确认并接受该主机密钥。",
+        )
+    } else if detail.contains("SSH_HOST_KEY_CHANGED") {
+        (
+            "SSH_HOST_KEY_CHANGED",
+            "SSH 主机密钥已变化，请检查 known_hosts 后重试。",
+        )
+    } else if detail.contains("SSH_CLIENT_MISSING") {
+        (
+            "SSH_CLIENT_MISSING",
+            "未找到 OpenSSH 客户端，请先安装或运行 bootstrap。",
+        )
+    } else {
+        (
+            "SSH_CONNECTION_FAILED",
+            "SSH 连接失败，请检查地址、网络或 SSH 服务。",
+        )
+    };
+    ApplicationError::new(ErrorCategory::Target, code, message, true).with_diagnostic(detail)
 }
 
 #[cfg(test)]
@@ -329,6 +364,18 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(suggestions.len(), 2);
         assert_ne!(suggestions[0], suggestions[1]);
+    }
+
+    #[test]
+    fn connection_failures_do_not_claim_site_checks_failed() {
+        let error = connection_error(AppError::Target(
+            "target operation failed: SSH_CONNECTION_FAILED: SSH 连接预检失败".to_owned(),
+        ));
+        assert_eq!(error.code, "SSH_CONNECTION_FAILED");
+        assert_eq!(error.message, "SSH 连接失败，请检查地址、网络或 SSH 服务。");
+        assert!(!error.message.contains("目录"));
+        assert!(!error.message.contains("端口"));
+        assert!(!error.message.contains("Docker"));
     }
 
     #[tokio::test]

@@ -189,7 +189,9 @@ exit 0"#,
     }
 
     pub fn fingerprint(&self) -> Result<String> {
-        let output = self.run_script(
+        // Connection-only preflight must not depend on a deployment directory.
+        // Fingerprinting only needs unprivileged host identity data.
+        let output = self.run_unscoped_script(
             "host=$(uname -n 2>/dev/null || hostname)\nif [ -r /etc/machine-id ]; then machine=$(cat /etc/machine-id); else machine=unknown; fi\nprintf '%s|%s' \"$host\" \"$machine\"",
         )?;
         let identity = format!(
@@ -405,6 +407,34 @@ docker --config "$registry_config" pull {image}"#,
     pub fn run_script(&self, script: &str) -> Result<Output> {
         let output = self.run_script_raw(script)?;
         require_success("target script", output)
+    }
+
+    fn run_unscoped_script(&self, script: &str) -> Result<Output> {
+        let output = match &self.target {
+            Target::Local => Command::new("sh")
+                .args(["-s"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .and_then(|mut child| {
+                    child
+                        .stdin
+                        .as_mut()
+                        .ok_or_else(|| std::io::Error::other("target shell stdin unavailable"))?
+                        .write_all(script.as_bytes())?;
+                    drop(child.stdin.take());
+                    child.wait_with_output()
+                })
+                .map_err(|error| {
+                    AppError::Target(format!("run target identity script: {error}"))
+                })?,
+            Target::Ssh { destination } => self
+                .ssh_client()?
+                .exec(destination, "sh -s", script.as_bytes())
+                .map_err(ssh_error)?,
+        };
+        require_success("target identity script", output)
     }
 
     pub fn run_script_streaming<F>(&self, script: &str, mut on_stdout: F) -> Result<Output>
@@ -703,6 +733,15 @@ mod tests {
         assert!(PRIVILEGED_SCRIPT_RUNNER.contains("sudo -n sh -c true"));
         assert!(PRIVILEGED_SCRIPT_RUNNER.contains("sudo -n sh -s"));
         assert!(PRIVILEGED_SCRIPT_RUNNER.contains("exec sh -s"));
+    }
+
+    #[test]
+    fn fingerprint_does_not_require_a_deployment_directory() {
+        let executor = TargetExecutor::new(Target::Local, PathBuf::new());
+        let fingerprint = executor
+            .fingerprint()
+            .expect("host identity should not need a deployment directory");
+        assert!(!fingerprint.is_empty());
     }
 
     #[test]

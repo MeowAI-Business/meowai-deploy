@@ -363,9 +363,12 @@ struct TargetPreflightRequest {
     target: WebDeploymentTarget,
     ssh_destination: Option<String>,
     ssh_password: Option<String>,
-    directory: String,
-    newapi_port: u16,
-    kuma_port: u16,
+    #[serde(default)]
+    directory: Option<String>,
+    #[serde(default)]
+    newapi_port: Option<u16>,
+    #[serde(default)]
+    kuma_port: Option<u16>,
     #[serde(default)]
     check_site: bool,
 }
@@ -1144,11 +1147,20 @@ async fn preflight_target(
         },
     };
     if payload.check_site {
+        let directory = payload
+            .directory
+            .ok_or_else(|| ApiError::bad_request("WEB_FIELD_REQUIRED", "请填写部署目录"))?;
+        let newapi_port = payload
+            .newapi_port
+            .ok_or_else(|| ApiError::bad_request("WEB_FIELD_REQUIRED", "请填写 NewAPI 端口"))?;
+        let kuma_port = payload.kuma_port.ok_or_else(|| {
+            ApiError::bad_request("WEB_FIELD_REQUIRED", "请填写 Uptime Kuma 端口")
+        })?;
         let request = DeploymentTargetProbeRequest {
             target,
-            directory: payload.directory.into(),
-            newapi_port: payload.newapi_port,
-            kuma_port: payload.kuma_port,
+            directory: directory.into(),
+            newapi_port,
+            kuma_port,
             ssh_password: optional_secret(payload.ssh_password),
         };
         let probe = tokio::task::spawn_blocking(move || {
@@ -1175,8 +1187,9 @@ async fn preflight_target(
     .map_err(ApiError::from_application)?;
     Ok(Json(TargetPreflightResponse {
         fingerprint,
-        newapi_port: payload.newapi_port,
-        kuma_port: payload.kuma_port,
+        // Connection-only preflight deliberately has no site settings yet.
+        newapi_port: payload.newapi_port.unwrap_or_default(),
+        kuma_port: payload.kuma_port.unwrap_or_default(),
     }))
 }
 

@@ -98,7 +98,11 @@ describe("deployment workbench", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("无法连接部署目标");
     expect(screen.getByRole("heading", { name: "部署位置" })).toBeInTheDocument();
     const preflightCall = vi.mocked(fetch).mock.calls.find(([path]) => String(path).endsWith("/api/preflight/target"));
-    expect(JSON.parse(String(preflightCall?.[1]?.body))).toMatchObject({ ssh_password: sshPassword, check_site: false });
+    const requestBody = JSON.parse(String(preflightCall?.[1]?.body));
+    expect(requestBody).toMatchObject({ ssh_password: sshPassword, check_site: false });
+    expect(requestBody).not.toHaveProperty("directory");
+    expect(requestBody).not.toHaveProperty("newapi_port");
+    expect(requestBody).not.toHaveProperty("kuma_port");
   });
 
   it("allows a plain HTTP source on a remote host", async () => {
