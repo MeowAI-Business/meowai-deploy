@@ -194,6 +194,25 @@ impl SourceClient {
         self.session.as_ref().map(|session| &session.identity)
     }
 
+    /// Promote a legacy HTTP control-plane URL when it is the same public host
+    /// as an HTTPS source. Older registrations were issued before TLS
+    /// termination was reflected in the fallback URL.
+    pub fn normalize_control_plane_url(&self, control_plane_url: &str) -> SourceResult<String> {
+        let mut control = Url::parse(control_plane_url)
+            .map_err(|error| SourceError::InvalidUrl(error.to_string()))?;
+        if self.base_url.scheme() == "https"
+            && control.scheme() == "http"
+            && control.host_str() == self.base_url.host_str()
+            && control.port_or_known_default() == Some(80)
+            && self.base_url.port_or_known_default() == Some(443)
+        {
+            control.set_scheme("https").map_err(|_| {
+                SourceError::InvalidUrl("cannot normalize control plane URL".to_owned())
+            })?;
+        }
+        Ok(control.to_string().trim_end_matches('/').to_owned())
+    }
+
     pub fn export_session(&self) -> SourceResult<PersistedSourceSession> {
         let session = self
             .session
@@ -432,26 +451,77 @@ impl SourceClient {
             .map_err(|_| SourceError::InvalidDeployment("invalid report credential".to_owned()))?;
         mac.update(canonical.as_bytes());
         let signature = encode_hex(&mac.finalize().into_bytes());
-        let mut request = self
-            .http
-            .request(method, endpoint)
-            .bearer_auth(credential.expose_secret())
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header("X-MeowAI-Timestamp", timestamp.to_string())
-            .header("X-MeowAI-Nonce", nonce)
-            .header("X-MeowAI-Sequence", sequence.to_string())
-            .header("X-MeowAI-Signature", signature)
-            .body(body_bytes);
-        if let Some(idempotency_key) = idempotency_key {
-            request = request.header("Idempotency-Key", idempotency_key);
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|source| SourceError::Transport {
-                endpoint: path.to_owned(),
-                source,
-            })?;
+        let build_request = |url: Url| {
+            let mut request = self
+                .http
+                .request(method.clone(), url)
+                .bearer_auth(credential.expose_secret())
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header("X-MeowAI-Timestamp", timestamp.to_string())
+                .header("X-MeowAI-Nonce", nonce.as_str())
+                .header("X-MeowAI-Sequence", sequence.to_string())
+                .header("X-MeowAI-Signature", signature.as_str())
+                .body(body_bytes.clone());
+            if let Some(idempotency_key) = idempotency_key.as_deref() {
+                request = request.header("Idempotency-Key", idempotency_key);
+            }
+            request
+        };
+        let response = {
+            let mut response = None;
+            for attempt in 0..CONNECTIVITY_ATTEMPTS {
+                match build_request(endpoint.clone()).send().await {
+                    Ok(value) => {
+                        response = Some(value);
+                        break;
+                    }
+                    Err(source) if attempt + 1 < CONNECTIVITY_ATTEMPTS => {
+                        tracing::debug!(
+                            attempt = attempt + 1,
+                            max_attempts = CONNECTIVITY_ATTEMPTS,
+                            error = %source,
+                            endpoint = path,
+                            "signed source report failed; retrying"
+                        );
+                        tokio::time::sleep(CONNECTIVITY_RETRY_DELAY).await;
+                    }
+                    Err(source) => {
+                        return Err(SourceError::Transport {
+                            endpoint: path.to_owned(),
+                            source,
+                        });
+                    }
+                }
+            }
+            response.expect("signed report attempts must produce a response or return an error")
+        };
+        // A legacy source registration may contain an HTTP control-plane URL
+        // while the reverse proxy now canonicalizes it to HTTPS. Follow only a
+        // same-host HTTPS redirect, preserving the signed path and body.
+        let response = if response.status().is_redirection() {
+            if let Some(location) = response.headers().get(reqwest::header::LOCATION)
+                && let Ok(location) = location
+                    .to_str()
+                    .ok()
+                    .and_then(|value| Url::parse(value).ok())
+                    .ok_or(())
+                && location.scheme() == "https"
+                && location.host_str() == endpoint.host_str()
+                && location.path() == endpoint.path()
+            {
+                build_request(location)
+                    .send()
+                    .await
+                    .map_err(|source| SourceError::Transport {
+                        endpoint: path.to_owned(),
+                        source,
+                    })?
+            } else {
+                response
+            }
+        } else {
+            response
+        };
         parse_response(response, path).await
     }
 
@@ -475,16 +545,39 @@ impl SourceClient {
             .session_id
             .clone();
         let endpoint = self.endpoint("api/user/auth/refresh")?;
-        let response = self
-            .http
-            .post(endpoint)
-            .header("X-Auth-Session", session_id)
-            .send()
-            .await
-            .map_err(|source| SourceError::Transport {
-                endpoint: "/api/user/auth/refresh".to_owned(),
-                source,
-            })?;
+        let response = {
+            let mut response = None;
+            for attempt in 0..CONNECTIVITY_ATTEMPTS {
+                match self
+                    .http
+                    .post(endpoint.clone())
+                    .header("X-Auth-Session", &session_id)
+                    .send()
+                    .await
+                {
+                    Ok(value) => {
+                        response = Some(value);
+                        break;
+                    }
+                    Err(source) if attempt + 1 < CONNECTIVITY_ATTEMPTS => {
+                        tracing::debug!(
+                            attempt = attempt + 1,
+                            max_attempts = CONNECTIVITY_ATTEMPTS,
+                            error = %source,
+                            "source session refresh failed; retrying"
+                        );
+                        tokio::time::sleep(CONNECTIVITY_RETRY_DELAY).await;
+                    }
+                    Err(source) => {
+                        return Err(SourceError::Transport {
+                            endpoint: "/api/user/auth/refresh".to_owned(),
+                            source,
+                        });
+                    }
+                }
+            }
+            response.expect("refresh attempts must produce a response or return an error")
+        };
         let envelope: ApiEnvelope<auth::LoginData> =
             parse_response(response, "/api/user/auth/refresh").await?;
         let data = require_data(envelope, "/api/user/auth/refresh")?;

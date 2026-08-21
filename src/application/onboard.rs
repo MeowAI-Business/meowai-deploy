@@ -467,7 +467,7 @@ impl ProductionOnboardBackend {
     }
 
     async fn prepare_registration(&mut self) -> ApplicationResult<()> {
-        let registration =
+        let mut registration =
             match deployment_control::load_registration_for(&self.config, self.identity.user_id)? {
                 Some(registration) => registration,
                 None => self
@@ -476,6 +476,10 @@ impl ProductionOnboardBackend {
                     .await
                     .map_err(source_error)?,
             };
+        registration.control_plane_url = self
+            .source
+            .normalize_control_plane_url(&registration.control_plane_url)
+            .map_err(source_error)?;
         deployment_control::persist_registration_locally(
             &self.config,
             self.identity.user_id,

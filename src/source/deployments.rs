@@ -163,10 +163,11 @@ impl SourceClient {
             ));
         }
         super::control_plane_endpoint(&data.control_plane_url, "/api/status")?;
+        let control_plane_url = self.normalize_control_plane_url(&data.control_plane_url)?;
         Ok(DeploymentRegistration {
             deployment_id: data.deployment_id,
             installation_generation: data.installation_generation,
-            control_plane_url: data.control_plane_url,
+            control_plane_url,
             report_credential: SecretString::from(data.report_credential),
             pull_credential: SecretString::from(data.pull_credential),
             heartbeat_interval_seconds: data.heartbeat_interval_seconds,

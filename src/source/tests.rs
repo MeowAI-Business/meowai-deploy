@@ -35,6 +35,23 @@ fn remote_plain_http_source_and_control_plane_are_allowed() {
 }
 
 #[test]
+fn legacy_same_host_http_control_plane_is_promoted_for_https_source() {
+    let client = SourceClient::new("https://enterprise.example").expect("source client");
+    assert_eq!(
+        client
+            .normalize_control_plane_url("http://enterprise.example/api")
+            .expect("normalized URL"),
+        "https://enterprise.example/api"
+    );
+    assert_eq!(
+        client
+            .normalize_control_plane_url("http://control.example/api")
+            .expect("unmodified URL"),
+        "http://control.example/api"
+    );
+}
+
+#[test]
 fn non_http_source_and_control_plane_are_rejected() {
     assert!(SourceClient::new("ftp://source.example.test").is_err());
     assert!(control_plane_endpoint("ftp://control.example.test", "/heartbeat").is_err());
