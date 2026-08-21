@@ -125,11 +125,11 @@ pub fn app_error(error: crate::error::AppError) -> ApplicationError {
 }
 
 pub fn source_error(error: crate::source::SourceError) -> ApplicationError {
-    let (category, code, message, retryable) = match &error {
+    let (category, code, message, retryable): (ErrorCategory, &str, String, bool) = match &error {
         crate::source::SourceError::ApprovalRequired => (
             ErrorCategory::Authorization,
             "SOURCE_APPROVAL_REQUIRED",
-            "需要上游批准后才能部署",
+            "需要上游批准后才能部署".to_owned(),
             true,
         ),
         crate::source::SourceError::AuthenticationRequired
@@ -137,13 +137,13 @@ pub fn source_error(error: crate::source::SourceError) -> ApplicationError {
         | crate::source::SourceError::InvalidCredentials(_) => (
             ErrorCategory::Authentication,
             "SOURCE_AUTHENTICATION_FAILED",
-            "源站账号验证失败",
+            "源站账号验证失败".to_owned(),
             true,
         ),
         crate::source::SourceError::InvalidUrl(_) => (
             ErrorCategory::Validation,
             "SOURCE_URL_INVALID",
-            "源站地址无效",
+            "源站地址无效".to_owned(),
             true,
         ),
         crate::source::SourceError::RateLimited { .. }
@@ -151,17 +151,44 @@ pub fn source_error(error: crate::source::SourceError) -> ApplicationError {
         | crate::source::SourceError::HttpStatus { .. } => (
             ErrorCategory::Source,
             "SOURCE_UNAVAILABLE",
-            "源站暂时不可用",
+            "源站暂时不可用".to_owned(),
             true,
+        ),
+        crate::source::SourceError::InvalidResponse { endpoint, message } => (
+            ErrorCategory::Source,
+            "SOURCE_RESPONSE_INVALID",
+            source_response_message(endpoint, message),
+            false,
         ),
         _ => (
             ErrorCategory::Source,
             "SOURCE_RESPONSE_INVALID",
-            "源站返回的数据无法用于部署",
+            "源站返回的数据无法用于部署".to_owned(),
             false,
         ),
     };
     ApplicationError::new(category, code, message, retryable).with_diagnostic(error.to_string())
+}
+
+fn source_response_message(endpoint: &str, detail: &str) -> String {
+    match (endpoint, detail) {
+        ("/api/user/login", "missing refresh cookie") => {
+            "源站登录成功，但没有返回刷新会话 Cookie；请确认源站版本支持新版登录接口，并检查反向代理没有删除 Set-Cookie。".to_owned()
+        }
+        ("/api/user/login", "missing session id") => {
+            "源站登录响应缺少会话标识；源站版本与当前部署工具不兼容，请先更新源站 NewAPI。".to_owned()
+        }
+        ("/api/user/login", "missing access_token") => {
+            "源站登录响应缺少访问令牌；请确认源站使用当前 NewAPI 登录接口。".to_owned()
+        }
+        ("/api/user/login", "unsupported token_type") => {
+            "源站登录响应返回了不支持的令牌类型；当前部署工具要求 Bearer 令牌。".to_owned()
+        }
+        ("/api/onboard/access", "missing data") => {
+            "源站批准检查接口返回的数据格式不兼容；请确认源站已部署下游控制面接口。".to_owned()
+        }
+        _ => format!("源站接口 {endpoint} 返回的数据格式不兼容：{}", sanitize_diagnostic(detail)),
+    }
 }
 
 pub fn sanitize_diagnostic(value: &str) -> String {
@@ -301,5 +328,30 @@ mod tests {
                 "target operation failed: docker compose --env-file secrets.env exited with status 1 service failed"
             )
         );
+    }
+
+    #[test]
+    fn source_response_errors_explain_auth_contract_failures() {
+        let error = source_error(crate::source::SourceError::InvalidResponse {
+            endpoint: "/api/user/login".to_owned(),
+            message: "missing refresh cookie".to_owned(),
+        });
+        assert_eq!(error.code, "SOURCE_RESPONSE_INVALID");
+        assert!(error.message.contains("刷新会话 Cookie"));
+        assert!(error.message.contains("Set-Cookie"));
+        assert_eq!(
+            error.diagnostic.as_deref(),
+            Some("source returned an invalid response for /api/user/login: missing refresh cookie")
+        );
+    }
+
+    #[test]
+    fn source_response_errors_identify_incompatible_approval_payloads() {
+        let error = source_error(crate::source::SourceError::InvalidResponse {
+            endpoint: "/api/onboard/access".to_owned(),
+            message: "missing data".to_owned(),
+        });
+        assert!(error.message.contains("批准检查接口"));
+        assert!(error.message.contains("控制面接口"));
     }
 }

@@ -201,8 +201,7 @@ impl SourceClient {
         let refresh_cookie = self
             .cookies
             .cookies(&refresh_endpoint)
-            .and_then(|value| value.to_str().ok().map(str::to_owned))
-            .filter(|value| !value.trim().is_empty())
+            .and_then(|value| value.to_str().ok().and_then(extract_refresh_cookie))
             .ok_or_else(|| SourceError::InvalidResponse {
                 endpoint: "/api/user/login".to_owned(),
                 message: "missing refresh cookie".to_owned(),
@@ -571,6 +570,17 @@ fn require_data<T>(envelope: ApiEnvelope<T>, endpoint: &str) -> SourceResult<T> 
     })
 }
 
+fn extract_refresh_cookie(header: &str) -> Option<String> {
+    header.split(';').find_map(|part| {
+        let (name, value) = part.trim().split_once('=')?;
+        if name == "new_api_refresh" && !value.trim().is_empty() {
+            Some(format!("new_api_refresh={}", value.trim()))
+        } else {
+            None
+        }
+    })
+}
+
 fn unix_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -594,6 +604,20 @@ fn encode_hex(bytes: &[u8]) -> String {
         encoded.push(HEX[(byte & 0x0f) as usize] as char);
     }
     encoded
+}
+
+#[cfg(test)]
+mod cookie_tests {
+    use super::extract_refresh_cookie;
+
+    #[test]
+    fn extracts_only_the_new_api_refresh_cookie() {
+        assert_eq!(
+            extract_refresh_cookie("new_api_refresh=session.secret; Path=/api/user/auth; HttpOnly"),
+            Some("new_api_refresh=session.secret".to_owned())
+        );
+        assert_eq!(extract_refresh_cookie("other=value; Path=/"), None);
+    }
 }
 
 fn control_plane_endpoint(control_plane_url: &str, path: &str) -> SourceResult<Url> {

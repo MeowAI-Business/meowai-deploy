@@ -124,7 +124,7 @@ type SyncPlan = {
 type PreflightStep = "target" | "source" | "site";
 type ImageCheckState = "idle" | "loading" | "valid" | "error";
 
-type ApiError = Error & { code?: string };
+type ApiError = Error & { code?: string; diagnostic?: string };
 
 type OperationEvent = {
   operation_id: string;
@@ -214,15 +214,18 @@ async function request<T>(path: string, options: RequestInit = {}, session?: Ses
   if (!response.ok) {
     let message = `请求失败（${response.status}）`;
     let code: string | undefined;
+    let diagnostic: string | undefined;
     try {
-      const body = (await response.json()) as { error?: { message?: string; code?: string } };
+      const body = (await response.json()) as { error?: { message?: string; code?: string; diagnostic?: string } };
       message = body.error?.message ?? message;
       code = body.error?.code;
+      diagnostic = body.error?.diagnostic;
     } catch {
       // Plain responses are possible when the request is rejected before routing.
     }
     const error = new Error(message) as ApiError;
     error.code = code;
+    error.diagnostic = diagnostic;
     throw error;
   }
   if (response.status === 204) return undefined as T;
@@ -638,7 +641,7 @@ export default function App() {
         );
         setValidatedSteps((current) => ({ ...current, source: true }));
       } catch (cause) {
-        setError(cause instanceof Error ? cause.message : "源站账号验证失败");
+        setError(formatApiError(cause, "源站账号验证失败"));
         return;
       } finally {
         setCheckingStep(null);
@@ -1596,6 +1599,15 @@ function mergeOperationEvents(current: OperationEvent[], incoming: OperationEven
 
 function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
   return <label className="field"><span className="field-label">{label}</span>{children}{hint && <small>{hint}</small>}</label>;
+}
+
+function formatApiError(cause: unknown, fallback: string): string {
+  if (!(cause instanceof Error)) return fallback;
+  const error = cause as ApiError;
+  if (error.diagnostic && error.diagnostic !== error.message) {
+    return `${error.message}（诊断：${error.diagnostic}）`;
+  }
+  return error.message || fallback;
 }
 
 function validateStep(step: StepKey, draft: Draft, presetLoaded = false): string | null {
