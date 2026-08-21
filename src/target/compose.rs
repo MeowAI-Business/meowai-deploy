@@ -18,6 +18,8 @@ const TARGET_SECRETS_FILE: &str = "secrets.env";
 const TARGET_DOWNSTREAM_CREDENTIALS_FILE: &str = "downstream-credentials.env";
 const COMPOSE_FILE: &str = "docker-compose.yml";
 const KUMA_IMAGE: &str = "louislam/uptime-kuma:2.5.0";
+const CHECKER_PROXY_IMAGE: &str =
+    "dannydirect/tinyproxy@sha256:0c1e9c56952955f799dabddabbd697661ab44172d334f4d27242fde4d33e8bfd";
 
 #[derive(Clone, Debug)]
 pub struct DeploymentSecrets {
@@ -556,11 +558,15 @@ fn render_compose(config: &DeploymentConfig, runtime: &DeploymentRuntime) -> Res
             "SESSION_SECRET": "${SESSION_SECRET}",
             "TZ": "Asia/Shanghai",
             "SESSION_COOKIE_SECURE": "false",
+            "CHECKER_PROXY_URL": "http://checker-proxy:8888",
+            "CHECKER_ENCRYPTION_KEY_ID": "1",
+            "CHECKER_FINGERPRINT_KEY_ID": "1",
             "MEOWAI_DOWNSTREAM_KUMA_HEALTH_URL": "http://uptime-kuma:3001/api/entry-page"
         },
         "env_file": [TARGET_DOWNSTREAM_CREDENTIALS_FILE, "updater-credentials.env"],
         "extra_hosts": ["host.docker.internal:host-gateway"],
         "depends_on": {
+            "checker-proxy": {"condition": "service_started"},
             "postgres": {"condition": "service_healthy"},
             "redis": {"condition": "service_healthy"}
         },
@@ -587,6 +593,11 @@ fn render_compose(config: &DeploymentConfig, runtime: &DeploymentRuntime) -> Res
             "timeout": "3s",
             "retries": 30
         }
+    });
+    let checker_proxy = json!({
+        "image": CHECKER_PROXY_IMAGE,
+        "command": ["ANY"],
+        "restart": "unless-stopped"
     });
     let redis = json!({
         "image": "redis:7-alpine",
@@ -624,6 +635,7 @@ fn render_compose(config: &DeploymentConfig, runtime: &DeploymentRuntime) -> Res
         "name": config.container_name,
         "services": {
             "new-api": newapi,
+            "checker-proxy": checker_proxy,
             "postgres": postgres,
             "redis": redis,
             "uptime-kuma": kuma
@@ -767,6 +779,10 @@ mod tests {
         assert!(value["services"]["postgres"].get("ports").is_none());
         assert!(value["services"]["redis"].get("ports").is_none());
         assert_eq!(value["services"]["uptime-kuma"]["image"], KUMA_IMAGE);
+        assert_eq!(
+            value["services"]["checker-proxy"]["image"],
+            CHECKER_PROXY_IMAGE
+        );
         assert!(value["services"]["new-api"].get("platform").is_none());
         assert_eq!(value["services"]["new-api"]["pull_policy"], "missing");
         let environment = &value["services"]["new-api"]["environment"];
@@ -776,6 +792,10 @@ mod tests {
         assert_eq!(
             environment["MEOWAI_DOWNSTREAM_KUMA_HEALTH_URL"],
             "http://uptime-kuma:3001/api/entry-page"
+        );
+        assert_eq!(
+            environment["CHECKER_PROXY_URL"],
+            "http://checker-proxy:8888"
         );
     }
 

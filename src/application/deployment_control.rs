@@ -5,7 +5,7 @@ use super::error::{ApplicationError, ApplicationResult, ErrorCategory, app_error
 use crate::{
     config::DeploymentConfig,
     lifecycle_outbox,
-    security::validate_env_value,
+    security::{random_secret, validate_env_value},
     source::{DeploymentRegistration, LifecycleReport, UpgradeTransitionReport},
     state::DeploymentState,
     storage::{self, DOWNSTREAM_CREDENTIALS_FILE},
@@ -120,6 +120,20 @@ pub fn persist_registration(
     executor: &TargetExecutor,
     registration: &DeploymentRegistration,
 ) -> ApplicationResult<()> {
+    let existing = executor
+        .run_in_directory("cat downstream-credentials.env 2>/dev/null || true")
+        .map_err(app_error)?;
+    let existing = String::from_utf8_lossy(&existing.stdout);
+    let env_value = |name: &str| {
+        existing
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| random_secret(64))
+    };
+    let checker_encryption_key = env_value("CHECKER_ENCRYPTION_KEY");
+    let checker_fingerprint_key = env_value("CHECKER_FINGERPRINT_KEY");
     for (name, value) in [
         ("MEOWAI_DEPLOYMENT_ID", registration.deployment_id.as_str()),
         (
@@ -156,7 +170,7 @@ pub fn persist_registration(
         }
     }
     let target_content = format!(
-        "MEOWAI_DEPLOYMENT_ID={}\nMEOWAI_INSTALLATION_GENERATION={}\nMEOWAI_CONTROL_PLANE_URL={}\nMEOWAI_REPORT_CREDENTIAL={}\nMEOWAI_PULL_CREDENTIAL={}\nMEOWAI_HEARTBEAT_INTERVAL_SECONDS={}\nMEOWAI_SNAPSHOT_INTERVAL_SECONDS={}\nMEOWAI_CURRENT_IMAGE_DIGEST={}\nMEOWAI_DEPLOYMENT_SCHEMA=1\nMEOWAI_UPDATER_SCHEMA=1\nMEOWAI_DATA_SCHEMA=1\nMEOWAI_CLI_SCHEMA=1\nMEOWAI_ALLOWED_IMAGE_REPOSITORY={}\nMEOWAI_CONTAINER_NAME={}\nMEOWAI_NEWAPI_PORT={}\nMEOWAI_KUMA_PORT={}\nMEOWAI_RELEASE_SCHEMA_VERSION={}\nMEOWAI_RELEASE_MANIFEST_PUBLIC_KEY={}\nMEOWAI_RELEASE_ARTIFACT_ALLOWED_HOSTS={}\nMEOWAI_UPDATER_SOCKET_PATH=/run/meowai/updater.sock\n",
+        "MEOWAI_DEPLOYMENT_ID={}\nMEOWAI_INSTALLATION_GENERATION={}\nMEOWAI_CONTROL_PLANE_URL={}\nMEOWAI_REPORT_CREDENTIAL={}\nMEOWAI_PULL_CREDENTIAL={}\nMEOWAI_HEARTBEAT_INTERVAL_SECONDS={}\nMEOWAI_SNAPSHOT_INTERVAL_SECONDS={}\nMEOWAI_CURRENT_IMAGE_DIGEST={}\nMEOWAI_DEPLOYMENT_SCHEMA=1\nMEOWAI_UPDATER_SCHEMA=1\nMEOWAI_DATA_SCHEMA=1\nMEOWAI_CLI_SCHEMA=1\nMEOWAI_ALLOWED_IMAGE_REPOSITORY={}\nMEOWAI_CONTAINER_NAME={}\nMEOWAI_NEWAPI_PORT={}\nMEOWAI_KUMA_PORT={}\nMEOWAI_RELEASE_SCHEMA_VERSION={}\nMEOWAI_RELEASE_MANIFEST_PUBLIC_KEY={}\nMEOWAI_RELEASE_ARTIFACT_ALLOWED_HOSTS={}\nMEOWAI_UPDATER_SOCKET_PATH=/run/meowai/updater.sock\nCHECKER_PROXY_URL=http://checker-proxy:8888\nCHECKER_ENCRYPTION_KEY={}\nCHECKER_FINGERPRINT_KEY={}\nCHECKER_ENCRYPTION_KEY_ID=1\nCHECKER_FINGERPRINT_KEY_ID=1\n",
         registration.deployment_id,
         registration.installation_generation,
         registration.control_plane_url,
@@ -171,7 +185,9 @@ pub fn persist_registration(
         config.kuma_port,
         registration.release_schema_version,
         registration.release_manifest_public_key,
-        registration.release_artifact_allowed_hosts.join(",")
+        registration.release_artifact_allowed_hosts.join(","),
+        checker_encryption_key,
+        checker_fingerprint_key
     );
     executor
         .write_file(
@@ -185,7 +201,7 @@ file=downstream-credentials.env
 test -s "$file"
 mode=$(stat -c '%a' "$file" 2>/dev/null || stat -f '%Lp' "$file")
 test "$mode" = 600
-for key in MEOWAI_DEPLOYMENT_ID MEOWAI_INSTALLATION_GENERATION MEOWAI_CONTROL_PLANE_URL MEOWAI_REPORT_CREDENTIAL MEOWAI_PULL_CREDENTIAL MEOWAI_HEARTBEAT_INTERVAL_SECONDS MEOWAI_SNAPSHOT_INTERVAL_SECONDS MEOWAI_CURRENT_IMAGE_DIGEST MEOWAI_DEPLOYMENT_SCHEMA MEOWAI_UPDATER_SCHEMA MEOWAI_DATA_SCHEMA MEOWAI_CLI_SCHEMA MEOWAI_ALLOWED_IMAGE_REPOSITORY MEOWAI_CONTAINER_NAME MEOWAI_NEWAPI_PORT MEOWAI_KUMA_PORT MEOWAI_RELEASE_SCHEMA_VERSION MEOWAI_UPDATER_SOCKET_PATH; do
+for key in MEOWAI_DEPLOYMENT_ID MEOWAI_INSTALLATION_GENERATION MEOWAI_CONTROL_PLANE_URL MEOWAI_REPORT_CREDENTIAL MEOWAI_PULL_CREDENTIAL MEOWAI_HEARTBEAT_INTERVAL_SECONDS MEOWAI_SNAPSHOT_INTERVAL_SECONDS MEOWAI_CURRENT_IMAGE_DIGEST MEOWAI_DEPLOYMENT_SCHEMA MEOWAI_UPDATER_SCHEMA MEOWAI_DATA_SCHEMA MEOWAI_CLI_SCHEMA MEOWAI_ALLOWED_IMAGE_REPOSITORY MEOWAI_CONTAINER_NAME MEOWAI_NEWAPI_PORT MEOWAI_KUMA_PORT MEOWAI_RELEASE_SCHEMA_VERSION MEOWAI_UPDATER_SOCKET_PATH CHECKER_PROXY_URL CHECKER_ENCRYPTION_KEY CHECKER_FINGERPRINT_KEY CHECKER_ENCRYPTION_KEY_ID CHECKER_FINGERPRINT_KEY_ID; do
   count=$(grep -c "^${key}=..*" "$file" || true)
   test "$count" = 1
 done"#).map_err(app_error)?;

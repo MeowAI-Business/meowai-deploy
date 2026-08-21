@@ -14,11 +14,15 @@
         "SESSION_SECRET": "${SESSION_SECRET}",
         "TZ": "Asia/Shanghai",
         "SESSION_COOKIE_SECURE": "false",
+        "CHECKER_PROXY_URL": "http://checker-proxy:8888",
+        "CHECKER_ENCRYPTION_KEY_ID": "1",
+        "CHECKER_FINGERPRINT_KEY_ID": "1",
         "MEOWAI_DOWNSTREAM_KUMA_HEALTH_URL": "http://uptime-kuma:3001/api/entry-page"
       },
       "env_file": ["downstream-credentials.env", "updater-credentials.env"],
       "extra_hosts": ["host.docker.internal:host-gateway"],
       "depends_on": {
+        "checker-proxy": {"condition": "service_started"},
         "postgres": {"condition": "service_healthy"},
         "redis": {"condition": "service_healthy"}
       },
@@ -28,6 +32,11 @@
         "timeout": "3s",
         "retries": 30
       }
+    },
+    "checker-proxy": {
+      "image": "dannydirect/tinyproxy@sha256:0c1e9c56952955f799dabddabbd697661ab44172d334f4d27242fde4d33e8bfd",
+      "command": ["ANY"],
+      "restart": "unless-stopped"
     },
     "postgres": {
       "image": "postgres:15-alpine",
