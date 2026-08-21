@@ -34,15 +34,10 @@ struct Fixture {
     _socket: UnixListener,
     _server: MockServer,
     _home: PathBuf,
-    _env_guard: std::sync::MutexGuard<'static, ()>,
 }
 
 impl Fixture {
     async fn new() -> Self {
-        let env_guard = crate::target::TEST_ENV_LOCK
-            .get_or_init(Default::default)
-            .lock()
-            .expect("E2E test environment lock");
         let temporary = tempdir().expect("fixture tempdir");
         let root = temporary.path().join("deployment");
         let fake_bin = temporary.path().join("bin");
@@ -111,7 +106,6 @@ impl Fixture {
             _socket: socket,
             _server: server,
             _home: home,
-            _env_guard: env_guard,
         }
     }
 
@@ -173,6 +167,10 @@ impl Respond for ControlPlaneResponder {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn complete_apply_covers_success_failures_data_rollback_and_recovery() {
+    let _env_guard = crate::target::TEST_ENV_LOCK
+        .get_or_init(Default::default)
+        .lock()
+        .expect("E2E test environment lock");
     let fixture = Fixture::new().await;
     let config = fixture.config();
     let registration = fixture.registration();
