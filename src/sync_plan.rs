@@ -533,6 +533,7 @@ pub fn module_for_pricing_key(key: &str) -> SyncModule {
         key,
         "QuotaPerUnit"
             | "USDExchangeRate"
+            | "Price"
             | "DisplayTokenStatEnabled"
             | "DisplayInCurrencyEnabled"
             | "PreConsumedQuota"

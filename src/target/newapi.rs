@@ -1825,6 +1825,7 @@ mod tests {
             },
             "quota_per_unit": 500000,
             "usd_exchange_rate": 7.3,
+            "price": 7.3,
             "display_token_stat_enabled": true,
             "display_in_currency_enabled": true,
             "pre_consumed_quota": 500,
@@ -1884,7 +1885,7 @@ mod tests {
                 "success": true,
                 "message": ""
             })))
-            .expect(53)
+            .expect(54)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -1927,7 +1928,7 @@ mod tests {
             .import_pricing(&source_pricing)
             .await
             .expect("import source pricing");
-        assert_eq!(hashes.len(), 55);
+        assert_eq!(hashes.len(), 56);
         assert!(!hashes.contains_key("video_cost_policies"));
         assert_eq!(hashes.get("model_price").map(String::len), Some(64));
     }

@@ -200,6 +200,8 @@ pub struct PricingConfig {
     #[serde(default)]
     usd_exchange_rate: f64,
     #[serde(default)]
+    price: Option<f64>,
+    #[serde(default)]
     display_token_stat_enabled: bool,
     #[serde(default)]
     display_in_currency_enabled: bool,
@@ -498,6 +500,9 @@ impl PricingConfig {
             "usd_exchange_rate",
             &format_float(self.usd_exchange_rate),
         ));
+        if let Some(price) = self.price {
+            options.push(exact_option("Price", "price", &format_float(price)));
+        }
         options.push(exact_option(
             "DisplayTokenStatEnabled",
             "display_token_stat_enabled",
@@ -858,12 +863,13 @@ mod tests {
             "image_ratio": {"image": 4},
             "audio_ratio": {"audio": 5},
             "audio_completion_ratio": {"audio-output": 6},
+            "price": 7.3,
             "marketplace": marketplace_config()
         }))
         .expect("parse source pricing");
 
         let options = config.options().expect("build pricing options");
-        assert_eq!(options.len(), 53);
+        assert_eq!(options.len(), 54);
         assert!(
             options
                 .iter()
@@ -886,7 +892,23 @@ mod tests {
             .find(|option| option.key == "OfficialCredentialAvailabilityWindowDays")
             .expect("credential availability option");
         assert_eq!(availability_window.canonical_json, "30");
+        let price = options
+            .iter()
+            .find(|option| option.key == "Price")
+            .expect("price option");
+        assert_eq!(price.source_field, "price");
+        assert_eq!(price.canonical_json, "7.3");
         assert!(options.iter().all(|option| option.sha256.len() == 64));
+    }
+
+    #[test]
+    fn price_is_omitted_when_upstream_does_not_send_it() {
+        let config = PricingConfig::from_value(minimal_pricing()).expect("parse pricing");
+        let options = config.options().expect("build pricing options");
+        assert!(
+            options.iter().all(|option| option.key != "Price"),
+            "Price must not be synced when the upstream does not emit it"
+        );
     }
 
     #[test]

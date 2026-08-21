@@ -96,6 +96,7 @@ fn pricing_data() -> Value {
         },
         "quota_per_unit": 500000,
         "usd_exchange_rate": 7.3,
+        "price": 7.3,
         "display_token_stat_enabled": true,
         "display_in_currency_enabled": true,
         "pre_consumed_quota": 500,
@@ -1054,7 +1055,7 @@ async fn pricing_reads_all_authenticated_source_fields() {
 
     let pricing = client.pricing().await.expect("read source pricing");
     let options = pricing.options().expect("build downstream options");
-    assert_eq!(options.len(), 53);
+    assert_eq!(options.len(), 54);
     let home_pricing_table = options
         .iter()
         .find(|option| option.key == "home_setting.pricing_table")
@@ -1088,6 +1089,7 @@ async fn pricing_reads_all_authenticated_source_fields() {
             "group_behavior.default_use_auto_group",
             "quota_per_unit",
             "usd_exchange_rate",
+            "price",
             "display_token_stat_enabled",
             "display_in_currency_enabled",
             "pre_consumed_quota",
