@@ -724,6 +724,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn cleanup_is_idempotent_when_directory_exists_without_compose_file() {
         let directory = tempfile::tempdir().expect("create empty deployment directory");
@@ -735,6 +736,7 @@ mod tests {
             .expect("missing compose file must be treated as an already-clean target");
     }
 
+    #[cfg(unix)]
     #[test]
     fn streaming_scripts_report_stdout_lines() {
         let executor = TargetExecutor::new(
@@ -757,6 +759,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn target_errors_keep_diagnostics_on_separate_lines() {
         let output = Command::new("sh")

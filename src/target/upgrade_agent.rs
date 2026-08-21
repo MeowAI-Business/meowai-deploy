@@ -2947,6 +2947,7 @@ mod tests {
         assert!(downstream.contains("MEOWAI_RELEASE_ARTIFACT_ALLOWED_HOSTS=assets.example\n"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn environment_patch_rejects_duplicate_and_undeclared_keys() {
         for (current, patch) in [
@@ -2982,6 +2983,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn environment_patch_rejects_conflicting_existing_add_key() {
         let root = tempfile::tempdir().expect("target directory");
