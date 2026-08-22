@@ -68,7 +68,7 @@ meowai-deploy doctor
 meowai-deploy onboard
 ```
 
-The setup asks for the source-site account, deployment target, ports, and administrator credentials. It displays a complete plan before making changes.
+The setup uses a target-first flow: choose local or SSH, enter an optional temporary SSH password, verify the connection, authenticate the source site, fill in site settings, verify the complete target (directory, Docker, and ports), then choose administrator credentials and the immutable image before reviewing the plan. The SSH password is kept in memory for this run only and is never written to the TOML configuration or local state.
 
 To deploy over SSH instead of to the current machine:
 

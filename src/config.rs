@@ -14,14 +14,17 @@ use sha2::{Digest, Sha256};
 use crate::{
     application::{
         input::{self, DeploymentInput, DeploymentTargetInput, InputField, ValidationError},
+        operation::CancellationToken,
         source::{self as application_source, SourceAccountRequest},
+        target::{
+            DeploymentTargetProbeRequest, probe_deployment_connection, probe_deployment_target,
+        },
     },
     cli::OnboardArgs,
     error::{AppError, Result},
     platform,
     registry::latest_image_digest,
     source::{SourceAccountMode, SourceClient, SourceIdentity},
-    target::TargetExecutor,
 };
 
 pub use input::{
@@ -284,7 +287,12 @@ impl fmt::Display for DeploymentConfig {
 
 pub async fn interactive_config(
     args: &OnboardArgs,
-) -> Result<(DeploymentConfig, SourceClient, SourceIdentity)> {
+) -> Result<(
+    DeploymentConfig,
+    SourceClient,
+    SourceIdentity,
+    Option<SecretString>,
+)> {
     if args.config.is_some() {
         return Err(AppError::InvalidConfig(
             "interactive_config cannot load a config file".to_owned(),
@@ -359,7 +367,75 @@ pub async fn reauthenticate_source(
 
 async fn prompt_config(
     args: &OnboardArgs,
-) -> Result<(DeploymentConfig, SourceClient, SourceIdentity)> {
+) -> Result<(
+    DeploymentConfig,
+    SourceClient,
+    SourceIdentity,
+    Option<SecretString>,
+)> {
+    prompt_screen("部署位置")?;
+    let target = if cfg!(windows) || args.ssh.is_some() {
+        "ssh".to_owned()
+    } else if args.local {
+        "local".to_owned()
+    } else {
+        prompt_io(
+            select("部署方式")
+                .item("local".to_owned(), "本机", "直接在当前服务器运行")
+                .item("ssh".to_owned(), "SSH 远程", "连接 user@host 目标服务器")
+                .initial_value("local".to_owned())
+                .interact(),
+        )?
+    };
+    let (target, ssh_password) = if target == "ssh" {
+        let destination = if let Some(destination) = &args.ssh {
+            destination.clone()
+        } else {
+            prompt_screen("部署位置")?;
+            prompt_io(input("SSH 目标（user@host）").interact())?
+        };
+        input::validate_ssh_destination(&destination).map_err(invalid_config)?;
+        prompt_screen("部署位置")?;
+        let password = prompt_io(
+            password("SSH 密码（可选）")
+                .mask('•')
+                .allow_empty()
+                .interact(),
+        )?;
+        let password = (!password.is_empty()).then(|| SecretString::from(password));
+        let target = Target::Ssh { destination };
+        let progress = spinner();
+        progress.start("正在预检 SSH 连接");
+        let result = probe_deployment_connection(
+            deployment_target_input(&target),
+            password.clone(),
+            &CancellationToken::default(),
+        );
+        match result {
+            Ok(_) => progress.stop("SSH 连接可用"),
+            Err(error) => {
+                progress.error("SSH 连接不可用");
+                return Err(error.into());
+            }
+        }
+        (target, password)
+    } else {
+        let target = Target::Local;
+        let progress = spinner();
+        progress.start("正在预检本机连接");
+        probe_deployment_connection(
+            deployment_target_input(&target),
+            None,
+            &CancellationToken::default(),
+        )
+        .map_err(|error| {
+            progress.error("本机连接不可用");
+            AppError::from(error)
+        })?;
+        progress.stop("本机连接可用");
+        (target, None)
+    };
+
     let mut source_error = None;
     let source_url = loop {
         prompt_screen("源站账号")?;
@@ -442,7 +518,7 @@ async fn prompt_config(
         }
     };
 
-    prompt_screen("站点与网络")?;
+    prompt_screen("站点设置")?;
     let website_name: String = prompt_io(
         input("网站名称")
             .default_input(DEFAULT_WEBSITE_NAME)
@@ -450,60 +526,29 @@ async fn prompt_config(
     )?;
     let container_name = prompt_container_name()?;
     let default_directory = format!("/opt/meowai-deploy/{container_name}");
-    let directory = prompt_directory(&default_directory)?;
-    let target: String = if cfg!(windows) || args.ssh.is_some() {
-        "ssh".to_owned()
-    } else if args.local {
-        "local".to_owned()
-    } else {
-        prompt_screen("站点与网络")?;
-        prompt_io(
-            select("部署方式")
-                .item("local".to_owned(), "本机", "直接在当前服务器运行")
-                .item("ssh".to_owned(), "SSH 远程", "连接 user@host 目标服务器")
-                .initial_value("local".to_owned())
-                .interact(),
-        )?
-    };
-    let target = if target == "ssh" {
-        let destination = if let Some(destination) = &args.ssh {
-            destination.clone()
-        } else {
-            prompt_screen("站点与网络")?;
-            prompt_io(input("SSH 目标（user@host）").interact())?
-        };
-        Target::Ssh { destination }
-    } else {
-        Target::Local
-    };
-    let executor = TargetExecutor::new(target.clone(), directory.clone());
-    if matches!(target, Target::Ssh { .. }) {
-        let progress = spinner();
-        progress.start("正在验证 SSH 连接和部署权限");
-        match executor.validate_access_interactive() {
-            Ok(()) => progress.stop("SSH 连接和部署权限可用"),
-            Err(error) => {
-                progress.error("SSH 连接或部署权限不可用");
-                return Err(error);
-            }
-        }
-    }
-    let newapi_bind = prompt_bind("站点与网络", "New API 监听地址")?;
-    let kuma_bind = prompt_bind("站点与网络", "Uptime Kuma 监听地址")?;
-    let newapi_port = prompt_port(
-        "站点与网络",
-        "New API 端口",
-        DEFAULT_NEWAPI_PORT,
-        &executor,
-        &[],
-    )?;
-    let kuma_port = prompt_port(
-        "站点与网络",
-        "Uptime Kuma 端口",
-        DEFAULT_KUMA_PORT,
-        &executor,
-        &[newapi_port],
-    )?;
+    let directory = prompt_directory(&default_directory, matches!(&target, Target::Ssh { .. }))?;
+    let newapi_bind = prompt_bind("站点设置", "New API 监听地址")?;
+    let kuma_bind = prompt_bind("站点设置", "Uptime Kuma 监听地址")?;
+    let newapi_port = prompt_port("站点设置", "New API 端口", DEFAULT_NEWAPI_PORT)?;
+    let kuma_port = prompt_port("站点设置", "Uptime Kuma 端口", DEFAULT_KUMA_PORT)?;
+
+    let progress = spinner();
+    progress.start("正在预检部署目录、Docker 和端口");
+    probe_deployment_target(
+        DeploymentTargetProbeRequest {
+            target: deployment_target_input(&target),
+            directory: directory.clone(),
+            newapi_port,
+            kuma_port,
+            ssh_password: ssh_password.clone(),
+        },
+        &CancellationToken::default(),
+    )
+    .map_err(|error| {
+        progress.error("目标环境预检失败");
+        AppError::from(error)
+    })?;
+    progress.stop("部署目录、Docker 和端口可用");
 
     let newapi_admin_username =
         prompt_username("管理员凭证", "New API 管理员用户名", "admin", Some(12))?;
@@ -511,7 +556,10 @@ async fn prompt_config(
     let kuma_admin_username =
         prompt_username("管理员凭证", "Uptime Kuma 管理员用户名", "admin", None)?;
     let kuma_admin_password = Some(prompt_secret("管理员凭证", "Uptime Kuma 管理员密码")?);
-    let image_ref = prompt_image_ref("镜像版本", DEFAULT_IMAGE).await?;
+    prompt_screen("镜像版本")?;
+    let image_input: String = prompt_io(input("容器镜像").default_input(DEFAULT_IMAGE).interact())?;
+    let image = image_input.trim().to_owned();
+    let image_ref = prompt_image_ref("镜像版本", &image).await?;
     let mut config = DeploymentConfig {
         source_url,
         source_account_mode,
@@ -529,19 +577,29 @@ async fn prompt_config(
         newapi_admin_password,
         kuma_admin_username,
         kuma_admin_password,
+        image,
         image_ref,
         ..DeploymentConfig::default()
     };
     config.normalize();
     config.validate()?;
     finish_prompt_flow()?;
-    Ok((config, source, identity))
+    Ok((config, source, identity, ssh_password))
+}
+
+fn deployment_target_input(target: &Target) -> DeploymentTargetInput {
+    match target {
+        Target::Local => DeploymentTargetInput::Local,
+        Target::Ssh { destination } => DeploymentTargetInput::Ssh {
+            destination: destination.clone(),
+        },
+    }
 }
 
 fn prompt_container_name() -> Result<String> {
     let mut error = None;
     loop {
-        prompt_screen("站点与网络")?;
+        prompt_screen("站点设置")?;
         let label = retry_label("容器名", error.as_deref(), 3)?;
         let value: String = prompt_io(input(label).default_input("newapi").interact())?;
         match validate_identifier("container_name", &value) {
@@ -556,14 +614,14 @@ fn prompt_container_name() -> Result<String> {
     }
 }
 
-fn prompt_directory(default: &str) -> Result<PathBuf> {
+fn prompt_directory(default: &str, remote: bool) -> Result<PathBuf> {
     let mut error = None;
     loop {
-        prompt_screen("站点与网络")?;
+        prompt_screen("站点设置")?;
         let label = retry_label("部署目录", error.as_deref(), 3)?;
         let value: String = prompt_io(input(label).default_input(default).interact())?;
         let directory = PathBuf::from(value);
-        let validation = if cfg!(windows) {
+        let validation = if remote || cfg!(windows) {
             input::validate_remote_directory(&directory).map_err(invalid_config)
         } else {
             validate_directory(&directory)
@@ -629,13 +687,7 @@ fn prompt_bind(section: &str, label: &str) -> Result<String> {
     )
 }
 
-fn prompt_port(
-    section: &str,
-    label: &str,
-    default: u16,
-    executor: &TargetExecutor,
-    excluded: &[u16],
-) -> Result<u16> {
+fn prompt_port(section: &str, label: &str, default: u16) -> Result<u16> {
     let mut error = None;
     loop {
         prompt_screen(section)?;
@@ -649,18 +701,8 @@ fn prompt_port(
                 continue;
             }
         };
-        match executor.allocate_port(requested, excluded) {
-            Ok(port) if port == requested => {
-                redraw_success(label, &value, "可用", 3)?;
-                return Ok(port);
-            }
-            Ok(port) => {
-                error = Some(format!("已被占用，可用 {port}"));
-            }
-            Err(error) => {
-                return Err(error);
-            }
-        }
+        redraw_success(label, &value, "格式有效，稍后检查目标端口", 3)?;
+        return Ok(requested);
     }
 }
 

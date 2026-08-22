@@ -160,7 +160,7 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
         clear_current_deployment_before_onboard().await?;
     }
     let resume_existing = existing_action.as_deref() == Some("resume");
-    let (mut config, mut source, identity) = if resume_existing {
+    let (mut config, mut source, identity, ssh_password) = if resume_existing {
         let mut config = load_deployment_config()?;
         config.resolve_passwords();
         let source = source_for_operation(&config).await?;
@@ -168,7 +168,7 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
             .identity()
             .cloned()
             .ok_or_else(|| AppError::State("source session has no identity".to_owned()))?;
-        (config, source, identity)
+        (config, source, identity, None)
     } else if let Some(path) = &args.config {
         let mut config = DeploymentConfig::from_file(path)?;
         config.apply_cli_target(args);
@@ -177,7 +177,7 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
         config.resolve_image_ref().await?;
         config.validate()?;
         let (source, identity) = authenticate_source(&config).await?;
-        (config, source, identity)
+        (config, source, identity, None)
     } else {
         interactive_config(args).await?
     };
@@ -251,7 +251,8 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
         None
     };
     let operation_id = format!("onboard-{}-{}", config.deployment_id(), unix_timestamp());
-    let mut backend = ProductionOnboardBackend::new(config, source, identity);
+    let mut backend =
+        ProductionOnboardBackend::new(config, source, identity).with_ssh_password(ssh_password);
     let mut checkpoint_store = DeploymentStateCheckpointStore;
     let mut result = match previous_checkpoint {
         Some(checkpoint)

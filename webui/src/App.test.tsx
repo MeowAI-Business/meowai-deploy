@@ -209,6 +209,15 @@ describe("deployment workbench", () => {
     fireEvent.click(screen.getByRole("button", { name: /下一步/ }));
 
     await screen.findByRole("heading", { name: "站点设置" });
+    fireEvent.click(screen.getByRole("button", { name: /下一步/ }));
+    await screen.findByRole("heading", { name: "管理员凭证" });
+    const targetCalls = fetchMock.mock.calls.filter(([path]) => String(path).endsWith("/api/preflight/target"));
+    expect(JSON.parse(String(targetCalls.at(-1)?.[1]?.body))).toMatchObject({
+      check_site: true,
+      directory: bootstrap.defaults.directory,
+      newapi_port: bootstrap.defaults.newapi_port,
+      kuma_port: bootstrap.defaults.kuma_port,
+    });
     expect(screen.getByLabelText("镜像 digest")).toBeRequired();
     expect(await screen.findByRole("button", { name: /正在解析最新镜像/ })).toBeDisabled();
     await waitFor(() => expect(screen.getByLabelText("镜像 digest")).toHaveValue(digest));

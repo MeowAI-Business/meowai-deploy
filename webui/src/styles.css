@@ -68,7 +68,7 @@ button:focus-visible, input:focus-visible { outline: 3px solid color-mix(in srgb
 .page-heading { display: flex; align-items: center; justify-content: space-between; gap: 24px; margin-bottom: 30px; }
 .page-heading h1 { margin: 0; font-size: 30px; line-height: 1.25; letter-spacing: 0; font-weight: 720; }
 .page-heading p { margin: 9px 0 0; color: var(--text-secondary); font-size: 14px; line-height: 1.55; }
-.stepper { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); margin-bottom: 18px; }
+.stepper { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); margin-bottom: 18px; }
 .stepper button { min-width: 0; min-height: 54px; border: 0; border-bottom: 2px solid var(--border); background: transparent; color: var(--text-secondary); display: flex; align-items: center; justify-content: center; gap: 8px; padding: 8px 6px 11px; font-size: 12px; font-weight: 600; }
 .stepper button:disabled { cursor: default; opacity: 1; }
 .stepper button:not(:disabled):hover { color: var(--text); background: transparent; }
@@ -247,7 +247,7 @@ button:focus-visible, input:focus-visible { outline: 3px solid color-mix(in srgb
   .deployment-page { width: 100%; }
   .page-heading { align-items: center; margin-bottom: 22px; }
   .page-heading h1 { font-size: 25px; }
-  .stepper { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+  .stepper { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .stepper button { flex-direction: column; gap: 5px; min-height: 70px; padding-inline: 2px; font-size: 10px; }
   .step-icon { width: 25px; height: 25px; }
   .workflow-heading { min-height: 88px; padding: 20px 18px; }

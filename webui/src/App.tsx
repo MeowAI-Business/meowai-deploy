@@ -21,7 +21,7 @@ import {
   Download,
 } from "lucide-react";
 
-type StepKey = "target" | "source" | "site" | "review" | "operation";
+type StepKey = "target" | "source" | "site" | "credentials" | "review" | "operation";
 type DeploymentTarget = "local" | "ssh";
 
 type Draft = {
@@ -167,6 +167,7 @@ const steps: Array<{ key: StepKey; label: string; icon: typeof Server }> = [
   { key: "target", label: "部署位置", icon: Server },
   { key: "source", label: "源站账号", icon: KeyRound },
   { key: "site", label: "站点设置", icon: Boxes },
+  { key: "credentials", label: "管理员凭证", icon: KeyRound },
   { key: "review", label: "确认信息", icon: ClipboardCheck },
   { key: "operation", label: "开始部署", icon: Activity },
 ];
@@ -269,7 +270,6 @@ export default function App() {
   const [imageCheckState, setImageCheckState] = useState<ImageCheckState>("idle");
   const [imageCheckError, setImageCheckError] = useState<string | null>(null);
   const [imageUpdatedAt, setImageUpdatedAt] = useState<string | null>(null);
-  const [resolvedImage, setResolvedImage] = useState<string | null>(null);
   const [imageReloadKey, setImageReloadKey] = useState(0);
   const [dialog, setDialog] = useState<DialogKind | null>(null);
   const [replaceExisting, setReplaceExisting] = useState(false);
@@ -517,16 +517,14 @@ export default function App() {
   }, [operationId, operationPollGeneration, session]);
 
   useEffect(() => {
-    if (activeStep !== "site" || !session || !draft.image.trim()) return;
+    if (activeStep !== "credentials" || !session || !draft.image.trim()) return;
     const image = draft.image.trim();
     const controller = new AbortController();
     let cancelled = false;
     setImageCheckState("loading");
     setImageCheckError(null);
     setImageUpdatedAt(null);
-    setResolvedImage(null);
     setDraft((current) => current.image.trim() === image ? { ...current, imageRef: "" } : current);
-    setValidatedSteps((current) => ({ ...current, site: false }));
     const timer = window.setTimeout(async () => {
       try {
         const result = await request<{ image: string; immutable_ref: string; updated_at: string | null }>(
@@ -539,7 +537,6 @@ export default function App() {
           ? { ...current, imageRef: result.immutable_ref }
           : current);
         setImageUpdatedAt(result.updated_at);
-        setResolvedImage(result.image);
         setImageCheckState("valid");
       } catch (cause) {
         if (cancelled) return;
@@ -579,14 +576,13 @@ export default function App() {
       return next;
     });
     // Review and recovery credentials are one-shot inputs, not deployment configuration.
-    if (preflight && activeStep !== "review" && activeStep !== "operation") {
+    if (preflight && preflight !== "credentials" && activeStep !== "review" && activeStep !== "operation") {
       setValidatedSteps((current) => ({ ...current, [preflight]: false }));
     }
     if (key === "image") {
       setImageCheckState("idle");
       setImageCheckError(null);
       setImageUpdatedAt(null);
-      setResolvedImage(null);
     }
     setError(null);
   }
@@ -648,10 +644,6 @@ export default function App() {
       }
     }
     if (activeStep === "site") {
-      if (imageCheckState !== "valid" || resolvedImage !== draft.image.trim() || !draft.imageRef) {
-        setError("请等待最新镜像 digest 解析完成后再继续。");
-        return;
-      }
       setCheckingStep("site");
       setError(null);
       try {
@@ -685,7 +677,6 @@ export default function App() {
 
   useEffect(() => {
     if (!presetLoaded || checkingStep || !["target", "source", "site"].includes(activeStep)) return;
-    if (activeStep === "site" && imageCheckState !== "valid") return;
     if (autoPreflightStep.current === activeStep) return;
     autoPreflightStep.current = activeStep;
     const timer = window.setTimeout(() => void goNext(), 0);
@@ -934,8 +925,7 @@ export default function App() {
     setForceSyncConflicts(false);
     setValidatedSteps({ target: true, source: true, site: true });
     setImageCheckState("valid");
-    setResolvedImage(bootstrap?.savedDeployment?.image ?? null);
-      setActiveStep("review");
+    setActiveStep("review");
       setPresetLoaded(true);
     setDialog(null);
     void loadSyncPlan(nextDraft);
@@ -1035,7 +1025,10 @@ export default function App() {
             )}
             {activeStep === "source" && <SourceStep draft={draft} update={update} />}
             {activeStep === "site" && (
-              <SiteStep
+              <SiteStep draft={draft} update={update} />
+            )}
+            {activeStep === "credentials" && (
+              <CredentialsStep
                 draft={draft}
                 update={update}
                 imageCheckState={imageCheckState}
@@ -1106,9 +1099,9 @@ export default function App() {
                 <TerminalSquare size={17} />{usingSavedConfig ? "应用选中的同步" : "开始部署"}
               </button>
             ) : (
-              <button className={`primary-action ${checkingStep || (activeStep === "site" && imageCheckState === "loading") ? "is-loading" : ""}`} onClick={() => void goNext()} disabled={!canAdvance || checkingStep !== null || (activeStep === "site" && imageCheckState !== "valid")}>
+              <button className={`primary-action ${checkingStep || (activeStep === "credentials" && imageCheckState === "loading") ? "is-loading" : ""}`} onClick={() => void goNext()} disabled={!canAdvance || checkingStep !== null || (activeStep === "credentials" && imageCheckState !== "valid")}>
                 {checkingLabel(checkingStep, activeStep, draft.target, imageCheckState)}
-                {checkingStep || (activeStep === "site" && imageCheckState === "loading") ? <LoaderCircle className="button-loader" size={16} aria-hidden="true" /> : <ArrowRight size={16} />}
+                {checkingStep || (activeStep === "credentials" && imageCheckState === "loading") ? <LoaderCircle className="button-loader" size={16} aria-hidden="true" /> : <ArrowRight size={16} />}
               </button>
             )}
             </>}
@@ -1186,7 +1179,8 @@ export default function App() {
 function stepDescription(step: StepKey): string {
   if (step === "target") return "选择当前服务器，或连接其他 Linux 服务器。";
   if (step === "source") return "输入源站地址和管理员账号。";
-  if (step === "site") return "设置站点名称、部署目录、端口和容器镜像。";
+  if (step === "site") return "设置站点名称、部署目录和服务端口，先检查目标环境。";
+  if (step === "credentials") return "设置管理员账号；密码留空时自动生成安全随机值。";
   if (step === "review") return "确认以下信息无误后开始部署。";
   return "可以在这里查看部署进度和结果。";
 }
@@ -1316,13 +1310,9 @@ function SourceStep({ draft, update }: { draft: Draft; update: <K extends keyof 
   return <div className="form-layout"><Field label="源站地址"><input autoFocus value={draft.sourceUrl} onChange={(event) => update("sourceUrl", event.target.value)} placeholder="https://enterprise.meowai.net" autoComplete="url" /></Field><div className="form-row"><Field label="用户名"><input value={draft.sourceUsername} onChange={(event) => update("sourceUsername", event.target.value)} placeholder="源站用户名" autoComplete="username" /></Field><Field label="密码"><input type="password" value={draft.sourcePassword} onChange={(event) => update("sourcePassword", event.target.value)} placeholder="源站密码" autoComplete="current-password" /></Field></div></div>;
 }
 
-function SiteStep({ draft, update, imageCheckState, imageCheckError, imageUpdatedAt, onRetryImage }: {
+function SiteStep({ draft, update }: {
   draft: Draft;
   update: <K extends keyof Draft>(key: K, value: Draft[K]) => void;
-  imageCheckState: ImageCheckState;
-  imageCheckError: string | null;
-  imageUpdatedAt: string | null;
-  onRetryImage: () => void;
 }) {
   return (
     <div className="form-layout">
@@ -1337,6 +1327,20 @@ function SiteStep({ draft, update, imageCheckState, imageCheckError, imageUpdate
         <Field label="NewAPI 端口"><input inputMode="numeric" value={draft.newapiPort} onChange={(event) => update("newapiPort", event.target.value)} placeholder="3000" /></Field>
         <Field label="Uptime Kuma 端口"><input inputMode="numeric" value={draft.kumaPort} onChange={(event) => update("kumaPort", event.target.value)} placeholder="3001" /></Field>
       </div>
+    </div>
+  );
+}
+
+function CredentialsStep({ draft, update, imageCheckState, imageCheckError, imageUpdatedAt, onRetryImage }: {
+  draft: Draft;
+  update: <K extends keyof Draft>(key: K, value: Draft[K]) => void;
+  imageCheckState: ImageCheckState;
+  imageCheckError: string | null;
+  imageUpdatedAt: string | null;
+  onRetryImage: () => void;
+}) {
+  return (
+    <div className="form-layout">
       <div className="form-row">
         <Field label="NewAPI 管理员用户名"><input value={draft.newapiAdminUsername} onChange={(event) => update("newapiAdminUsername", event.target.value)} placeholder="admin" autoComplete="username" /></Field>
         <Field label="NewAPI 管理员密码" hint="留空则自动生成随机密码。"><input type="password" value={draft.newapiAdminPassword} onChange={(event) => update("newapiAdminPassword", event.target.value)} placeholder="部署时自动生成" autoComplete="new-password" /></Field>
@@ -1625,12 +1629,19 @@ function validateStep(step: StepKey, draft: Draft, presetLoaded = false): string
     const newapi = Number(draft.newapiPort);
     const kuma = Number(draft.kumaPort);
     if (!Number.isInteger(newapi) || !Number.isInteger(kuma) || newapi < 1 || kuma < 1 || newapi > 65535 || kuma > 65535 || newapi === kuma) return "两个端口需要是 1 到 65535 之间的不同数字。";
+  }
+  if (step === "credentials") {
+    if (!draft.newapiAdminUsername.trim() || !draft.kumaAdminUsername.trim()) return "管理员用户名不能为空。";
+    if (draft.newapiAdminUsername.length > 12) return "NewAPI 管理员用户名不能超过 12 个字符。";
     if (!draft.image.trim()) return "请填写容器镜像。";
+    if (!presetLoaded && !/^sha256:[A-Fa-f0-9]{64}$/.test(draft.imageRef)) return "镜像 digest 尚未解析或无效，请等待解析完成。";
   }
   if (step === "review") {
-    const validation = validateStep("target", draft, presetLoaded) ?? validateStep("source", draft, presetLoaded) ?? validateStep("site", draft, presetLoaded);
+    const validation = validateStep("target", draft, presetLoaded)
+      ?? validateStep("source", draft, presetLoaded)
+      ?? validateStep("site", draft, presetLoaded)
+      ?? validateStep("credentials", draft, presetLoaded);
     if (validation) return validation;
-    if (!presetLoaded && !/^sha256:[A-Fa-f0-9]{64}$/.test(draft.imageRef)) return "镜像 digest 尚未解析或无效，请返回站点设置重新检查。";
   }
   return null;
 }
@@ -1647,18 +1658,19 @@ function requiresSshPassword(failure: OperationFailure | null, target: Deploymen
   return target === "ssh" && failure?.retryable === true && failure.code === "SSH_AUTHENTICATION_FAILED";
 }
 
-function preflightForField(field: keyof Draft): PreflightStep | null {
+function preflightForField(field: keyof Draft): PreflightStep | "credentials" | null {
   if (["target", "sshDestination", "sshPassword"].includes(field)) return "target";
   if (["sourceUrl", "sourceUsername", "sourcePassword"].includes(field)) return "source";
-  if (["websiteName", "containerName", "directory", "newapiPort", "kumaPort", "newapiAdminUsername", "newapiAdminPassword", "kumaAdminUsername", "kumaAdminPassword", "image", "imageRef"].includes(field)) return "site";
+  if (["websiteName", "containerName", "directory", "newapiPort", "kumaPort"].includes(field)) return "site";
+  if (["newapiAdminUsername", "newapiAdminPassword", "kumaAdminUsername", "kumaAdminPassword", "image", "imageRef"].includes(field)) return "credentials";
   return null;
 }
 
 function checkingLabel(checking: PreflightStep | null, active: StepKey, target: DeploymentTarget, imageState: ImageCheckState): string {
   if (checking === "target") return target === "ssh" ? "正在连接 SSH" : "正在检查本机环境";
   if (checking === "source") return "正在验证源站账号";
-  if (checking === "site") return "正在检查服务端口";
-  if (active === "site" && imageState === "loading") return "正在解析最新镜像";
+  if (checking === "site") return "正在检查部署目标";
+  if (active === "credentials" && imageState === "loading") return "正在解析最新镜像";
   return "下一步";
 }
 
