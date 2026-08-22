@@ -367,7 +367,7 @@ async fn groups_are_complete_sorted_and_hashed_deterministically() {
             "message": "",
             "data": {
                 "vip": {
-                    "description": "VIP", "ratio": 1.5, "topup_ratio": 1.2,
+                    "description": "VIP", "ratio": 1.5, "discount": "6折", "topup_ratio": 1.2,
                     "user_selectable": true, "models": ["gpt-vip", "shared"]
                 },
                 "default": {
@@ -406,6 +406,7 @@ async fn groups_are_complete_sorted_and_hashed_deterministically() {
     assert_eq!(first.groups[1].ratio, json!(1.5));
     assert_eq!(first.groups[1].purchase_ratio, None);
     assert_eq!(first.groups[1].purchase_source, "unknown");
+    assert_eq!(first.groups[1].discount.as_deref(), Some("6折"));
 }
 
 #[tokio::test]
@@ -1198,6 +1199,7 @@ fn group(name: &str, ratio: impl Into<Value>) -> SourceGroup {
         ratio,
         purchase_ratio: None,
         purchase_source: "unknown".to_owned(),
+        discount: None,
         topup_ratio: None,
         user_selectable: false,
         models: vec![format!("{name}-model")],

@@ -1140,6 +1140,7 @@ mod tests {
             ratio: serde_json::json!(terminal),
             purchase_ratio: purchase.map(|value| serde_json::json!(value)),
             purchase_source: purchase.map_or("unknown", |_| "special_ratio").to_owned(),
+            discount: None,
             topup_ratio: None,
             user_selectable: true,
             models: Vec::new(),

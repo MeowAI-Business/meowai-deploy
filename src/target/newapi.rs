@@ -258,7 +258,21 @@ impl NewApiClient {
             }
             ratios.insert(group.group_name.clone(), group.ratio.clone());
         }
-        self.update_json_option("GroupRatio", &ratios).await
+        self.update_json_option("GroupRatio", &ratios).await?;
+        self.update_json_option(
+            "GroupDiscount",
+            &catalog
+                .groups
+                .iter()
+                .filter_map(|group| {
+                    group
+                        .discount
+                        .clone()
+                        .map(|discount| (group.group_name.clone(), discount))
+                })
+                .collect::<BTreeMap<_, _>>(),
+        )
+        .await
     }
 
     pub async fn apply_topup_pricing(&self, catalog: &GroupCatalog) -> Result<()> {
@@ -390,6 +404,7 @@ impl NewApiClient {
         for (key, module) in [
             ("UserUsableGroups", SyncModule::Groups),
             ("GroupRatio", SyncModule::GroupPricing),
+            ("GroupDiscount", SyncModule::GroupPricing),
             ("TopupGroupRatio", SyncModule::Units),
             ("console_setting.public_status_url", SyncModule::Kuma),
         ] {

@@ -23,6 +23,7 @@ pub struct SourceGroup {
     pub ratio: serde_json::Value,
     pub purchase_ratio: Option<serde_json::Value>,
     pub purchase_source: String,
+    pub discount: Option<String>,
     pub topup_ratio: Option<serde_json::Value>,
     pub user_selectable: bool,
     pub models: Vec<String>,
@@ -108,6 +109,8 @@ struct RawGroup {
     purchase_ratio: Option<serde_json::Value>,
     #[serde(default)]
     purchase_source: Option<String>,
+    #[serde(default)]
+    discount: Option<String>,
     #[serde(default)]
     ratio: Option<serde_json::Value>,
     #[serde(default)]
@@ -238,6 +241,10 @@ impl SourceClient {
                     }
                     .to_owned()
                 }),
+                discount: group
+                    .discount
+                    .map(|discount| discount.trim().to_owned())
+                    .filter(|discount| !discount.is_empty()),
                 topup_ratio: group.topup_ratio,
                 user_selectable: group.user_selectable,
                 models,
@@ -741,6 +748,7 @@ mod unit_tests {
             ratio: serde_json::json!(1),
             purchase_ratio: None,
             purchase_source: "unknown".to_owned(),
+            discount: None,
             topup_ratio: None,
             user_selectable: false,
             models: vec!["gpt-test".to_owned()],
@@ -762,6 +770,7 @@ mod unit_tests {
             ratio: serde_json::json!(1),
             purchase_ratio: None,
             purchase_source: "unknown".to_owned(),
+            discount: None,
             topup_ratio: None,
             user_selectable: false,
             models: vec![],

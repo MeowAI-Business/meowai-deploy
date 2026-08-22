@@ -307,6 +307,22 @@ pub fn build_source_modules(
         serde_json::to_value(group_ratios)
             .map_err(|error| AppError::State(format!("serialize group ratios: {error}")))?,
     );
+    let group_discounts = input
+        .catalog
+        .groups
+        .iter()
+        .filter_map(|group| {
+            group
+                .discount
+                .clone()
+                .map(|discount| (group.group_name.clone(), discount))
+        })
+        .collect::<BTreeMap<_, _>>();
+    group_pricing.insert(
+        "GroupDiscount".to_owned(),
+        serde_json::to_value(group_discounts)
+            .map_err(|error| AppError::State(format!("serialize group discounts: {error}")))?,
+    );
     group_pricing.insert(
         "purchase".to_owned(),
         serde_json::to_value(purchase)
@@ -546,6 +562,7 @@ pub fn module_for_pricing_key(key: &str) -> SyncModule {
     } else if matches!(
         key,
         "GroupGroupRatio"
+            | "GroupDiscount"
             | "group_ratio_setting.group_special_usable_group"
             | "AutoGroups"
             | "MaxTokenAutoGroups"
