@@ -95,7 +95,7 @@ struct TargetUpgradeLock {
 }
 
 impl TargetUpgradeLock {
-    fn acquire(executor: &TargetExecutor) -> Result<Self> {
+    fn acquire(executor: &TargetExecutor, allow_repair_operation_lock: bool) -> Result<Self> {
         let token = crate::security::random_secret(32);
         let quoted_token = shell_quote(&token);
         executor.run_in_directory(&format!(
@@ -103,12 +103,30 @@ impl TargetUpgradeLock {
 lock=.meowai-upgrade.lock
 token={quoted_token}
 now=$(date +%s)
+allow_repair={allow_repair}
+updater_owned=${{MEOWAI_UPDATER_OWNS_OPERATION_LOCK:-0}}
+updater_operation_id=${{MEOWAI_UPDATER_OPERATION_ID:-}}
+operation_lock_is_ours() {{
+  [ "$allow_repair" = 1 ] && return 0
+  [ "$updater_owned" = 1 ] || return 1
+  [ "$(cat .meowai-operation.lock/kind 2>/dev/null || true)" = updater ] || return 1
+  [ -n "$updater_operation_id" ] || return 1
+  [ "$(cat .meowai-operation.lock/operation_id 2>/dev/null || true)" = "$updater_operation_id" ]
+}}
+reject_operation_lock() {{
+  if [ -e .meowai-operation.lock ] && ! operation_lock_is_ours; then
+    echo 'another managed repair operation is already running' >&2
+    return 1
+  fi
+}}
 write_owner() {{
   printf '%s\n%s\n' "$token" "$now" > "$lock/owner.next-$token"
   chmod 600 "$lock/owner.next-$token"
   mv "$lock/owner.next-$token" "$lock/owner"
 }}
+reject_operation_lock
 if mkdir "$lock" 2>/dev/null; then
+  if ! reject_operation_lock; then rmdir "$lock"; exit 1; fi
   chmod 700 "$lock"
   write_owner
   exit 0
@@ -128,6 +146,7 @@ rm -rf -- "$stale"
 mkdir "$lock"
 chmod 700 "$lock"
 write_owner"#,
+            allow_repair = if allow_repair_operation_lock { 1 } else { 0 }
         ))?;
         let (stop, receiver) = mpsc::channel();
         let heartbeat_executor = executor.clone();
@@ -211,6 +230,7 @@ impl Drop for UpdaterPauseGuard {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn apply(
     config: &DeploymentConfig,
     state: &DeploymentState,
@@ -221,6 +241,7 @@ pub async fn apply(
     plan: &UpgradePlan,
     repair_updater: bool,
     invoked_by_updater: bool,
+    allow_repair_operation_lock: bool,
 ) -> Result<UpgradeAgentResult> {
     validate_data_migration_policy(manifest, invoked_by_updater)?;
     validate_migration_path(state, manifest)?;
@@ -250,7 +271,7 @@ pub async fn apply(
     };
     let backup_id = operation_id.clone();
     let executor = TargetExecutor::new(config.target.clone(), config.directory.clone());
-    let _target_upgrade_lock = TargetUpgradeLock::acquire(&executor)?;
+    let _target_upgrade_lock = TargetUpgradeLock::acquire(&executor, allow_repair_operation_lock)?;
     let control_plane = control_plane_client(registration)?;
 
     recover_incomplete_operation(&executor, config, registration, manifest).await?;
@@ -1747,17 +1768,16 @@ fn validate_migration_path(state: &DeploymentState, manifest: &ReleaseManifest) 
             current_deployment, manifest.migration_plan.from
         )));
     }
-    if manifest.migration_plan.from == manifest.migration_plan.to {
-        if manifest
+    if manifest.migration_plan.from == manifest.migration_plan.to
+        && manifest
             .migration_plan
             .steps
             .iter()
             .any(|step| step.starts_with("deployment-"))
-        {
-            return Err(AppError::State(
-                "deployment schema 不变时不得声明 deployment migration step".to_owned(),
-            ));
-        }
+    {
+        return Err(AppError::State(
+            "deployment schema 不变时不得声明 deployment migration step".to_owned(),
+        ));
     }
     if manifest.migration_plan.steps.is_empty() {
         return Err(AppError::State(
@@ -3049,10 +3069,10 @@ mod tests {
     fn upgrade_lock_rejects_active_owner_and_reclaims_expired_owner() {
         let root = tempfile::tempdir().expect("target directory");
         let executor = TargetExecutor::new(Target::Local, root.path().to_path_buf());
-        let first = TargetUpgradeLock::acquire(&executor).expect("first lock");
-        assert!(TargetUpgradeLock::acquire(&executor).is_err());
+        let first = TargetUpgradeLock::acquire(&executor, false).expect("first lock");
+        assert!(TargetUpgradeLock::acquire(&executor, false).is_err());
         drop(first);
-        let second = TargetUpgradeLock::acquire(&executor).expect("lock after release");
+        let second = TargetUpgradeLock::acquire(&executor, false).expect("lock after release");
         drop(second);
 
         std::fs::create_dir(root.path().join(".meowai-upgrade.lock")).expect("stale lock");
@@ -3061,7 +3081,7 @@ mod tests {
             "orphan\n1\n",
         )
         .expect("stale owner");
-        let reclaimed = TargetUpgradeLock::acquire(&executor).expect("reclaim stale lock");
+        let reclaimed = TargetUpgradeLock::acquire(&executor, false).expect("reclaim stale lock");
         drop(reclaimed);
         assert!(!root.path().join(".meowai-upgrade.lock").exists());
     }

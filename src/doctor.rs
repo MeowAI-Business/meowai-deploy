@@ -129,14 +129,13 @@ fn check_architecture_for(operating_system: &str, architecture: &str) -> Check {
         "aarch64" => Some("arm64"),
         _ => None,
     };
-    if matches!(operating_system, "linux" | "macos" | "windows") && architecture_name.is_some() {
+    if matches!(operating_system, "linux" | "macos" | "windows")
+        && let Some(architecture_name) = architecture_name
+    {
         Check {
             name: "architecture".to_owned(),
             status: CheckStatus::Pass,
-            detail: format!(
-                "{operating_system} {} supported",
-                architecture_name.expect("supported architecture")
-            ),
+            detail: format!("{operating_system} {} supported", architecture_name),
             blocking: true,
         }
     } else {

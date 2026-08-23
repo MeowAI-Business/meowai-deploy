@@ -3,6 +3,7 @@ mod deployments;
 mod groups;
 mod onboard_status;
 mod pricing;
+mod repair;
 
 pub use auth::{SourceAccountMode, SourceCredentials, SourceIdentity};
 pub use deployments::{
@@ -16,6 +17,10 @@ pub use groups::{
 pub use onboard_status::{
     StatusKeyMetadata, StatusKeyProvision, StatusManifest, StatusMonitorManifest,
     StatusMonitorResponse, StatusMonitorSnapshot, StatusPage, StatusSnapshot,
+};
+pub use repair::{
+    PreparedRepairCredentials, RepairDiagnoseReceipt, RepairDiagnostic, RepairObservationRequest,
+    RepairOperationReceipt, RepairOperationRequest, RepairProbeReceipt,
 };
 
 use std::{fmt, sync::Arc, time::Duration};
@@ -300,7 +305,11 @@ impl SourceClient {
     }
 
     pub async fn validate_session(&mut self) -> SourceResult<()> {
-        self.refresh_session().await
+        // A persisted access token is still valid until it approaches its
+        // expiry. Refreshing unconditionally makes consecutive read-only
+        // operations hit the source refresh rate limit and destabilize repair
+        // plan fingerprints.
+        self.refresh_if_needed().await
     }
 
     fn endpoint(&self, path: &str) -> SourceResult<Url> {

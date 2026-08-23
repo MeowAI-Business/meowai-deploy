@@ -262,6 +262,7 @@ impl SourceClient {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn report_upgrade_plan(
         &self,
         registration: &DeploymentRegistration,

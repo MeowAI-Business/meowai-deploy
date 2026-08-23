@@ -5,5 +5,6 @@ pub mod manage;
 pub mod onboard;
 pub mod operation;
 pub mod plan;
+pub mod repair;
 pub mod source;
 pub mod target;

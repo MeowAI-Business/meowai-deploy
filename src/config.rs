@@ -152,11 +152,7 @@ image_ref = ""
     }
 
     pub fn resolve_passwords(&mut self) {
-        if self.source_password.is_none() {
-            self.source_password = env::var("MEOWAI_DEPLOY_SOURCE_PASSWORD")
-                .ok()
-                .map(SecretString::from);
-        }
+        self.resolve_source_password();
         if self.newapi_admin_password.is_none() {
             self.newapi_admin_password = Some(
                 env::var("MEOWAI_DEPLOY_NEWAPI_ADMIN_PASSWORD").unwrap_or_else(|_| random_secret()),
@@ -166,6 +162,18 @@ image_ref = ""
             self.kuma_admin_password = Some(
                 env::var("MEOWAI_DEPLOY_KUMA_ADMIN_PASSWORD").unwrap_or_else(|_| random_secret()),
             );
+        }
+    }
+
+    /// Overlay only the source login password from the environment. Repair and
+    /// other non-onboard flows need a non-interactive re-login path after an
+    /// upstream rebuild invalidates the stored session, without generating
+    /// unrelated admin passwords.
+    pub fn resolve_source_password(&mut self) {
+        if self.source_password.is_none() {
+            self.source_password = env::var("MEOWAI_DEPLOY_SOURCE_PASSWORD")
+                .ok()
+                .map(SecretString::from);
         }
     }
 
@@ -579,7 +587,6 @@ async fn prompt_config(
         kuma_admin_password,
         image,
         image_ref,
-        ..DeploymentConfig::default()
     };
     config.normalize();
     config.validate()?;

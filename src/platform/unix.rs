@@ -14,6 +14,20 @@ pub fn user_profile_directory() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Report whether a process with the given PID is still running for the
+/// current user. Used to reclaim operation locks left behind by a killed
+/// process. `kill -0` succeeds without sending a signal when the process
+/// exists and is signalable by this user.
+pub fn process_alive(pid: u32) -> bool {
+    std::process::Command::new("/bin/kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 pub const fn launched_from_desktop_shell() -> bool {
     false
 }

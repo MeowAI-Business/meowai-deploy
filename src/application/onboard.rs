@@ -492,13 +492,8 @@ impl ProductionOnboardBackend {
     pub async fn report_failure(&self, error: &ApplicationError) {
         if let Some(registration) = &self.registration {
             let reason = format!("{}: {}", error.code, error.message);
-            let _ = deployment_control::queue_lifecycle(
-                registration,
-                "deployment_failed",
-                "failed",
-                &reason,
-            )
-            .await;
+            let _ = deployment_control::queue_lifecycle(registration, "failed", "failed", &reason)
+                .await;
         }
     }
 

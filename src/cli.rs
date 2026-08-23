@@ -1,6 +1,7 @@
 use std::{net::IpAddr, path::PathBuf};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -38,6 +39,8 @@ pub enum Command {
     Update(UpdateArgs),
     /// Plan or apply a complete target deployment upgrade.
     Upgrade(UpgradeArgs),
+    /// Diagnose and safely repair a managed downstream deployment.
+    Repair(RepairArgs),
     /// Internal target-host entrypoint used by the installed systemd updater.
     #[command(hide = true)]
     Agent(AgentArgs),
@@ -137,6 +140,57 @@ pub struct UpgradeArgs {
     pub rollback: Option<String>,
 }
 
+#[derive(Clone, Debug, Args)]
+pub struct RepairArgs {
+    /// Only collect diagnostics; do not create an operation or write files.
+    #[arg(long, conflicts_with_all = ["plan", "yes", "plan_fingerprint", "allow_data_migration"])]
+    pub check: bool,
+
+    /// Generate a redacted plan and exit without applying it.
+    #[arg(long, conflicts_with_all = ["check", "yes", "plan_fingerprint"])]
+    pub plan: bool,
+
+    /// Apply automatic actions after validating the plan.
+    #[arg(long, conflicts_with_all = ["check", "plan"])]
+    pub yes: bool,
+
+    /// Fingerprint returned by a prior `repair --plan` invocation.
+    #[arg(long, value_name = "FINGERPRINT", requires = "yes", conflicts_with_all = ["check", "plan"])]
+    pub plan_fingerprint: Option<String>,
+
+    /// Emit versioned JSON instead of terminal output.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Load the deployment target from a TOML configuration file.
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+
+    /// Restrict automatic actions to the listed action kinds.
+    #[arg(long, value_enum, value_delimiter = ',')]
+    pub actions: Vec<RepairActionKind>,
+
+    /// Permit a signed release manifest to perform a data migration.
+    #[arg(long)]
+    pub allow_data_migration: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, ValueEnum, Serialize, Deserialize)]
+#[value(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum RepairActionKind {
+    ManualIntervention,
+    RotateInstallationCredentials,
+    ReconcileRegistrationIdentity,
+    RebuildManagedEnvironment,
+    ReconcileCompose,
+    RepairUpgradeAgent,
+    ReconcileApprovedRelease,
+    RestartManagedService,
+    RepairManagedPermissions,
+    RefreshMonitoring,
+}
+
 #[derive(Debug, Args)]
 pub struct AgentArgs {
     /// Target deployment root containing downstream-credentials.env.
@@ -146,6 +200,24 @@ pub struct AgentArgs {
     /// Required for the non-interactive systemd execution path.
     #[arg(long)]
     pub auto: bool,
+
+    /// Generate a target-applied repair proof from the target env file.
+    /// Deliberately visible in `agent --help` so capability probes can detect
+    /// binaries that predate the repair protocol.
+    #[arg(long)]
+    pub proof: bool,
+
+    #[arg(long, hide = true, requires = "proof")]
+    pub operation_id: Option<String>,
+
+    #[arg(long, hide = true, requires = "proof")]
+    pub generation: Option<u32>,
+
+    #[arg(long, hide = true, requires = "proof")]
+    pub challenge: Option<String>,
+
+    #[arg(long, hide = true, requires = "proof")]
+    pub observation_fingerprint: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]

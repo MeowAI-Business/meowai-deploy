@@ -9,6 +9,8 @@ set -eu
 umask 077
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 LOCK="$ROOT/.meowai-updater.lock"
+OPERATION_LOCK="$ROOT/.meowai-operation.lock"
+OPERATION_ID="updater-$(date +%s)-$$"
 SOCKET="$ROOT/run/updater.sock"
 STATE="$ROOT/run/updater-status.json"
 PROJECT="__PROJECT__"
@@ -17,8 +19,25 @@ REPOSITORY="__REPOSITORY__"
 COMPOSE_BASE="$ROOT/docker-compose.yml"
 COMPOSE_OVERRIDE="$ROOT/docker-compose.updater.yml"
 
-if ! mkdir "$LOCK" 2>/dev/null; then exit 0; fi
-trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT HUP INT TERM
+if [ -e "$ROOT/.meowai-upgrade.lock" ]; then exit 0; fi
+if ! mkdir "$OPERATION_LOCK" 2>/dev/null; then exit 0; fi
+if [ -e "$ROOT/.meowai-upgrade.lock" ]; then rmdir "$OPERATION_LOCK" 2>/dev/null || true; exit 0; fi
+if ! mkdir "$LOCK" 2>/dev/null; then rmdir "$OPERATION_LOCK" 2>/dev/null || true; exit 0; fi
+chmod 700 "$OPERATION_LOCK" "$LOCK"
+printf '%s\n' "updater" > "$OPERATION_LOCK/kind"
+printf '%s\n' "$OPERATION_ID" > "$OPERATION_LOCK/operation_id"
+printf '%s\n' "$(date +%s)" > "$OPERATION_LOCK/heartbeat"
+chmod 600 "$OPERATION_LOCK/kind" "$OPERATION_LOCK/operation_id" "$OPERATION_LOCK/heartbeat"
+export MEOWAI_UPDATER_OWNS_OPERATION_LOCK=1
+export MEOWAI_UPDATER_OPERATION_ID="$OPERATION_ID"
+heartbeat_loop() {
+  while sleep 30; do
+    [ -d "$OPERATION_LOCK" ] || break
+    printf '%s\n' "$(date +%s)" > "$OPERATION_LOCK/heartbeat"
+  done
+}
+heartbeat_loop & HEARTBEAT_PID=$!
+trap 'kill "$HEARTBEAT_PID" 2>/dev/null || true; wait "$HEARTBEAT_PID" 2>/dev/null || true; rm -f "$OPERATION_LOCK/owner" "$OPERATION_LOCK/kind" "$OPERATION_LOCK/operation_id" "$OPERATION_LOCK/heartbeat"; rmdir "$OPERATION_LOCK" 2>/dev/null || true; rmdir "$LOCK" 2>/dev/null || true' EXIT HUP INT TERM
 
 report() {
   event=$1 current=$2 approved=$3 backup_id=$4 error_code=$5 reason=$6
@@ -318,6 +337,7 @@ mod tests {
         fs::set_permissions(path, permissions).expect("make fake executable runnable");
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn serve_control_socket(
         listener: UnixListener,
         repository: String,
@@ -624,6 +644,9 @@ esac
         assert!(SCRIPT.contains("updater-status.json"));
         assert!(!SCRIPT.contains("eval "));
         assert!(!SCRIPT.contains("sh -c \"$"));
+        assert!(SCRIPT.contains(".meowai-operation.lock"));
+        assert!(SCRIPT.contains("MEOWAI_UPDATER_OWNS_OPERATION_LOCK=1"));
+        assert!(SCRIPT.contains("wait \"$HEARTBEAT_PID\""));
     }
 
     #[test]
@@ -700,6 +723,8 @@ esac
             fs::read_to_string(result.root.join("current-digest")).expect("read final digest"),
             APPROVED_DIGEST
         );
+        assert!(!result.root.join(".meowai-operation.lock").exists());
+        assert!(!result.root.join(".meowai-updater.lock").exists());
         let compose_override = fs::read_to_string(result.root.join("docker-compose.updater.yml"))
             .expect("read updater Compose override");
         assert!(

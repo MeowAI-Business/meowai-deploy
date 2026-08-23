@@ -17,7 +17,8 @@ use unix as implementation;
 use windows as implementation;
 
 pub use implementation::{
-    ensure_private_directory, open_private_append, private_path_is_restricted, write_private_file,
+    ensure_private_directory, open_private_append, private_path_is_restricted, process_alive,
+    write_private_file,
 };
 
 pub fn state_home() -> Result<PathBuf> {

@@ -453,7 +453,6 @@ impl From<&DeploymentConfig> for WebDraft {
             kuma_admin_username: config.kuma_admin_username.clone(),
             image: config.image.clone(),
             image_ref: config.image_ref.clone(),
-            ..Self::default()
         }
     }
 }

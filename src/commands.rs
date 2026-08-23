@@ -80,17 +80,44 @@ pub async fn run(cli: Cli) -> Result<()> {
     if let Some(Command::Agent(args)) = cli.command {
         return upgrade::run_agent(&args).await;
     }
-    match lifecycle_outbox::flush().await {
-        Ok(sent) if sent > 0 => print_done(&format!("已补送 {sent} 条待处理生命周期事件")),
-        Err(error) => eprintln!(
-            "{}",
-            style(format!("警告：待处理生命周期事件仍未送达：{error}")).yellow()
-        ),
-        _ => {}
+    let read_only_repair = match &cli.command {
+        Some(Command::Repair(args)) => args.check || args.plan,
+        _ => false,
+    };
+    // Machine-readable modes must keep stdout pure JSON; route incidental
+    // outbox notices to stderr instead.
+    let json_stdout = match &cli.command {
+        Some(Command::Repair(args)) => args.json,
+        Some(Command::Bootstrap(args)) => args.json,
+        Some(Command::Doctor(args)) => args.json,
+        _ => false,
+    };
+    if !read_only_repair {
+        match lifecycle_outbox::flush().await {
+            Ok(sent) if sent > 0 => {
+                let message = format!("已补送 {sent} 条待处理生命周期事件");
+                if json_stdout {
+                    eprintln!("{message}");
+                } else {
+                    print_done(&message);
+                }
+            }
+            Err(error) => eprintln!(
+                "{}",
+                style(format!("警告：待处理生命周期事件仍未送达：{error}")).yellow()
+            ),
+            _ => {}
+        }
     }
     if !matches!(
         cli.command,
-        Some(Command::Update(_) | Command::Upgrade(_) | Command::Agent(_) | Command::Web(_))
+        Some(
+            Command::Update(_)
+                | Command::Upgrade(_)
+                | Command::Repair(_)
+                | Command::Agent(_)
+                | Command::Web(_)
+        )
     ) {
         updater::check_periodically().await;
     }
@@ -116,6 +143,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Some(Command::Logout(args)) => run_logout(&args).await,
         Some(Command::Update(args)) => updater::run(&args).await,
         Some(Command::Upgrade(args)) => upgrade::run(&args).await,
+        Some(Command::Repair(args)) => crate::application::repair::run(&args).await,
         Some(Command::Agent(_)) => unreachable!("agent command handled before lifecycle setup"),
     }
 }
@@ -235,10 +263,14 @@ async fn run_onboard(args: &OnboardArgs) -> Result<()> {
         println!();
         return Ok(());
     }
-    let confirmed = confirm("按以上配置开始部署？")
-        .initial_value(false)
-        .interact()
-        .map_err(AppError::from_prompt)?;
+    let confirmed = if args.non_interactive {
+        true
+    } else {
+        confirm("按以上配置开始部署？")
+            .initial_value(false)
+            .interact()
+            .map_err(AppError::from_prompt)?
+    };
     if !confirmed {
         return Err(AppError::Cancelled);
     }

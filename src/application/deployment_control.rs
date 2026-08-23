@@ -12,6 +12,8 @@ use crate::{
     target::{TargetExecutor, updater},
 };
 
+const REGISTRATION_STAGING_FILE: &str = "downstream-credentials.json.next";
+
 #[derive(Serialize, Deserialize)]
 struct PersistedDownstreamCredentials {
     #[serde(default)]
@@ -120,6 +122,12 @@ pub fn persist_registration(
     executor: &TargetExecutor,
     registration: &DeploymentRegistration,
 ) -> ApplicationResult<()> {
+    // The registration URL is the control-plane identity used by the CLI and
+    // lifecycle outbox. Services inside Compose need the container-reachable
+    // form when that identity points at host loopback.
+    let container_control_plane_url =
+        crate::target::compose::container_source_url(&registration.control_plane_url)
+            .map_err(app_error)?;
     let existing = executor
         .run_in_directory("cat downstream-credentials.env 2>/dev/null || true")
         .map_err(app_error)?;
@@ -138,7 +146,7 @@ pub fn persist_registration(
         ("MEOWAI_DEPLOYMENT_ID", registration.deployment_id.as_str()),
         (
             "MEOWAI_CONTROL_PLANE_URL",
-            registration.control_plane_url.as_str(),
+            container_control_plane_url.as_str(),
         ),
         (
             "MEOWAI_REPORT_CREDENTIAL",
@@ -173,7 +181,7 @@ pub fn persist_registration(
         "MEOWAI_DEPLOYMENT_ID={}\nMEOWAI_INSTALLATION_GENERATION={}\nMEOWAI_CONTROL_PLANE_URL={}\nMEOWAI_REPORT_CREDENTIAL={}\nMEOWAI_PULL_CREDENTIAL={}\nMEOWAI_HEARTBEAT_INTERVAL_SECONDS={}\nMEOWAI_SNAPSHOT_INTERVAL_SECONDS={}\nMEOWAI_CURRENT_IMAGE_DIGEST={}\nMEOWAI_DEPLOYMENT_SCHEMA=1\nMEOWAI_UPDATER_SCHEMA=1\nMEOWAI_DATA_SCHEMA=1\nMEOWAI_CLI_SCHEMA=1\nMEOWAI_ALLOWED_IMAGE_REPOSITORY={}\nMEOWAI_CONTAINER_NAME={}\nMEOWAI_NEWAPI_PORT={}\nMEOWAI_KUMA_PORT={}\nMEOWAI_RELEASE_SCHEMA_VERSION={}\nMEOWAI_RELEASE_MANIFEST_PUBLIC_KEY={}\nMEOWAI_RELEASE_ARTIFACT_ALLOWED_HOSTS={}\nMEOWAI_UPDATER_SOCKET_PATH=/run/meowai/updater.sock\nCHECKER_PROXY_URL=http://checker-proxy:8888\nCHECKER_ENCRYPTION_KEY={}\nCHECKER_FINGERPRINT_KEY={}\nCHECKER_ENCRYPTION_KEY_ID=1\nCHECKER_FINGERPRINT_KEY_ID=1\n",
         registration.deployment_id,
         registration.installation_generation,
-        registration.control_plane_url,
+        container_control_plane_url,
         registration.report_credential.expose_secret(),
         registration.pull_credential.expose_secret(),
         registration.heartbeat_interval_seconds,
@@ -213,6 +221,15 @@ pub fn persist_registration_locally(
     source_user_id: i64,
     registration: &DeploymentRegistration,
 ) -> ApplicationResult<()> {
+    stage_registration_locally(config, source_user_id, registration)?;
+    commit_staged_registration()
+}
+
+pub fn stage_registration_locally(
+    config: &DeploymentConfig,
+    source_user_id: i64,
+    registration: &DeploymentRegistration,
+) -> ApplicationResult<()> {
     let stored = PersistedDownstreamCredentials {
         local_deployment_id: config.deployment_id(),
         source_user_id,
@@ -237,7 +254,12 @@ pub fn persist_registration_locally(
         )
         .with_diagnostic(error.to_string())
     })?;
-    storage::write(DOWNSTREAM_CREDENTIALS_FILE, &content).map_err(app_error)
+    storage::write(REGISTRATION_STAGING_FILE, &content).map_err(app_error)
+}
+
+pub fn commit_staged_registration() -> ApplicationResult<()> {
+    storage::rename_private(REGISTRATION_STAGING_FILE, DOWNSTREAM_CREDENTIALS_FILE)
+        .map_err(app_error)
 }
 
 pub async fn queue_lifecycle(

@@ -60,6 +60,28 @@ pub fn launched_from_desktop_shell() -> bool {
         .is_some_and(|name| name.eq_ignore_ascii_case("explorer.exe"))
 }
 
+/// Report whether a process with the given PID is still running. Used to
+/// reclaim operation locks left behind by a killed process.
+pub fn process_alive(pid: u32) -> bool {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return true;
+    }
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut alive = false;
+    let mut has_entry = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while has_entry {
+        if entry.th32ProcessID == pid {
+            alive = true;
+            break;
+        }
+        has_entry = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    unsafe { CloseHandle(snapshot) };
+    alive
+}
+
 fn parent_process_name() -> Option<String> {
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if snapshot == INVALID_HANDLE_VALUE {

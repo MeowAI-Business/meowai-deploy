@@ -3,6 +3,7 @@ use std::{collections::BTreeMap, fs, path::Path};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use hmac::{Hmac, Mac};
 use reqwest::Client;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -168,6 +169,9 @@ pub async fn run_agent(args: &AgentArgs) -> Result<()> {
             "目标机 agent 必须使用 --auto".to_owned(),
         ));
     }
+    if args.proof {
+        return run_agent_proof(args);
+    }
     let root = fs::canonicalize(&args.root)
         .map_err(|error| AppError::State(format!("无法定位目标 deployment 目录：{error}")))?;
     let values = read_target_env(&root)?;
@@ -178,17 +182,19 @@ pub async fn run_agent(args: &AgentArgs) -> Result<()> {
             "目标机仍有未送达的控制面状态，停止自动升级：{error}"
         ))
     })?;
-    let mut config = DeploymentConfig::default();
-    config.directory = root.clone();
-    config.target = Target::Local;
-    config.container_name = required_env(&values, "MEOWAI_CONTAINER_NAME")?;
-    config.image = required_env(&values, "MEOWAI_ALLOWED_IMAGE_REPOSITORY")?;
-    config.image_ref = values
-        .get("MEOWAI_CURRENT_IMAGE_DIGEST")
-        .cloned()
-        .unwrap_or_default();
-    config.newapi_port = parse_u16(&values, "MEOWAI_NEWAPI_PORT", 3000)?;
-    config.kuma_port = parse_u16(&values, "MEOWAI_KUMA_PORT", 3001)?;
+    let config = DeploymentConfig {
+        directory: root.clone(),
+        target: Target::Local,
+        container_name: required_env(&values, "MEOWAI_CONTAINER_NAME")?,
+        image: required_env(&values, "MEOWAI_ALLOWED_IMAGE_REPOSITORY")?,
+        image_ref: values
+            .get("MEOWAI_CURRENT_IMAGE_DIGEST")
+            .cloned()
+            .unwrap_or_default(),
+        newapi_port: parse_u16(&values, "MEOWAI_NEWAPI_PORT", 3000)?,
+        kuma_port: parse_u16(&values, "MEOWAI_KUMA_PORT", 3001)?,
+        ..DeploymentConfig::default()
+    };
 
     let mut state: DeploymentState = serde_json::from_value(serde_json::json!({
         "schema_version": 1,
@@ -205,7 +211,7 @@ pub async fn run_agent(args: &AgentArgs) -> Result<()> {
         "data_schema": values.get("MEOWAI_DATA_SCHEMA").cloned().unwrap_or_else(|| "1".to_owned()),
         "cli_schema": values.get("MEOWAI_CLI_SCHEMA").cloned().unwrap_or_else(|| "1".to_owned()),
         "target_os": "linux",
-        "target_arch": values.get("MEOWAI_TARGET_ARCH").cloned().unwrap_or_else(|| host_arch()),
+        "target_arch": values.get("MEOWAI_TARGET_ARCH").cloned().unwrap_or_else(host_arch),
         "systemd_available": true,
         "compose_v2_available": true,
         "image_digest": values.get("MEOWAI_CURRENT_IMAGE_DIGEST").cloned().unwrap_or_default(),
@@ -253,6 +259,7 @@ pub async fn run_agent(args: &AgentArgs) -> Result<()> {
         &plan,
         false,
         true,
+        false,
     )
     .await?;
     state.deployment_schema = manifest.deployment_schema.to_string();
@@ -283,14 +290,72 @@ pub async fn run_agent(args: &AgentArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_agent_proof(args: &AgentArgs) -> Result<()> {
+    let operation_id = args
+        .operation_id
+        .as_deref()
+        .ok_or_else(|| AppError::InvalidConfig("proof 缺少 operation id".to_owned()))?;
+    let generation = args
+        .generation
+        .ok_or_else(|| AppError::InvalidConfig("proof 缺少 generation".to_owned()))?;
+    let challenge = args
+        .challenge
+        .as_deref()
+        .ok_or_else(|| AppError::InvalidConfig("proof 缺少 challenge".to_owned()))?;
+    let observation_fingerprint = args
+        .observation_fingerprint
+        .as_deref()
+        .ok_or_else(|| AppError::InvalidConfig("proof 缺少 observation fingerprint".to_owned()))?;
+    for (label, value) in [("operation id", operation_id), ("challenge", challenge)] {
+        if value.is_empty()
+            || value.len() > 128
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err(AppError::InvalidConfig(format!("invalid {label}")));
+        }
+    }
+    if observation_fingerprint.len() != 71
+        || !observation_fingerprint.starts_with("sha256:")
+        || !observation_fingerprint[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(AppError::InvalidConfig(
+            "invalid observation fingerprint".to_owned(),
+        ));
+    }
+    let root = fs::canonicalize(&args.root)
+        .map_err(|error| AppError::State(format!("无法定位目标 deployment 目录：{error}")))?;
+    let values = read_target_env(&root)?;
+    let pull = values
+        .get("MEOWAI_PULL_CREDENTIAL")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::State("TARGET_PULL_CREDENTIAL_MISSING".to_owned()))?;
+    let payload = format!("{operation_id}|{generation}|{challenge}|{observation_fingerprint}");
+    let mut mac = Hmac::<Sha256>::new_from_slice(pull.as_bytes())
+        .map_err(|_| AppError::State("TARGET_PROOF_KEY_INVALID".to_owned()))?;
+    mac.update(payload.as_bytes());
+    println!("{:x}", mac.finalize().into_bytes());
+    Ok(())
+}
+
 fn read_target_env(root: &Path) -> Result<BTreeMap<String, String>> {
     let path = root.join("downstream-credentials.env");
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|error| AppError::State(format!("无法读取目标 deployment 凭证环境：{error}")))?;
+    if !metadata.file_type().is_file() {
+        return Err(AppError::State(
+            "目标 deployment 凭证环境不是普通文件".to_owned(),
+        ));
+    }
     let content = fs::read_to_string(&path)
         .map_err(|error| AppError::State(format!("无法读取目标 deployment 凭证环境：{error}")))?;
     parse_target_env(&content)
 }
 
-fn parse_target_env(content: &str) -> Result<BTreeMap<String, String>> {
+pub(crate) fn parse_target_env(content: &str) -> Result<BTreeMap<String, String>> {
     let mut values = BTreeMap::new();
     for line in content.lines() {
         let line = line.trim();
@@ -335,7 +400,7 @@ fn registration_from_target_env(
     registration_from_target_env_with_trust(values, true)
 }
 
-fn registration_from_target_env_with_trust(
+pub(crate) fn registration_from_target_env_with_trust(
     values: &BTreeMap<String, String>,
     require_release_trust: bool,
 ) -> Result<DeploymentRegistration> {
@@ -564,6 +629,7 @@ pub async fn run(args: &UpgradeArgs) -> Result<()> {
         &plan,
         bootstrap,
         false,
+        false,
     )
     .await?;
     state.deployment_schema = manifest.deployment_schema.to_string();
@@ -595,6 +661,78 @@ pub async fn run(args: &UpgradeArgs) -> Result<()> {
         .map_err(|error| AppError::State(format!("serialize upgrade result: {error}")))?
     );
     Ok(())
+}
+
+/// Execute a signed structural release while a repair operation owns the
+/// shared target lock. This is the repair-side bridge to the existing upgrade
+/// engine; it does not accept arbitrary release files or shell commands.
+pub async fn run_approved_release_for_repair(
+    config: &DeploymentConfig,
+    registration: &mut DeploymentRegistration,
+    allow_data_migration: bool,
+) -> Result<()> {
+    let mut state = load_state()?;
+    observe_target_capability(config, &mut state)?;
+    let policy = fetch_policy(
+        &registration.control_plane_url,
+        &registration.report_credential,
+    )
+    .await?;
+    if policy.upgrade_manifest_url.is_empty() {
+        return Err(AppError::State(
+            "CONTROL_RELEASE_MANIFEST_MISSING".to_owned(),
+        ));
+    }
+    refresh_release_trust(config, &state, registration).await?;
+    let manifest = fetch_and_verify_manifest(&policy, registration).await?;
+    if manifest.minimum_data_schema > state.data_schema.parse::<u32>().unwrap_or(0)
+        && !allow_data_migration
+    {
+        return Err(AppError::State(
+            "DATA_MIGRATION_AUTHORIZATION_REQUIRED".to_owned(),
+        ));
+    }
+    let plan = build_plan(&state, &policy, Some(&manifest));
+    if plan.decision != UpgradeDecision::UpgradeRequired {
+        return Err(AppError::State("CONTROL_RELEASE_NOT_STRUCTURAL".to_owned()));
+    }
+    let artifact = plan
+        .selected_artifact
+        .as_ref()
+        .ok_or_else(|| AppError::State("RELEASE_ARTIFACT_UNAVAILABLE".to_owned()))?;
+    let artifact_bytes = download_artifact(artifact, registration).await?;
+    let result = crate::target::upgrade_agent::apply(
+        config,
+        &state,
+        registration,
+        &manifest,
+        artifact,
+        &artifact_bytes,
+        &plan,
+        false,
+        false,
+        true,
+    )
+    .await?;
+    state.deployment_schema = manifest.deployment_schema.to_string();
+    state.updater_schema = manifest.minimum_updater_schema.to_string();
+    state.cli_schema = manifest.minimum_cli_schema.to_string();
+    state.data_schema = state
+        .data_schema
+        .parse::<u32>()
+        .unwrap_or(0)
+        .max(manifest.minimum_data_schema)
+        .to_string();
+    state.last_upgrade_release_id = manifest.release_id.clone();
+    state.last_upgrade_state = "committed".to_owned();
+    state.image_digest = result.image_digest;
+    observe_target_capability(config, &mut state)?;
+    storage::write(
+        STATE_FILE,
+        &serde_json::to_vec_pretty(&state)
+            .map_err(|error| AppError::State(format!("serialize repaired state: {error}")))?,
+    )?;
+    report_capability(&state, registration).await
 }
 
 async fn refresh_release_trust(
@@ -1074,7 +1212,7 @@ fn build_plan(
     policy: &UpgradePolicy,
     manifest: Option<&ReleaseManifest>,
 ) -> UpgradePlan {
-    let decision = policy.decision.clone().unwrap_or_else(|| {
+    let decision = policy.decision.clone().unwrap_or({
         if policy.image_digest.is_empty() {
             if policy.release_id.is_empty() {
                 UpgradeDecision::None

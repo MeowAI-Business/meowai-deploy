@@ -57,6 +57,20 @@ New API 默认监听 `3000` 端口，Uptime Kuma 默认监听 `3001` 端口；�
 
 使用 `meowai-deploy <命令> --help` 查看完整参数。
 
+## Repair 修复
+
+`repair` 是现有受管站点的诊断驱动恢复入口。它只采集脱敏事实，从固定的动作注册表生成带指纹的类型化计划；所有文件改动都由本地模板重新渲染产生，并在执行前后核对 PostgreSQL、Redis、New API 和 Uptime Kuma 数据挂载身份保持一致。完整安全边界见 `docs/repair-runbook.md`。
+
+```bash
+meowai-deploy repair --check
+meowai-deploy repair --plan --json
+meowai-deploy repair --yes
+```
+
+审阅计划后可使用 `--yes --plan-fingerprint <指纹>` 执行；目标事实变化会返回 `REPAIR_PLAN_STALE`，而审阅过的计划在其过期时间之前可以跨整点边界继续执行。若上游重建导致本地会话失效，可设置 `MEOWAI_DEPLOY_SOURCE_PASSWORD` 完成非交互重新登录后再继续修复。凭据轮换先创建 pending installation，并在目标机生成 proof 后才激活；激活前失败会恢复旧配置。公网入口验证与 heartbeat、snapshot 上报独立报告。若上游无法解密旧密文，`DATA_ENCRYPTED_WITH_LOST_KEY` 表示 provider、channel 或用户敏感数据必须人工处理，修复不会声称这些数据可恢复。
+
+恢复记录：保留目标端 `.repair/<operation_id>/backup-manifest.json` 与本地 `repair-operation.json` journal。结果为 `failed_recoverable` 时表示新目标凭据已经生效；使用 `meowai-deploy repair --yes --plan-fingerprint <指纹>` 继续上报或公网探测验证，激活后不要恢复旧凭据。`operation_aborted` 只允许发生在激活前；遇到 `PERSISTENT_RESOURCE_IDENTITY_CHANGED`、`REPAIR_DATA_DEPENDENCY_UNHEALTHY` 或 `DATA_ENCRYPTED_WITH_LOST_KEY`，先人工核对数据挂载和密文边界。
+
 默认更新通道为 `stable`，后台周期检查也只检查正式版本。Canary 必须通过 `--channel canary` 明确选择，不会自动安装。维护者可以在 `main` commit 末尾添加 `Canary-Build: true` trailer 生成 Canary prerelease；`Canary-Platforms` 省略或设为 `all` 时构建所有平台，也可以填写逗号分隔的平台子集。支持的平台值为 `linux-amd64`、`linux-arm64`、`macos-amd64`、`macos-arm64`、`windows-amd64` 和 `windows-arm64`。
 
 ## 自动化部署

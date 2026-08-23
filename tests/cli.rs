@@ -20,6 +20,7 @@ fn help_lists_supported_commands() {
         "logout",
         "update",
         "upgrade",
+        "repair",
     ] {
         assert!(
             stdout.contains(command),
@@ -39,6 +40,70 @@ fn help_lists_supported_commands() {
     assert!(!doctor_help.contains("--source-url"));
     assert!(!doctor_help.contains("--skip-network"));
     assert!(doctor_help.contains("--ssh"));
+}
+
+#[test]
+fn repair_check_is_redacted_and_read_only() {
+    let directory = tempfile::tempdir().expect("create temporary state directory");
+    let output = binary()
+        .env("MEOWAI_DEPLOY_HOME", directory.path())
+        .env("MEOWAI_DEPLOY_DISABLE_UPDATE_CHECK", "1")
+        .args(["repair", "--check", "--json"])
+        .output()
+        .expect("run repair check");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("repair JSON");
+    assert_eq!(report["status"], "diagnosed");
+    assert_eq!(
+        report["protection"]["destructive_operations_allowed"],
+        false
+    );
+    assert!(report["manual_items"].is_array());
+    assert!(!directory.path().join("repair-operation.json").exists());
+    assert!(!directory.path().join("operation.lock").exists());
+}
+
+#[test]
+fn repair_help_exposes_safe_modes_and_action_filter() {
+    let output = binary()
+        .args(["repair", "--help"])
+        .output()
+        .expect("repair help");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for flag in [
+        "--check",
+        "--plan",
+        "--yes",
+        "--plan-fingerprint",
+        "--json",
+        "--actions",
+        "--allow-data-migration",
+    ] {
+        assert!(stdout.contains(flag), "missing {flag} in help: {stdout}");
+    }
+}
+
+#[test]
+fn repair_modes_require_an_explicit_execution_boundary() {
+    let output = binary()
+        .args(["repair", "--check", "--yes"])
+        .output()
+        .expect("run conflicting repair modes");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be used with"));
+
+    let output = binary()
+        .args(["repair", "--plan-fingerprint", "sha256:test"])
+        .output()
+        .expect("run missing repair confirmation");
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("requires") || stderr.contains("required"));
 }
 
 #[test]

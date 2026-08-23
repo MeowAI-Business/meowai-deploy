@@ -163,6 +163,23 @@ pub async fn flush() -> Result<usize> {
             } => send_upgrade_transition(&registration.registration(), report).await,
         };
         if let Err(error) = result {
+            // A permanent semantic rejection (HTTP 400) can never succeed on
+            // retry. Keeping it at the head of the FIFO would wedge every
+            // later lifecycle/upgrade/repair report behind it forever, so
+            // drop the poisoned entry and keep flushing.
+            if matches!(
+                &error,
+                crate::source::SourceError::HttpStatus { status, .. }
+                    if *status == reqwest::StatusCode::BAD_REQUEST
+            ) {
+                tracing::warn!(
+                    error = %error,
+                    "dropping permanently rejected control-plane report"
+                );
+                pending.remove(0);
+                save(&pending)?;
+                continue;
+            }
             save(&pending)?;
             return Err(AppError::Source(error));
         }

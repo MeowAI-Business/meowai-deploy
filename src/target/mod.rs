@@ -2,6 +2,7 @@ pub mod compose;
 pub mod kuma;
 pub mod newapi;
 pub mod remote_path;
+pub mod repair;
 pub mod ssh;
 pub mod updater;
 pub mod upgrade_agent;

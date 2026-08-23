@@ -12,6 +12,8 @@ use crate::{
 pub const CONFIG_FILE: &str = "deployment.toml";
 pub const STATE_FILE: &str = "state.json";
 pub const OPERATION_FILE: &str = "operation.json";
+pub const REPAIR_OPERATION_FILE: &str = "repair-operation.json";
+pub const REPAIR_STATE_BACKUP_FILE: &str = "repair-state-backup.json";
 pub const CREDENTIALS_FILE: &str = "credentials.env";
 pub const SESSION_FILE: &str = "session.json";
 pub const SOURCE_STATUS_KEYS_FILE: &str = "source-status-keys.json";
@@ -61,6 +63,21 @@ pub fn write(name: &str, content: &[u8]) -> Result<()> {
     write_private_file(&root.join(name), content)
 }
 
+/// Atomically rename one private state file to another within the managed
+/// state directory. Both names are validated so callers cannot escape the
+/// state root while staging sensitive registration data.
+pub fn rename_private(from: &str, to: &str) -> Result<()> {
+    validate_name(from)?;
+    validate_name(to)?;
+    let root = ensure_directory()?;
+    let source = root.join(from);
+    let destination = root.join(to);
+    fs::rename(&source, &destination).map_err(|error| AppError::WriteFile {
+        path: destination,
+        source: error,
+    })
+}
+
 pub struct OperationLock {
     path: PathBuf,
 }
@@ -74,25 +91,56 @@ impl Drop for OperationLock {
 pub fn acquire_operation_lock() -> Result<OperationLock> {
     let root = ensure_directory()?;
     let path = root.join(OPERATION_LOCK_FILE);
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .map_err(|source| {
-            if source.kind() == std::io::ErrorKind::AlreadyExists {
-                AppError::State("已有 onboard、sync、clean 或 rollback 操作正在运行".to_owned())
-            } else {
-                AppError::WriteFile {
+    for attempt in 0..2 {
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(_) => {
+                platform::write_private_file(&path, std::process::id().to_string().as_bytes())
+                    .map_err(|source| AppError::WriteFile {
+                        path: path.clone(),
+                        source,
+                    })?;
+                return Ok(OperationLock { path });
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                // A killed process cannot remove its lock. Reclaim only when
+                // the recorded owner PID is provably gone (or the legacy
+                // empty lock is old enough that no live operation can hold
+                // it), then retry exactly once.
+                if attempt == 0 && operation_lock_is_stale(&path) {
+                    let _ = fs::remove_file(&path);
+                    continue;
+                }
+                return Err(AppError::State(
+                    "已有 onboard、sync、clean 或 rollback 操作正在运行".to_owned(),
+                ));
+            }
+            Err(source) => {
+                return Err(AppError::WriteFile {
                     path: path.clone(),
                     source,
-                }
+                });
             }
-        })?;
-    platform::write_private_file(&path, &[]).map_err(|source| AppError::WriteFile {
-        path: path.clone(),
-        source,
-    })?;
-    Ok(OperationLock { path })
+        }
+    }
+    Err(AppError::State(
+        "已有 onboard、sync、clean 或 rollback 操作正在运行".to_owned(),
+    ))
+}
+
+fn operation_lock_is_stale(path: &Path) -> bool {
+    match fs::read_to_string(path) {
+        Ok(content) => match content.trim().parse::<u32>() {
+            Ok(pid) => pid != std::process::id() && !platform::process_alive(pid),
+            // Legacy locks contain no PID. Treat them as stale only after a
+            // conservative day-long window.
+            Err(_) => fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age.as_secs() > 24 * 3600),
+        },
+        Err(_) => false,
+    }
 }
 
 pub fn open_log_file() -> Result<fs::File> {

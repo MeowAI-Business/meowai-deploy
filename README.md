@@ -53,6 +53,20 @@ The command checks the supported architecture, Docker, Docker Compose, curl, tar
 
 On Windows, `doctor` checks the local state directory and OpenSSH Client only. Pass `--ssh user@linux-host` to run the Docker, Compose, curl, architecture, directory, and disk checks on the Linux target. A saved SSH configuration is not contacted unless `--ssh` is supplied explicitly.
 
+## Repair
+
+`repair` is the diagnostic-driven recovery entry point for an existing managed site. It collects redacted local facts and builds a typed plan from a fixed action registry; every file it touches is re-rendered from local templates, and the PostgreSQL, Redis, New API, and Uptime Kuma data mounts are verified unchanged before and after execution. The full safety boundary is documented in `docs/repair-runbook.md`.
+
+```bash
+meowai-deploy repair --check
+meowai-deploy repair --plan --json
+meowai-deploy repair --yes
+```
+
+Review the plan fingerprint before applying it with `--yes --plan-fingerprint <fingerprint>`. A changed target observation returns `REPAIR_PLAN_STALE`; a reviewed plan stays applicable across an hour boundary while its expiry has not passed. If an upstream rebuild invalidated the stored session, set `MEOWAI_DEPLOY_SOURCE_PASSWORD` to re-authenticate non-interactively before repair continues. Credential rotation uses a pending installation and target-applied proof before activation; activation failures before the cutover restore the previous target configuration. Public endpoint verification is reported independently from heartbeat and snapshot recovery. If the source cannot decrypt old ciphertext, `DATA_ENCRYPTED_WITH_LOST_KEY` is a manual-handling boundary for provider, channel, or user secrets; repair does not claim those values are recoverable.
+
+Recovery runbook: retain `.repair/<operation_id>/backup-manifest.json` on the target and the local `repair-operation.json` journal. A `failed_recoverable` result means the new target credentials remain active; rerun `meowai-deploy repair --yes --plan-fingerprint <fingerprint>` to resume reporting or probe verification. Do not restore old credentials after activation. `operation_aborted` is only valid before activation; investigate `PERSISTENT_RESOURCE_IDENTITY_CHANGED`, `REPAIR_DATA_DEPENDENCY_UNHEALTHY`, and `DATA_ENCRYPTED_WITH_LOST_KEY` manually before changing data mounts or ciphertext.
+
 ## Quick start
 
 Install the latest release:

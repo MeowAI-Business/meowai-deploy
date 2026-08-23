@@ -543,6 +543,19 @@ exit 1"#,
     }
 }
 
+/// Render the canonical managed Compose document for a repair reconciliation.
+/// This keeps repair on the same template and deployment values as onboard/sync.
+pub fn render_managed_compose(
+    config: &DeploymentConfig,
+    runtime: &DeploymentRuntime,
+) -> Result<String> {
+    render_compose(config, runtime)
+}
+
+pub fn render_managed_secrets(secrets: &DeploymentSecrets) -> String {
+    secrets.render()
+}
+
 fn render_compose(config: &DeploymentConfig, runtime: &DeploymentRuntime) -> Result<String> {
     let image = image_reference(&config.image, &config.image_ref);
     let newapi = json!({
@@ -658,7 +671,10 @@ fn image_reference(image: &str, image_ref: &str) -> String {
     }
 }
 
-fn container_source_url(source_url: &str) -> Result<String> {
+/// Return the source URL as seen from a service running inside the target
+/// Compose network. Host loopback addresses refer to the container itself,
+/// so they must resolve through Docker's host gateway instead.
+pub(crate) fn container_source_url(source_url: &str) -> Result<String> {
     let mut parsed = Url::parse(source_url)
         .map_err(|error| AppError::State(format!("parse source URL: {error}")))?;
     if matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "::1")) {
