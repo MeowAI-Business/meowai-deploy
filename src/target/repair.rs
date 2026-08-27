@@ -381,7 +381,7 @@ for unit in meowai-deploy-updater.service meowai-deploy-updater.timer; do
   fi
 done
 find "$backup_dir" -type d -exec chmod 700 {{}} +
-if sync -f "$backup_dir" 2>/dev/null; then :; else sync; fi"#,
+sync -f "$backup_dir" 2>/dev/null || sync 2>/dev/null || true"#,
         operation_dir = quote(&operation_dir),
         backup_dir = quote(&backup_dir),
         managed_files = MANAGED_FILES
@@ -464,7 +464,7 @@ docker cp "$redis:/data/dump.rdb" {data_dir}/redis-dump.rdb
 chmod 600 {data_dir}/redis-dump.rdb
 if [ -d data ]; then find data -xdev -type f -print | sort > {data_dir}/data-inventory.txt; else : > {data_dir}/data-inventory.txt; fi
 chmod 600 {data_dir}/data-inventory.txt
-if sync -f {data_dir} 2>/dev/null; then :; else sync; fi"#,
+sync -f {data_dir} 2>/dev/null || sync 2>/dev/null || true"#,
         data_dir = quote(&data_dir),
         project = quote(project),
     ))?;
@@ -504,9 +504,9 @@ next={next}
 destination={destination}
 [ -f "$next" ] && [ ! -L "$next" ]
 chmod {mode:o} "$next"
-if sync -f "$next" 2>/dev/null; then :; else sync; fi
+sync -f "$next" 2>/dev/null || sync 2>/dev/null || true
 mv -f "$next" "$destination"
-if sync -f . 2>/dev/null; then :; else sync; fi"#,
+sync -f . 2>/dev/null || sync 2>/dev/null || true"#,
         next = quote(&next),
         destination = quote(path),
     ))?;
@@ -539,9 +539,9 @@ destination={destination}
 temporary="$destination.restore-{operation_id}"
 cp "$source" "$temporary"
 chmod {mode} "$temporary"
-if sync -f "$temporary" 2>/dev/null; then :; else sync; fi
+sync -f "$temporary" 2>/dev/null || sync 2>/dev/null || true
 mv -f "$temporary" "$destination"
-if sync -f . 2>/dev/null; then :; else sync; fi"#,
+sync -f . 2>/dev/null || sync 2>/dev/null || true"#,
                 source = quote(source),
                 destination = quote(&entry.path),
                 operation_id = operation_id,
