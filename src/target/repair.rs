@@ -605,7 +605,7 @@ if sync -f . 2>/dev/null; then :; else sync; fi"#,
         };
         executor.run_in_directory(&script)?;
     }
-    if !manifest.systemd_files.is_empty() {
+    if manifest.systemd_files.iter().any(|entry| entry.existed) {
         executor.run_in_directory(
             "if command -v systemctl >/dev/null 2>&1; then systemctl daemon-reload; fi",
         )?;
