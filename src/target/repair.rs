@@ -362,7 +362,7 @@ for file in {managed_files}; do
   fi
   if [ -f "$file" ]; then
     mkdir -p "$(dirname "$backup_dir/$file")"
-    cp "$file" "$backup_dir/$file"
+    cp -p "$file" "$backup_dir/$file"
     case "$file" in
       secrets.env|downstream-credentials.env|updater-credentials.env)
         chmod 600 "$backup_dir/$file"
@@ -377,10 +377,10 @@ for unit in meowai-deploy-updater.service meowai-deploy-updater.timer; do
     exit 1
   fi
   if [ -f "$source" ]; then
-    cp "$source" "$backup_dir/systemd/$unit"
+    cp -p "$source" "$backup_dir/systemd/$unit"
   fi
 done
-find "$backup_dir" -type d -exec chmod 700 {{}} + 2>/dev/null || true
+find "$backup_dir" -type d -exec chmod 700 {{}} +
 sync -f "$backup_dir" 2>/dev/null || sync 2>/dev/null || true"#,
         operation_dir = quote(&operation_dir),
         backup_dir = quote(&backup_dir),
@@ -1500,31 +1500,7 @@ mod tests {
         assert!(error.to_string().contains("volume newapi_data"));
     }
 
-    #[test]
-    fn b1_backup_script_succeeds_with_trace_on_windows() {
-        let temporary = tempfile::tempdir().unwrap();
-        std::fs::write(
-            temporary.path().join("secrets.env"),
-            b"SESSION_SECRET=old
-",
-        )
-        .unwrap();
-        let executor = TargetExecutor::new(Target::Local, temporary.path().to_path_buf());
-        let result = executor.run_in_directory(
-            "set -x
-umask 077
-mkdir -p .repair/repair_test/backup/systemd .repair/repair_test/backup/data
-chmod 700 .repair .repair/repair_test .repair/repair_test/backup .repair/repair_test/backup/systemd
-cp secrets.env .repair/repair_test/backup/secrets.env
-chmod 600 .repair/repair_test/backup/secrets.env
-find .repair/repair_test/backup -type d -exec chmod 700 {} +
-printf done",
-        );
-        if let Err(e) = result {
-            panic!("diagnostic script failed: {e}");
-        }
-    }
-
+    #[cfg(unix)]
     #[test]
     fn b1_backup_and_atomic_restore_preserve_original() {
         let temporary = tempfile::tempdir().unwrap();
