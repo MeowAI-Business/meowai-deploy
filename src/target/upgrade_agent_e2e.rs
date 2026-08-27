@@ -186,6 +186,7 @@ async fn complete_apply_covers_success_failures_data_rollback_and_recovery() {
         &plan,
         true,
         false,
+        false,
     )
     .await
     .expect("successful apply");
@@ -225,7 +226,8 @@ async fn complete_apply_covers_success_failures_data_rollback_and_recovery() {
             &bytes,
             &plan,
             false,
-            false
+            false,
+            false,
         )
         .await
         .is_err()
@@ -265,6 +267,7 @@ async fn complete_apply_covers_success_failures_data_rollback_and_recovery() {
             &plan,
             false,
             false,
+            false,
         )
         .await
         .is_err()
@@ -295,7 +298,8 @@ async fn complete_apply_covers_success_failures_data_rollback_and_recovery() {
             &bytes,
             &plan,
             false,
-            false
+            false,
+            false,
         )
         .await
         .is_err()
@@ -325,7 +329,8 @@ async fn complete_apply_covers_success_failures_data_rollback_and_recovery() {
             &bytes,
             &plan,
             false,
-            false
+            false,
+            false,
         )
         .await
         .is_err()
@@ -350,6 +355,7 @@ async fn complete_apply_covers_success_failures_data_rollback_and_recovery() {
         &artifact,
         &bytes,
         &plan,
+        false,
         false,
         false,
     )
@@ -414,6 +420,7 @@ async fn complete_apply_covers_success_failures_data_rollback_and_recovery() {
             &plan,
             false,
             false,
+            false,
         )
         .await
         .is_err()
@@ -451,6 +458,7 @@ async fn complete_apply_covers_success_failures_data_rollback_and_recovery() {
         &plan,
         false,
         false,
+        false,
     )
     .await
     .expect("a new operation can continue after pre-switch recovery");
@@ -474,6 +482,7 @@ async fn complete_apply_covers_success_failures_data_rollback_and_recovery() {
             &artifact,
             &bytes,
             &plan,
+            false,
             false,
             false,
         )
@@ -720,6 +729,7 @@ async fn real_linux_ssh_upgrade_against_local_control_plane() {
         &plan,
         true,
         true,
+        false,
     )
     .await
     .expect("real Linux deployment upgrade");
