@@ -25,7 +25,6 @@ use std::sync::{Mutex, OnceLock};
 pub(crate) static TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 use secrecy::{ExposeSecret, SecretString};
-use shell_escape::escape;
 
 use self::remote_path::RemotePath;
 use self::ssh::SshClient;
@@ -45,6 +44,17 @@ elif command -v sudo >/dev/null 2>&1 && sudo -n sh -c true >/dev/null 2>&1; then
 else
     exec sh -s
 fi"#;
+
+/// Walk to the nearest existing ancestor. POSIX `dirname /` is a no-op, and Git
+/// Bash `dirname` is also a no-op for Windows drive roots such as `C:/` or `C:\`.
+/// Stop when the path stops changing so the runner cannot spin forever.
+const EXISTING_ANCESTOR_WALK: &str = r#"while [ ! -e "$path" ]; do
+    next=$(dirname "$path")
+    if [ "$next" = "$path" ]; then
+        break
+    fi
+    path=$next
+done"#;
 
 #[derive(Clone, Debug)]
 pub struct TargetExecutor {
@@ -103,9 +113,7 @@ impl TargetExecutor {
         let script = format!(
             r#"set -eu
 path={directory}
-while [ ! -e "$path" ] && [ "$path" != / ]; do
-    path=$(dirname "$path")
-done
+{walk}
 if [ "$(id -u)" -eq 0 ]; then
     [ -d "$path" ] && [ -r "$path" ] && [ -w "$path" ] && [ -x "$path" ] && docker info >/dev/null 2>&1 && exit 0
 fi
@@ -116,6 +124,8 @@ else
 fi
 printf '%s\n' '部署目录或最近的父目录必须可读、可写、可进入，并且 Docker 必须可用' >&2
 exit 1"#,
+            directory = directory,
+            walk = EXISTING_ANCESTOR_WALK,
         );
         let output = match &self.target {
             Target::Local => {
@@ -559,9 +569,7 @@ docker --config "$registry_config" pull {image}"#,
         let directory = self.quoted_directory()?;
         Ok(format!(
             r#"path={directory}
-while [ ! -e "$path" ] && [ "$path" != / ]; do
-    path=$(dirname "$path")
-done
+{walk}
 if [ "$(id -u)" -eq 0 ]; then
     exec sh -s
 elif [ -d "$path" ] && [ -r "$path" ] && [ -w "$path" ] && [ -x "$path" ]; then
@@ -571,7 +579,8 @@ elif command -v sudo >/dev/null 2>&1 && sudo -n sh -c true >/dev/null 2>&1; then
 else
     exec sh -s
 fi"#,
-            directory = directory
+            directory = directory,
+            walk = EXISTING_ANCESTOR_WALK,
         ))
     }
 
@@ -641,7 +650,11 @@ fn quote_path(path: &Path) -> String {
 }
 
 fn quote(value: &str) -> String {
-    escape(Cow::Borrowed(value)).into_owned()
+    // Target scripts always run under POSIX `sh` (local Git Bash included).
+    // `shell_escape::escape` switches to cmd.exe quoting on native Windows,
+    // which leaves `C:\Users\...` unquoted and lets Git Bash `dirname` hang
+    // at the drive root.
+    shell_escape::unix::escape(Cow::Borrowed(value)).into_owned()
 }
 
 fn remote_upload_path(relative: &str, local_temporary: &Path) -> String {
@@ -734,6 +747,69 @@ mod tests {
         assert!(PRIVILEGED_SCRIPT_RUNNER.contains("sudo -n sh -c true"));
         assert!(PRIVILEGED_SCRIPT_RUNNER.contains("sudo -n sh -s"));
         assert!(PRIVILEGED_SCRIPT_RUNNER.contains("exec sh -s"));
+    }
+
+    #[test]
+    fn posix_shell_quote_keeps_windows_paths_single_quoted_for_sh() {
+        assert_eq!(
+            quote(r"C:\Users\runner\AppData\Local\Temp\job"),
+            r"'C:\Users\runner\AppData\Local\Temp\job'"
+        );
+    }
+
+    #[test]
+    fn script_runner_stops_walking_when_dirname_makes_no_progress() {
+        let runner = TargetExecutor::new(Target::Local, PathBuf::from(r"D:\missing\nested"))
+            .script_runner()
+            .expect("quote local directory");
+        assert!(
+            runner.contains(r#"next=$(dirname "$path")"#),
+            "runner must capture dirname before replacing path: {runner}"
+        );
+        assert!(
+            runner.contains(r#"[ "$next" = "$path" ]"#),
+            "runner must stop at Windows drive roots where dirname is a no-op: {runner}"
+        );
+    }
+
+    #[test]
+    fn ancestor_walk_terminates_when_dirname_repeats_a_windows_drive_root() {
+        let script = format!(
+            r#"
+dirname() {{
+  case "$1" in
+    'D:/missing/nested') printf '%s\n' 'D:/missing' ;;
+    'D:/missing') printf '%s\n' 'D:/' ;;
+    'D:/') printf '%s\n' 'D:/' ;;
+    *) command dirname "$1" ;;
+  esac
+}}
+path='D:/missing/nested'
+{walk}
+printf '%s\n' "$path"
+"#,
+            walk = EXISTING_ANCESTOR_WALK
+        );
+        let output = Command::new("sh")
+            .args(["-c", &script])
+            .output()
+            .expect("run ancestor walk");
+        assert!(
+            output.status.success(),
+            "walker should terminate: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "D:/");
+    }
+
+    #[test]
+    fn local_directory_scripts_complete_on_a_temporary_workspace() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let executor = TargetExecutor::new(Target::Local, temporary.path().to_path_buf());
+        let output = executor
+            .run_in_directory("printf ready")
+            .expect("run local script");
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ready");
     }
 
     #[test]
